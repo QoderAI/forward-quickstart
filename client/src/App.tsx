@@ -12,12 +12,14 @@ import {
   uploadCloudFile,
   updateCloudEnvironment,
   updateCloudSkill,
+  listCloudSkills,
   listCloudCredentials,
   createCloudCredential,
   deleteCloudCredential,
   type CloudModel,
   listCloudModels,
   createTemplate,
+  updateTemplate,
   ensureIdentity,
   listEvents,
   listResources,
@@ -1579,6 +1581,7 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [viewingTemplate, setViewingTemplate] = useState<ForwardTemplate | null>(null);
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
   const [viewingResource, setViewingResource] = useState<ForwardResource | null>(null);
   const [conversationSearch, setConversationSearch] = useState('');
   const [showCreateEnvModal, setShowCreateEnvModal] = useState(false);
@@ -1771,8 +1774,26 @@ export default function App() {
     setError('');
     try {
       const page = await listResources(ctx, nextType);
-      setResourceOptionsByType((prev) => ({ ...prev, [nextType]: page.data }));
-      if (updateActiveList || nextType === resourceType) setResources(page.data);
+      let data = page.data;
+      // The Forward /resources endpoint may not echo a usable display name for skills,
+      // causing the UI to fall back to the raw skill_ id. Enrich with the authoritative
+      // name from the Cloud Skills API (best-effort) so the user-given name is shown.
+      if (nextType === 'skill') {
+        try {
+          const cloud = await listCloudSkills(ctx);
+          const nameMap = new Map(
+            cloud.data.map((s) => [s.id, s.display_title || s.name]),
+          );
+          data = data.map((r) => {
+            const cloudName = nameMap.get(r.id);
+            return cloudName ? { ...r, name: r.name || cloudName } : r;
+          });
+        } catch {
+          // Enrichment is best-effort; keep the raw Forward resource list on failure.
+        }
+      }
+      setResourceOptionsByType((prev) => ({ ...prev, [nextType]: data }));
+      if (updateActiveList || nextType === resourceType) setResources(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -2134,6 +2155,7 @@ export default function App() {
   }, [loadResources]);
 
   const openTemplateModal = useCallback(() => {
+    setEditingTemplateId(null);
     setTemplateName('');
     setTemplateDescription('');
     setTemplateSystem('');
@@ -2146,6 +2168,53 @@ export default function App() {
     setToolsJson('');
     setMcpServersJson('');
     setError('');
+    setShowTemplateModal(true);
+    void loadTemplateResourceOptions();
+    if (ctx) void loadModels(ctx);
+  }, [ctx, loadModels, loadTemplateResourceOptions]);
+
+  const openEditTemplateModal = useCallback((template: ForwardTemplate) => {
+    setEditingTemplateId(template.id);
+    setTemplateName(template.name || '');
+    setTemplateDescription(template.description || '');
+    setTemplateModel(template.model || 'ultimate');
+    setTemplateSystem(template.system || '');
+    setEnvironmentId(template.environment_id || '');
+    // Skills → skill IDs
+    setSkillIdsText(extractSkillInfo(template.skills).map((s) => s.id).filter(Boolean).join('\n'));
+    // Files → file IDs (object keys)
+    setFileIdsText(
+      template.files && typeof template.files === 'object'
+        ? Object.keys(template.files as Record<string, unknown>).join('\n')
+        : '',
+    );
+    // Vaults
+    setVaultIdsText((template.vault_ids ?? []).join('\n'));
+    // Environment variables → KEY=value lines
+    setEnvVarsText(
+      template.environment_variables && typeof template.environment_variables === 'object'
+        ? Object.entries(template.environment_variables as Record<string, unknown>)
+            .map(([k, v]) => `${k}=${String(v)}`)
+            .join('\n')
+        : '',
+    );
+    // Builtin tools → checkboxes; non-builtin tool entries preserved via toolsJson
+    const builtinNames = extractToolNames(template.tools).filter((name) => BUILTIN_TOOLS.includes(name));
+    setSelectedTools(builtinNames);
+    const nonBuiltinTools = Array.isArray(template.tools)
+      ? template.tools.filter((tool) => {
+          if (!tool || typeof tool !== 'object') return false;
+          return (tool as Record<string, unknown>).type !== 'agent_toolset_20260401';
+        })
+      : [];
+    setToolsJson(nonBuiltinTools.length > 0 ? JSON.stringify(nonBuiltinTools, null, 2) : '');
+    setMcpServersJson(
+      Array.isArray(template.mcp_servers) && template.mcp_servers.length > 0
+        ? JSON.stringify(template.mcp_servers, null, 2)
+        : '',
+    );
+    setError('');
+    setViewingTemplate(null);
     setShowTemplateModal(true);
     void loadTemplateResourceOptions();
     if (ctx) void loadModels(ctx);
@@ -2463,6 +2532,21 @@ export default function App() {
       setLoading(false);
     }
   }, [buildTemplateInput, ctx, identity, refreshSessions]);
+
+  const updateExistingTemplate = useCallback(async () => {
+    if (!ctx || !editingTemplateId) return;
+    setLoading(true);
+    setError('');
+    try {
+      const updated = await updateTemplate(ctx, editingTemplateId, buildTemplateInput());
+      setTemplates((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }, [buildTemplateInput, ctx, editingTemplateId]);
 
   const selectSession = useCallback(async (sessionId: string) => {
     setActivePanel('chat');
@@ -3407,6 +3491,7 @@ export default function App() {
                       onClick={() => {
                         setViewingTemplate(template);
                         void loadResources('environment', false);
+                        void loadResources('skill', false);
                       }}
                       className={`group rounded-2xl border bg-white p-5 text-left transition hover:shadow-md ${
                         isActive ? 'border-[#3550FF] ring-1 ring-[#3550FF]/10' : 'border-[#DDE2F2] hover:border-[#B8C3FF]'
@@ -4703,12 +4788,17 @@ export default function App() {
       {viewingTemplate && (() => {
         const vt = viewingTemplate;
         const vtMcp = extractMcpNames(vt.mcp_servers);
-        // Build skill name lookup from loaded resources
-        const skillNameMap = new Map(resourceOptionsByType.skill.map((r) => [r.id, r.name || r.id]));
-        const vtSkills = extractSkillInfo(vt.skills).map((s) => ({
-          ...s,
-          name: skillNameMap.get(s.id) || s.name,
-        }));
+        // Build skill name lookup from loaded resources (only keep real names)
+        const skillNameMap = new Map(
+          resourceOptionsByType.skill
+            .filter((r) => r.name)
+            .map((r) => [r.id, r.name as string]),
+        );
+        const vtSkills = extractSkillInfo(vt.skills).map((s) => {
+          const resolved = skillNameMap.get(s.id);
+          const displayName = resolved || (s.name && s.name !== s.id ? s.name : '未命名技能');
+          return { ...s, name: displayName };
+        });
         const vtFiles = fileCount(vt.files);
         const vtEnvVars = vt.environment_variables && typeof vt.environment_variables === 'object'
           ? Object.entries(vt.environment_variables as Record<string, unknown>)
@@ -4861,6 +4951,7 @@ export default function App() {
                       <div key={skill.id} className="flex items-center justify-between rounded-xl bg-[#FAFBFF] px-4 py-2.5">
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-xs font-medium text-black/70">{skill.name}</div>
+                          <div className="mt-0.5 truncate font-mono text-[11px] text-black/35">{skill.id}</div>
                         </div>
                         <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] ${skill.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-gray-100 text-black/35'}`}>
                           {skill.enabled ? '已启用' : '已禁用'}
@@ -4931,13 +5022,19 @@ export default function App() {
               >
                 {vtIsActive ? '当前使用中' : '使用此模板对话'}
               </button>
+              <button
+                onClick={() => openEditTemplateModal(vt)}
+                className="rounded-full border border-[#DDE2F2] px-5 py-2.5 text-sm font-medium text-[#3550FF] transition hover:bg-[#F4F6FC]"
+              >
+                编辑
+              </button>
               <button onClick={() => setViewingTemplate(null)} className="rounded-full border border-gray-200 px-5 py-2.5 text-sm text-black/60 hover:bg-gray-50">关闭</button>
             </div>
           </Modal>
         );
       })()}
 
-      <Modal open={showTemplateModal} onClose={() => setShowTemplateModal(false)} title="新建模板">
+      <Modal open={showTemplateModal} onClose={() => { setShowTemplateModal(false); setEditingTemplateId(null); }} title={editingTemplateId ? '编辑模板' : '新建模板'}>
         <div className="space-y-5">
           <div>
             <div className="mb-3 text-xs font-semibold text-black/40">基本信息</div>
@@ -5067,12 +5164,13 @@ export default function App() {
           <button
             onClick={() => {
               if (!environmentId.trim()) { setError('请先选择一个运行环境'); return; }
-              void createDefaultTemplate().then(() => setShowTemplateModal(false)).catch(() => {});
+              const action = editingTemplateId ? updateExistingTemplate() : createDefaultTemplate();
+              void action.then(() => { setShowTemplateModal(false); setEditingTemplateId(null); }).catch(() => {});
             }}
             disabled={!ctx || loading || !environmentId.trim()}
             className="mt-2 flex h-11 w-full items-center justify-center rounded-xl bg-[#3550FF] text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {loading ? (<span className="flex items-center gap-2"><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />创建中...</span>) : '创建模板'}
+            {loading ? (<span className="flex items-center gap-2"><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />{editingTemplateId ? '保存中...' : '创建中...'}</span>) : (editingTemplateId ? '保存' : '创建模板')}
           </button>
         </div>
       </Modal>

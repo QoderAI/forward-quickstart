@@ -492,6 +492,28 @@ export async function ensureIdentity(ctx: ForwardContext, externalId: string) {
   return createIdentity(ctx, externalId, externalId);
 }
 
+export async function getIdentity(ctx: ForwardContext, identityId: string) {
+  return forwardRequest<ForwardIdentity>(ctx, 'GET', `/identities/${encodeURIComponent(identityId)}`);
+}
+
+export async function deleteIdentity(ctx: ForwardContext, identityId: string) {
+  return forwardRequest<{ id: string; type: string; deleted: boolean }>(ctx, 'DELETE', `/identities/${encodeURIComponent(identityId)}`);
+}
+
+export interface ForwardAccessToken {
+  id: string;
+  type: 'access_token';
+  identity_id: string;
+  token_type: string;
+  expires_at?: string;
+  metadata?: Record<string, unknown>;
+  created_at?: string;
+}
+
+export async function listAccessTokens(ctx: ForwardContext, identityId: string) {
+  return forwardRequest<Page<ForwardAccessToken>>(ctx, 'GET', `/identities/${encodeURIComponent(identityId)}/access_tokens`, undefined, { limit: 50 });
+}
+
 export async function createAccessToken(ctx: ForwardContext, identityId: string) {
   return forwardRequest<{
     access_token: string;
@@ -501,6 +523,14 @@ export async function createAccessToken(ctx: ForwardContext, identityId: string)
   }>(ctx, 'POST', `/identities/${encodeURIComponent(identityId)}/access_tokens`, {
     metadata: { created_by: 'forward-quickstart' },
   });
+}
+
+export async function deleteAccessToken(ctx: ForwardContext, identityId: string, tokenId: string) {
+  return forwardRequest<{ id: string; type: string; deleted: boolean }>(ctx, 'DELETE', `/identities/${encodeURIComponent(identityId)}/access_tokens/${encodeURIComponent(tokenId)}`);
+}
+
+export async function getTemplate(ctx: ForwardContext, templateId: string) {
+  return forwardRequest<ForwardTemplate>(ctx, 'GET', `/templates/${encodeURIComponent(templateId)}`);
 }
 
 export async function listTemplates(ctx: ForwardContext) {
@@ -531,6 +561,23 @@ export async function createTemplate(ctx: ForwardContext, input?: Partial<Create
     environment_variables: input?.environment_variables ?? {},
     metadata: { created_by: 'forward-quickstart' },
   });
+}
+
+export async function updateTemplate(ctx: ForwardContext, templateId: string, input: Partial<CreateTemplateInput>) {
+  // Forward Template update uses merge-patch semantics: only send changed fields.
+  const body: Record<string, unknown> = {};
+  if (input.name !== undefined) body.name = input.name;
+  if (input.description !== undefined) body.description = input.description;
+  if (input.model !== undefined) body.model = input.model;
+  if (input.system !== undefined) body.system = input.system;
+  if (input.environment_id !== undefined) body.environment_id = input.environment_id;
+  if (input.tools !== undefined) body.tools = input.tools;
+  if (input.mcp_servers !== undefined) body.mcp_servers = input.mcp_servers;
+  if (input.skills !== undefined) body.skills = input.skills;
+  if (input.vault_ids !== undefined) body.vault_ids = input.vault_ids;
+  if (input.files !== undefined) body.files = input.files;
+  if (input.environment_variables !== undefined) body.environment_variables = input.environment_variables;
+  return forwardRequest<ForwardTemplate>(ctx, 'POST', `/templates/${encodeURIComponent(templateId)}`, body);
 }
 
 export async function registerResource(ctx: ForwardContext, type: ForwardResourceType, id: string, name?: string) {
@@ -599,6 +646,10 @@ export async function createSession(
     incremental_streaming_enabled: true,
     metadata: { created_by: 'forward-quickstart' },
   });
+}
+
+export async function getSession(ctx: ForwardContext, sessionId: string) {
+  return forwardRequest<ForwardSession>(ctx, 'GET', `/sessions/${encodeURIComponent(sessionId)}`);
 }
 
 export async function archiveSession(ctx: ForwardContext, sessionId: string) {
@@ -802,6 +853,10 @@ export async function archiveSchedule(ctx: ForwardContext, scheduleId: string) {
 
 export async function runSchedule(ctx: ForwardContext, scheduleId: string) {
   return forwardRequest<ForwardScheduleRun>(ctx, 'POST', `/schedules/${encodeURIComponent(scheduleId)}/run`);
+}
+
+export async function deleteSchedule(ctx: ForwardContext, scheduleId: string) {
+  return forwardRequest<{ id: string; type: string; deleted: boolean }>(ctx, 'DELETE', `/schedules/${encodeURIComponent(scheduleId)}`);
 }
 
 export async function pauseSchedule(ctx: ForwardContext, scheduleId: string) {
