@@ -5,6 +5,9 @@ import {
   createCloudVault,
   createSession,
   deleteCloudFile,
+  getCloudFile,
+  downloadCloudFile,
+  type CloudFile,
   deleteCloudSkill,
   deleteCloudEnvironment,
   deleteCloudVault,
@@ -133,18 +136,6 @@ const CHANNEL_TYPES: Array<{ value: ChannelType; label: string; icon: string; qr
   { value: 'dingtalk', label: '钉钉', icon: '📌', qrSupport: true, manualSupport: true },
   { value: 'feishu', label: '飞书', icon: '🐦', qrSupport: true, manualSupport: true },
 ];
-
-const TOOL_NAME_LABELS: Record<string, string> = {
-  Bash: '命令行',
-  Read: '读取文件',
-  Write: '写入文件',
-  Edit: '编辑文件',
-  Glob: '搜索文件',
-  Grep: '搜索内容',
-  WebFetch: '网页抓取',
-  WebSearch: '网页搜索',
-  DeliverArtifacts: '文件交付',
-};
 
 const MODEL_DISPLAY_NAMES: Record<string, string> = {
   ultimate: '旗舰版',
@@ -593,6 +584,24 @@ function toolEventId(event: ForwardEvent) {
   return typeof value === 'string' ? value : '';
 }
 
+/**
+ * Extract Cloud file ids (file_...) produced by the DeliverArtifacts tool from a
+ * tool_result event. The exact field path varies, so we scan the serialized
+ * output/result/content payload for file id tokens and dedupe them.
+ */
+function extractArtifactFileIds(event: ForwardEvent): string[] {
+  const raw = stringifyPayload(
+    getEventValue(event, ['output', 'result', 'content']) ?? eventDebugPayload(event),
+  );
+  if (!raw) return [];
+  // Real Cloud file ids look like `file_00iyui42qpz40fqtdh45` (prefix + long
+  // lowercase alphanumeric token). Require >=12 trailing chars so we match real
+  // ids while excluding the JSON key name `file_id` (only 2 chars after prefix).
+  const matches = raw.match(/file_[0-9a-zA-Z]{12,}/g);
+  if (!matches) return [];
+  return Array.from(new Set(matches));
+}
+
 function toolResultMatchesUse(resultEvent: ForwardEvent, useEvent: ForwardEvent) {
   if (eventViewKind(resultEvent) !== 'tool_result') return false;
   if (resultEvent.session_id !== useEvent.session_id) return false;
@@ -904,20 +913,96 @@ function ThinkingMessage({ event }: { event: ForwardEvent }) {
   );
 }
 
+function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fileId: string }) {
+  const [meta, setMeta] = useState<CloudFile | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (!ctx) return;
+    let cancelled = false;
+    void getCloudFile(ctx, fileId)
+      .then((file) => { if (!cancelled) setMeta(file); })
+      .catch(() => { /* filename is best-effort; keep showing the id */ });
+    return () => { cancelled = true; };
+  }, [ctx, fileId]);
+
+  const filename = meta?.filename || fileId;
+
+  const handleDownload = async () => {
+    if (!ctx || loading) return;
+    setError('');
+    setLoading(true);
+    try {
+      // Per Cloud API: GET /files/{id}/content returns a JSON body with a
+      // time-limited pre-signed `url`. We then navigate to that URL to download.
+      const { url } = await downloadCloudFile(ctx, fileId);
+      if (!url) throw new Error('未获取到下载链接');
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleDownload}
+      disabled={!ctx || loading}
+      title={`下载 ${filename}`}
+      className="group flex w-full max-w-[420px] items-center gap-3 rounded-xl border border-[#DDE2F2] bg-white px-3.5 py-3 text-left transition hover:border-[#3550FF] hover:shadow-[0_6px_18px_rgba(53,80,255,0.10)] disabled:opacity-60"
+    >
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#EEF1FF] text-[#3550FF]">
+        <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+        </svg>
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[13px] font-medium text-black/80">{filename}</span>
+        <span className="mt-0.5 block truncate font-mono text-[11px] text-black/35">
+          {meta?.size_bytes != null ? `${formatFileSize(meta.size_bytes)} · ` : ''}{fileId}
+        </span>
+        {error && <span className="mt-0.5 block truncate text-[11px] text-red-500">{error}</span>}
+      </span>
+      <span className="shrink-0 text-black/30 transition group-hover:text-[#3550FF]">
+        {loading ? (
+          <span className="block h-4 w-4 animate-spin rounded-full border-2 border-[#D7DBEA] border-t-[#3550FF]" />
+        ) : (
+          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+          </svg>
+        )}
+      </span>
+    </button>
+  );
+}
+
 function ToolEventMessage({
   event,
   result,
   pending = false,
   displayName,
+  ctx,
 }: {
   event: ForwardEvent;
   result: boolean;
   pending?: boolean;
   displayName?: string;
+  ctx?: ForwardContext | null;
 }) {
   const name = displayName || toolEventName(event);
   const payload = toolEventPayload(event);
   const id = toolEventId(event);
+  const artifactIds = result && name === 'DeliverArtifacts' ? extractArtifactFileIds(event) : [];
   const tone = result
     ? 'bg-emerald-50 text-emerald-700'
     : 'bg-orange-50 text-orange-600';
@@ -966,6 +1051,13 @@ function ToolEventMessage({
             )}
           </div>
         </details>
+        {artifactIds.length > 0 && (
+          <div className="mt-2 flex flex-col gap-2">
+            {artifactIds.map((fileId) => (
+              <ArtifactDownloadCard key={fileId} ctx={ctx ?? null} fileId={fileId} />
+            ))}
+          </div>
+        )}
         {event.created_at && <div className="mt-1 px-1 text-[11px] text-black/30">{displayTime(event.created_at)}</div>}
       </div>
     </div>
@@ -1624,6 +1716,7 @@ export default function App() {
   const [channels, setChannels] = useState<ForwardChannel[]>([]);
   const [memoryEntries, setMemoryEntries] = useState<Array<{ id: string; path: string; content?: string; size: number; version: number; updated_at?: string }>>([]);
   const [memoryTemplateId, setMemoryTemplateId] = useState('');
+  const [memoryStoreId, setMemoryStoreId] = useState('');
   const [showChannelModal, setShowChannelModal] = useState(false);
   const [chanName, setChanName] = useState('');
   const [chanType, setChanType] = useState<ChannelType>('wechat');
@@ -1942,6 +2035,7 @@ export default function App() {
         (r) => r.type === 'memory_store' && r.memory_store_id
       );
       const storeId = memoryResource?.memory_store_id;
+      setMemoryStoreId(storeId || '');
 
       if (storeId) {
         const entries = await listMemoryEntries(ctx, storeId);
@@ -2586,7 +2680,6 @@ export default function App() {
     streamAbort.current?.abort();
     const controller = new AbortController();
     let pollTimer: number | undefined;
-    let completed = false;
     let reconnecting = false;
     const stopPolling = () => {
       if (pollTimer !== undefined) {
@@ -2595,7 +2688,6 @@ export default function App() {
       }
     };
     const finishStream = () => {
-      completed = true;
       stopPolling();
       controller.abort();
       setStreaming(false);
@@ -2745,6 +2837,16 @@ export default function App() {
             void confirmAndReconnect();
             return; // Don't check isTerminal - we're handling reconnection
           }
+          // requires_action but nothing actionable to confirm (empty event_ids or
+          // missing ctx): end the turn instead of hanging, because isTerminalSessionEvent
+          // treats requires_action as non-terminal and the upstream keeps the SSE alive
+          // with heartbeats until its ~10min timeout.
+          if (stopReason?.type === 'requires_action') {
+            finishStream();
+            void mergeSessionEvents(sessionId);
+            void refreshSessions();
+            return;
+          }
         }
         if (isTerminalSessionEvent(event)) {
           finishStream();
@@ -2766,7 +2868,10 @@ export default function App() {
       if (!controller.signal.aborted && !reconnecting) setError(err instanceof Error ? err.message : String(err));
     }).finally(() => {
       if (reconnecting) return;
-      if ((controller.signal.aborted || completed) && streamAbort.current === controller) {
+      // Once the SSE stream ends (server closed it on a terminal event, or we aborted
+      // locally), always clear the streaming flag for the current turn so the composer
+      // is never left permanently disabled.
+      if (streamAbort.current === controller) {
         setStreaming(false);
       }
     });
@@ -3047,7 +3152,10 @@ export default function App() {
                         void loadResources(nextType);
                       }
                       if (id === 'memoryStores') {
-                        const tplId = templateId || templates[0]?.id || '';
+                        // Default to the template used by the active chat session so the
+                        // memory menu reads the same memory store you just talked to.
+                        const activeTpl = sessions.find((s) => s.id === currentSessionId)?.template_id;
+                        const tplId = activeTpl || templateId || templates[0]?.id || '';
                         setMemoryTemplateId(tplId);
                         void loadMemoryEntriesForTemplate(tplId);
                       }
@@ -3075,7 +3183,10 @@ export default function App() {
                         void loadResources(nextType);
                       }
                       if (id === 'memoryStores') {
-                        const tplId = templateId || templates[0]?.id || '';
+                        // Default to the template used by the active chat session so the
+                        // memory menu reads the same memory store you just talked to.
+                        const activeTpl = sessions.find((s) => s.id === currentSessionId)?.template_id;
+                        const tplId = activeTpl || templateId || templates[0]?.id || '';
                         setMemoryTemplateId(tplId);
                         void loadMemoryEntriesForTemplate(tplId);
                       }
@@ -3549,7 +3660,7 @@ export default function App() {
                         <div className="mt-3 flex flex-wrap gap-1.5">
                           {tools.slice(0, 6).map((name) => (
                             <span key={name} className="rounded-md bg-[#F4F6FC] px-2 py-0.5 text-[11px] text-black/45">
-                              {TOOL_NAME_LABELS[name] ?? name}
+                              {name}
                             </span>
                           ))}
                           {tools.length > 6 && (
@@ -3603,7 +3714,12 @@ export default function App() {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.58m15.36 2A8 8 0 0 0 4.58 9m0 0H9m11 11v-5h-.58m0 0A8 8 0 0 1 4.06 13m15.36 2H15" />
                     </svg>
                   </button>
-                  <span className="ml-auto text-sm text-black/40">{memoryEntries.length} 条记忆</span>
+                  <span className="ml-auto flex items-center gap-3 text-sm text-black/40">
+                    {memoryStoreId && (
+                      <span className="font-mono text-xs text-black/35" title="当前读取的记忆库 ID">{memoryStoreId}</span>
+                    )}
+                    <span>{memoryEntries.length} 条记忆</span>
+                  </span>
                 </div>
                 <div className="rounded-2xl border border-[#DDE2F2] bg-white p-5">
                   {memoryEntries.length === 0 ? (
@@ -4041,6 +4157,7 @@ export default function App() {
                               event={event}
                               result
                               displayName={toolDisplayNameForEvent(events, event, index)}
+                              ctx={ctx}
                             />
                           );
                         }
@@ -4912,7 +5029,7 @@ export default function App() {
                         <div className="flex flex-wrap gap-1.5">
                           {entry.names.map((name) => (
                             <span key={name} className="rounded-md bg-white px-2 py-0.5 text-xs text-black/60 shadow-[inset_0_0_0_1px_#E8EBF5]">
-                              {TOOL_NAME_LABELS[name] ?? name}
+                              {name}
                             </span>
                           ))}
                         </div>

@@ -129,6 +129,35 @@ function summarizeSseFrame(frame: string) {
   };
 }
 
+// Detect whether an SSE frame carries a terminal session event. The upstream keeps
+// the stream open with heartbeat frames after the agent goes idle, so the proxy must
+// close proactively once a terminal event is forwarded to avoid a ~10min hang.
+function isTerminalSseFrame(frame: string): boolean {
+  const dataLines = frame
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trim());
+  const data = safeJsonParse(dataLines.join('\n'));
+  if (!data || typeof data !== 'object') return false;
+  const record = data as Record<string, unknown>;
+  const type = String(record.type ?? '');
+  if (
+    type === 'session.completed' ||
+    type === 'session.error' ||
+    type === 'session.cancelled' ||
+    type === 'session.canceled' ||
+    type === 'session.status_terminated' ||
+    type === 'session.thread_status_idle'
+  ) return true;
+  // session.status_idle is terminal unless the agent is waiting for a tool
+  // confirmation (requires_action), in which case the client reconnects.
+  if (type === 'session.status_idle') {
+    const stopReason = record.stop_reason as { type?: string } | undefined;
+    return stopReason?.type !== 'requires_action';
+  }
+  return false;
+}
+
 function parseApiEnvironment(value: unknown): ForwardApiEnvironment {
   if (value === 'cn-prod' || value === 'global-prod') return value;
   return 'cn-prod';
@@ -383,6 +412,7 @@ app.get('/api/forward/sessions/:sessionId/events/stream', async (req, res) => {
         duration: requestMs(startedAt),
       });
     });
+    let terminal = false;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -399,11 +429,26 @@ app.get('/api/forward/sessions/:sessionId/events/stream', async (req, res) => {
           frame: frameCount,
           ...summarizeSseFrame(frame),
         });
+        if (isTerminalSseFrame(frame)) terminal = true;
       }
       res.write(Buffer.from(value));
       // Force flush to ensure client receives SSE frames immediately
       if (typeof (res as unknown as { flush?: () => void }).flush === 'function') {
         (res as unknown as { flush: () => void }).flush();
+      }
+      // Close proactively after forwarding a terminal event, otherwise the upstream
+      // keeps the connection alive with heartbeats until its ~10min timeout and the
+      // client stays stuck in the streaming state.
+      if (terminal) {
+        proxyLog('info', 'sse terminal event, closing', {
+          sessionId,
+          environment: apiEnvironment,
+          requestId: upstreamRequestId || undefined,
+          frames: frameCount,
+          duration: requestMs(startedAt),
+        });
+        void reader.cancel().catch(() => undefined);
+        break;
       }
     }
     if (buffer.trim()) {
