@@ -38,8 +38,23 @@ docs/     公开产品说明与安全说明
 
 ## 环境要求
 
-- Node.js >= 18
-- npm >= 9
+- Git：用于克隆本仓库。
+- Node.js：`^20.19.0` 或 `>=22.12.0`。推荐使用 Node.js 22.12 或更高版本。
+- npm：随 Node.js 一起安装，建议 `>= 10`。
+
+本项目使用 npm workspaces 同时启动前端和本地代理，请在仓库根目录执行安装和启动命令。
+
+可以先在本地检查版本：
+
+```bash
+git --version
+node -v
+npm -v
+```
+
+如果没有安装 Node.js，建议先通过 [Node.js 官网](https://nodejs.org/)安装 LTS 版本，或使用 `nvm` 管理 Node 版本。
+
+如果没有安装 Git，可以通过 [Git 官网](https://git-scm.com/downloads)安装，或在 macOS 上执行 `xcode-select --install` 安装 Command Line Tools。
 
 ## API 环境
 
@@ -64,6 +79,15 @@ cp .env.example .env
 
 ## 本地启动
 
+首次获取项目：
+
+```bash
+git clone https://github.com/QoderAI/forward-quickstart.git
+cd forward-quickstart
+```
+
+安装依赖并启动：
+
 ```bash
 npm install
 npm run dev
@@ -73,6 +97,10 @@ npm run dev
 
 - 前端：`http://localhost:5173`
 - 本地代理：`http://localhost:3001`
+
+启动成功后，终端会同时显示前端 Vite 服务和 Express 本地代理的日志。打开前端地址后，在登录页面选择 API 环境并输入对应的 Forward PAT 即可开始体验。
+
+如果端口被占用，可以先停止占用 `5173` 或 `3001` 的本地进程，再重新执行 `npm run dev`。
 
 ## 体验流程
 

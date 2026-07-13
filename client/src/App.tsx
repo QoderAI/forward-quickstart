@@ -64,6 +64,7 @@ import {
   type ForwardSession,
   type ForwardTemplate,
 } from './forwardApi';
+import { PRODUCT_NAME } from './config/product';
 
 const AUTH_KEY = 'forward_quickstart_auth';
 const FORWARD_ICON = '/forward-icon.png';
@@ -854,7 +855,7 @@ function BrandIcon({ className = 'h-7 w-7', rounded = 'rounded-lg' }: { classNam
   return (
     <img
       src={FORWARD_ICON}
-      alt="Forward"
+      alt={PRODUCT_NAME}
       className={`${className} ${rounded} object-contain`}
       draggable={false}
     />
@@ -3039,7 +3040,7 @@ export default function App() {
               <div className="mb-4 inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-white shadow-[0_2px_12px_rgba(53,80,255,0.08)]">
                 <BrandIcon className="h-8 w-8" rounded="rounded-xl" />
               </div>
-              <h1 className="text-[22px] font-semibold text-black">欢迎使用 Forward</h1>
+              <h1 className="text-[22px] font-semibold text-black">欢迎使用 {PRODUCT_NAME}</h1>
               <p className="mt-2 text-sm text-black/45">快速创建 AI Agent，开始智能对话</p>
             </div>
             <div className="rounded-2xl bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.04),0_8px_24px_rgba(47,58,128,0.06)]">
@@ -3130,7 +3131,7 @@ export default function App() {
               <div className="mb-1 flex items-center justify-between px-1 py-1.5">
                 <div className="flex items-center gap-2">
                   <BrandIcon className="h-7 w-7" rounded="rounded-lg" />
-                  <span className="text-[15px] font-semibold text-black">Forward</span>
+                  <span className="text-[15px] font-semibold text-black">{PRODUCT_NAME}</span>
                 </div>
                 <button onClick={() => setSidebarCollapsed(true)} className="flex h-7 w-7 items-center justify-center rounded-md text-black/40 transition hover:bg-gray-200 hover:text-black" title="收起侧边栏">
                   <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M11 19l-7-7 7-7m8 14l-7-7 7-7" /></svg>
