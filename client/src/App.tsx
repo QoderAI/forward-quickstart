@@ -3341,67 +3341,7 @@ export default function App() {
               <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
             </button>
           )}
-          {/* Template switcher - only shown on chat panel */}
-          {activePanel === 'chat' && (
-          <div className="absolute top-4 z-10" style={{ left: (sidebarCollapsed ? 56 : 0) + 300 + 24 }} ref={templateSwitcherRef}>
-            <button
-              onClick={() => setShowTemplateSwitcher(!showTemplateSwitcher)}
-              className="flex items-center gap-1.5 rounded-lg px-2 py-1 text-sm font-medium text-black/80 transition hover:bg-gray-50 hover:text-black"
-            >
-              <span className="max-w-[220px] truncate">{currentTemplate?.name || '选择模板'}</span>
-              <svg className={`h-3.5 w-3.5 shrink-0 text-black/40 transition ${showTemplateSwitcher ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="m19 9-7 7-7-7" /></svg>
-            </button>
-            {showTemplateSwitcher && (
-              <div className="absolute left-full top-0 z-50 ml-2 w-[320px] rounded-xl border border-gray-200 bg-white p-1.5 shadow-lg">
-                <div className="max-h-72 overflow-y-auto">
-                  {templates.length === 0 && (
-                    <div className="py-3 text-center text-xs text-black/35">暂无模板</div>
-                  )}
-                  {templates.map((template) => {
-                    const isSelected = templateId === template.id;
-                    const skillCount = extractSkillInfo(template.skills).length;
-                    return (
-                      <button
-                        key={template.id}
-                        onClick={() => {
-                          setTemplateId(template.id);
-                          setCurrentSessionId('');
-                          setEvents([]);
-                          setShowTemplateSwitcher(false);
-                          void refreshSessions(identity, template.id);
-                        }}
-                        className={`w-full rounded-lg px-3 py-2.5 text-left transition ${
-                          isSelected ? 'bg-[#F4F6FC]' : 'hover:bg-gray-50'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="truncate text-sm font-medium text-black/80">{template.name || '未命名模板'}</div>
-                          {isSelected && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#3550FF]" />}
-                        </div>
-                        {template.description && (
-                          <div className="mt-0.5 truncate text-[11px] text-black/40">{template.description}</div>
-                        )}
-                        <div className="mt-1 flex items-center gap-2 text-[11px] text-black/35">
-                          <span>{getModelLabel(template.model)}</span>
-                          {skillCount > 0 && <span>· {skillCount} 个技能</span>}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-                <div className="border-t border-gray-100 p-1.5">
-                  <button
-                    onClick={() => { setShowTemplateSwitcher(false); openTemplateModal(); }}
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium text-[#3550FF] transition hover:bg-[#F4F6FC]"
-                  >
-                    <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
-                    新建模板
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-          )}
+          {/* Template switcher moved into the conversation list header */}
 
           {error && (
             <div className="absolute left-6 right-6 top-4 z-20 rounded-2xl border border-[#fecaca] bg-[#fef2f2] px-5 py-3 text-sm text-[#b42318] shadow-sm">
@@ -4023,12 +3963,69 @@ export default function App() {
             <div className="flex h-full flex-row overflow-hidden">
               {/* ── Conversation list ── */}
               <div className="flex w-[300px] shrink-0 flex-col border-r border-gray-100 bg-[#FAFBFF]">
-                {/* Header */}
-                <div className="flex items-center justify-between px-5 pb-3 pt-5">
-                  <h2 className="text-base font-semibold text-black">对话</h2>
+                {/* Header: template switcher (replaces the "对话" title) */}
+                <div className="flex items-center justify-between gap-2 px-5 pb-3 pt-5">
+                  <div className="relative min-w-0 flex-1" ref={templateSwitcherRef}>
+                    <button
+                      onClick={() => setShowTemplateSwitcher(!showTemplateSwitcher)}
+                      className="-ml-2 flex max-w-full items-center gap-1.5 rounded-lg px-2 py-1 text-base font-semibold text-black transition hover:bg-gray-100"
+                    >
+                      <span className="truncate">{currentTemplate?.name || '选择模板'}</span>
+                      <svg className={`h-4 w-4 shrink-0 text-black/40 transition ${showTemplateSwitcher ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="m19 9-7 7-7-7" /></svg>
+                    </button>
+                    {showTemplateSwitcher && (
+                      <div className="absolute left-0 top-full z-50 mt-1 w-[280px] rounded-xl border border-gray-200 bg-white p-1.5 shadow-lg">
+                        <div className="max-h-72 overflow-y-auto">
+                          {templates.length === 0 && (
+                            <div className="py-3 text-center text-xs text-black/35">暂无模板</div>
+                          )}
+                          {templates.map((template) => {
+                            const isSelected = templateId === template.id;
+                            const skillCount = extractSkillInfo(template.skills).length;
+                            return (
+                              <button
+                                key={template.id}
+                                onClick={() => {
+                                  setTemplateId(template.id);
+                                  setCurrentSessionId('');
+                                  setEvents([]);
+                                  setShowTemplateSwitcher(false);
+                                  void refreshSessions(identity, template.id);
+                                }}
+                                className={`w-full rounded-lg px-3 py-2.5 text-left transition ${
+                                  isSelected ? 'bg-[#F4F6FC]' : 'hover:bg-gray-50'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="truncate text-sm font-medium text-black/80">{template.name || '未命名模板'}</div>
+                                  {isSelected && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#3550FF]" />}
+                                </div>
+                                {template.description && (
+                                  <div className="mt-0.5 truncate text-[11px] text-black/40">{template.description}</div>
+                                )}
+                                <div className="mt-1 flex items-center gap-2 text-[11px] text-black/35">
+                                  <span>{getModelLabel(template.model)}</span>
+                                  {skillCount > 0 && <span>· {skillCount} 个技能</span>}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <div className="border-t border-gray-100 p-1.5">
+                          <button
+                            onClick={() => { setShowTemplateSwitcher(false); openTemplateModal(); }}
+                            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium text-[#3550FF] transition hover:bg-[#F4F6FC]"
+                          >
+                            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
+                            新建模板
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                   <button
                     onClick={() => { setCurrentSessionId(''); setEvents([]); }}
-                    className="flex h-8 w-8 items-center justify-center rounded-lg text-black/45 transition hover:bg-gray-100 hover:text-black"
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/45 transition hover:bg-gray-100 hover:text-black"
                     title="新建对话"
                   >
                     <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
