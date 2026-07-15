@@ -1327,20 +1327,14 @@ const ChatTextMessage = memo(function ChatTextMessage({ event, user }: { event: 
   }
 
   const responseTime = getResponseTime(event);
-  // While streaming (synthetic `local-stream-` message), render raw text instead
-  // of re-parsing markdown on every throttled flush — markdown is parsed once when
-  // the real final message replaces it. Also cap length to avoid huge synchronous
-  // renders that can freeze the tab.
-  const isStreaming = event.id.startsWith('local-stream-');
+  // Render markdown live during streaming too. Real-time cost stays bounded by the
+  // throttled flush (<=10fps), React.memo (only this message re-renders per flush),
+  // and truncateForDisplay (caps huge synchronous renders that could freeze the tab).
 
   return (
     <div className="flex justify-start">
       <div className="max-w-[85%] text-[14px] leading-7 text-[#1a1a1a]">
-        {isStreaming ? (
-          <div className="markdown-body whitespace-pre-wrap break-words">{truncateForDisplay(item.message)}</div>
-        ) : (
-          <div className="markdown-body break-words">{renderMarkdown(truncateForDisplay(item.message))}</div>
-        )}
+        <div className="markdown-body break-words">{renderMarkdown(truncateForDisplay(item.message))}</div>
         {responseTime && (
           <div className="mt-1.5 text-[11px] text-black/25">
             ⏱ {responseTime}
