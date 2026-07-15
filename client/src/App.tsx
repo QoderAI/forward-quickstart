@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import {
   cancelSession,
   createCloudEnvironment,
@@ -532,6 +532,14 @@ function stringifyPayload(value: unknown): string {
   }
 }
 
+// Guard against rendering megabyte-scale strings synchronously (e.g. a huge tool
+// result payload), which can freeze the main thread / make the tab unresponsive.
+const MAX_DISPLAY_CHARS = 50000;
+function truncateForDisplay(text: string, max = MAX_DISPLAY_CHARS): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n\n… [内容过长，已截断显示，共 ${text.length} 字符]`;
+}
+
 function eventDebugPayload(event: ForwardEvent) {
   const omitted = new Set([
     'id',
@@ -572,7 +580,7 @@ function toolEventPayload(event: ForwardEvent) {
     'error',
     'reason',
   ]);
-  return stringifyPayload(value || eventDebugPayload(event));
+  return truncateForDisplay(stringifyPayload(value || eventDebugPayload(event)));
 }
 
 function toolEventId(event: ForwardEvent) {
@@ -595,10 +603,12 @@ function extractArtifactFileIds(event: ForwardEvent): string[] {
     getEventValue(event, ['output', 'result', 'content']) ?? eventDebugPayload(event),
   );
   if (!raw) return [];
+  // Cap the scanned length so a huge tool result can't make the regex scan expensive.
+  const scan = raw.length > 200000 ? raw.slice(0, 200000) : raw;
   // Real Cloud file ids look like `file_00iyui42qpz40fqtdh45` (prefix + long
   // lowercase alphanumeric token). Require >=12 trailing chars so we match real
   // ids while excluding the JSON key name `file_id` (only 2 chars after prefix).
-  const matches = raw.match(/file_[0-9a-zA-Z]{12,}/g);
+  const matches = scan.match(/file_[0-9a-zA-Z]{12,}/g);
   if (!matches) return [];
   return Array.from(new Set(matches));
 }
@@ -867,9 +877,9 @@ function ChatAvatar({ user }: { user?: boolean }) {
   return null;
 }
 
-function ThinkingMessage({ event }: { event: ForwardEvent }) {
-  const text = eventThinkingText(event);
-  const payload = stringifyPayload(eventDebugPayload(event));
+const ThinkingMessage = memo(function ThinkingMessage({ event }: { event: ForwardEvent }) {
+  const text = truncateForDisplay(eventThinkingText(event));
+  const payload = truncateForDisplay(stringifyPayload(eventDebugPayload(event)));
   const isLocalWaiting = event.id.startsWith('local-');
 
   if (isLocalWaiting) {
@@ -912,7 +922,7 @@ function ThinkingMessage({ event }: { event: ForwardEvent }) {
       </div>
     </div>
   );
-}
+});
 
 function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fileId: string }) {
   const [meta, setMeta] = useState<CloudFile | null>(null);
@@ -987,7 +997,7 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
   );
 }
 
-function ToolEventMessage({
+const ToolEventMessage = memo(function ToolEventMessage({
   event,
   result,
   pending = false,
@@ -1063,7 +1073,7 @@ function ToolEventMessage({
       </div>
     </div>
   );
-}
+});
 
 // Track user message timestamps for response time calculation
 const _turnTimestamps = new Map<string, number>();
@@ -1303,7 +1313,7 @@ function renderInline(text: string): React.ReactNode {
   return <>{parts}</>;
 }
 
-function ChatTextMessage({ event, user }: { event: ForwardEvent; user?: boolean }) {
+const ChatTextMessage = memo(function ChatTextMessage({ event, user }: { event: ForwardEvent; user?: boolean }) {
   const item = eventDisplay(event);
 
   if (user) {
@@ -1317,11 +1327,20 @@ function ChatTextMessage({ event, user }: { event: ForwardEvent; user?: boolean 
   }
 
   const responseTime = getResponseTime(event);
+  // While streaming (synthetic `local-stream-` message), render raw text instead
+  // of re-parsing markdown on every throttled flush — markdown is parsed once when
+  // the real final message replaces it. Also cap length to avoid huge synchronous
+  // renders that can freeze the tab.
+  const isStreaming = event.id.startsWith('local-stream-');
 
   return (
     <div className="flex justify-start">
       <div className="max-w-[85%] text-[14px] leading-7 text-[#1a1a1a]">
-        <div className="markdown-body break-words">{renderMarkdown(item.message)}</div>
+        {isStreaming ? (
+          <div className="markdown-body whitespace-pre-wrap break-words">{truncateForDisplay(item.message)}</div>
+        ) : (
+          <div className="markdown-body break-words">{renderMarkdown(truncateForDisplay(item.message))}</div>
+        )}
         {responseTime && (
           <div className="mt-1.5 text-[11px] text-black/25">
             ⏱ {responseTime}
@@ -1330,7 +1349,7 @@ function ChatTextMessage({ event, user }: { event: ForwardEvent; user?: boolean 
       </div>
     </div>
   );
-}
+});
 
 function NavIcon({ panel }: { panel: SidebarPanel }) {
   const c = 'h-4 w-4 shrink-0';
@@ -1768,6 +1787,9 @@ export default function App() {
   const userMenuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  // Whether the chat should auto-stick to the bottom. Turns off when the user
+  // scrolls up, so streaming updates during a running task won't yank them back.
+  const stickToBottomRef = useRef(true);
   const startStreamRef = useRef<(sessionId: string, lastEventId?: string, turnStartedAt?: string) => void>(() => {});
   const streamAbort = useRef<AbortController | null>(null);
 
@@ -1778,9 +1800,18 @@ export default function App() {
 
   useEffect(() => () => streamAbort.current?.abort(), []);
 
-  // Scroll to bottom when events change
+  // Track whether the user is pinned to the bottom of the chat. When they scroll
+  // up during a running task, we stop auto-scrolling to preserve their position.
+  const handleChatScroll = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 80;
+  }, []);
+
+  // Auto-scroll to bottom on new events only when the user is already at the bottom.
   useEffect(() => {
-    if (chatScrollRef.current) {
+    if (stickToBottomRef.current && chatScrollRef.current) {
       chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
     }
   }, [events]);
@@ -1799,13 +1830,6 @@ export default function App() {
   useEffect(() => {
     return () => { stopQrPolling(); };
   }, []);
-
-  // Auto-scroll chat to bottom when events change
-  useEffect(() => {
-    if (chatScrollRef.current) {
-      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
-    }
-  }, [events]);
 
   useEffect(() => {
     if (!showTemplateSwitcher) return;
@@ -2645,6 +2669,7 @@ export default function App() {
 
   const selectSession = useCallback(async (sessionId: string) => {
     setActivePanel('chat');
+    stickToBottomRef.current = true;
     setCurrentSessionId(sessionId);
     setEvents([]);
     setError('');
@@ -2682,6 +2707,50 @@ export default function App() {
     const controller = new AbortController();
     let pollTimer: number | undefined;
     let reconnecting = false;
+    // Throttle streaming UI updates so fast/long responses don't overwhelm the main
+    // thread. Text deltas are coalesced and the synthetic streaming message is
+    // flushed at most once per FLUSH_INTERVAL_MS, always with the latest text.
+    const FLUSH_INTERVAL_MS = 100;
+    let streamFlushTimer: number | null = null;
+    let lastStreamFlush = 0;
+    const flushStreamingText = () => {
+      streamFlushTimer = null;
+      lastStreamFlush = Date.now();
+      const text = _streamingTextBySession.get(sessionId);
+      const msgId = _streamingMsgIdBySession.get(sessionId);
+      if (text == null || !msgId) return;
+      const streamEvent: ForwardEvent = {
+        id: msgId,
+        type: 'agent.message',
+        session_id: sessionId,
+        created_at: new Date().toISOString(),
+        content: [{ type: 'text', text }],
+      };
+      setEvents((prev) => {
+        const idx = prev.findIndex((e) => e.id === msgId);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = streamEvent;
+          return next;
+        }
+        return [...prev, streamEvent];
+      });
+    };
+    const scheduleStreamFlush = () => {
+      if (streamFlushTimer != null) return;
+      const elapsed = Date.now() - lastStreamFlush;
+      if (elapsed >= FLUSH_INTERVAL_MS) {
+        flushStreamingText();
+      } else {
+        streamFlushTimer = window.setTimeout(flushStreamingText, FLUSH_INTERVAL_MS - elapsed);
+      }
+    };
+    const cancelStreamFlush = () => {
+      if (streamFlushTimer != null) {
+        window.clearTimeout(streamFlushTimer);
+        streamFlushTimer = null;
+      }
+    };
     const stopPolling = () => {
       if (pollTimer !== undefined) {
         window.clearInterval(pollTimer);
@@ -2689,6 +2758,7 @@ export default function App() {
       }
     };
     const finishStream = () => {
+      cancelStreamFlush();
       stopPolling();
       controller.abort();
       setStreaming(false);
@@ -2706,6 +2776,7 @@ export default function App() {
       }
     };
     controller.signal.addEventListener('abort', () => {
+      cancelStreamFlush();
       stopPolling();
       if (!reconnecting) setStreaming(false);
     }, { once: true });
@@ -2723,6 +2794,8 @@ export default function App() {
       (event) => {
         // New turn started — reset accumulators for this session
         if (event.type === 'session.status_running') {
+          cancelStreamFlush();
+          lastStreamFlush = 0;
           _thinkingBySession.set(sessionId, '');
           _streamingTextBySession.delete(sessionId);
           _streamingMsgIdBySession.delete(sessionId);
@@ -2740,28 +2813,12 @@ export default function App() {
             const prev = _streamingTextBySession.get(sessionId) ?? '';
             const updated = prev + delta.text;
             _streamingTextBySession.set(sessionId, updated);
-            // Upsert a synthetic streaming message event for real-time display
-            let msgId = _streamingMsgIdBySession.get(sessionId);
-            if (!msgId) {
-              msgId = `local-stream-${sessionId}-${Date.now()}`;
-              _streamingMsgIdBySession.set(sessionId, msgId);
+            // Ensure a stable synthetic message id exists, then throttle the flush
+            // so we re-render at most ~10 times/second regardless of delta rate.
+            if (!_streamingMsgIdBySession.get(sessionId)) {
+              _streamingMsgIdBySession.set(sessionId, `local-stream-${sessionId}-${Date.now()}`);
             }
-            const streamEvent: ForwardEvent = {
-              id: msgId,
-              type: 'agent.message',
-              session_id: sessionId,
-              created_at: new Date().toISOString(),
-              content: [{ type: 'text', text: updated }],
-            };
-            setEvents((prev) => {
-              const idx = prev.findIndex((e) => e.id === msgId);
-              if (idx >= 0) {
-                const next = [...prev];
-                next[idx] = streamEvent;
-                return next;
-              }
-              return [...prev, streamEvent];
-            });
+            scheduleStreamFlush();
           }
           return; // Skip adding delta events to the event list
         }
@@ -2780,6 +2837,7 @@ export default function App() {
         // agent.thinking event (which arrives empty from the API), and replace
         // the synthetic streaming message with the real final message.
         if (event.type === 'agent.message') {
+          cancelStreamFlush();
           const thinkingText = _thinkingBySession.get(sessionId) ?? '';
           _thinkingBySession.delete(sessionId);
           const streamMsgId = _streamingMsgIdBySession.get(sessionId);
@@ -2902,6 +2960,8 @@ export default function App() {
       recordTurnStart(sessionId);
       const localEvents = localTurnEvents(sessionId, text);
       localThinkingId = localEvents.thinking.id;
+      // Sending a new message should always bring the view back to the bottom.
+      stickToBottomRef.current = true;
       setEvents((prev) => [...prev, localEvents.user, localEvents.thinking]);
       const result = await sendUserMessage(ctx, sessionId, text);
       setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
@@ -2940,6 +3000,8 @@ export default function App() {
       recordTurnStart(sessionId);
       const localEvents = localTurnEvents(sessionId, text);
       localThinkingId = localEvents.thinking.id;
+      // Sending a new message should always bring the view back to the bottom.
+      stickToBottomRef.current = true;
       setEvents((prev) => [...prev, localEvents.user, localEvents.thinking]);
       const result = await sendUserMessage(ctx, sessionId, text);
       setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
@@ -4134,7 +4196,7 @@ export default function App() {
                   </div>
                 )}
                 {events.length > 0 && (
-                  <div ref={chatScrollRef} className="min-h-0 flex-1 overflow-y-auto px-8">
+                  <div ref={chatScrollRef} onScroll={handleChatScroll} className="min-h-0 flex-1 overflow-y-auto px-8">
                     <div className="mx-auto flex max-w-[860px] flex-col py-6">
                     <div className="space-y-4 pb-8">
                       {events.map((event, index) => {
