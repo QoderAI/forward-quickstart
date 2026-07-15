@@ -1686,6 +1686,12 @@ export default function App() {
   const [showTemplateSwitcher, setShowTemplateSwitcher] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
+  // Developer mode unlocks template & template-resource management (create/edit/delete).
+  // Default is user mode (false). Persisted so the choice survives reloads.
+  const [developerMode, setDeveloperMode] = useState<boolean>(() => {
+    try { return localStorage.getItem('developer_mode') === '1'; } catch { return false; }
+  });
+  const [showDevModeConfirm, setShowDevModeConfirm] = useState(false);
   const [viewingTemplate, setViewingTemplate] = useState<ForwardTemplate | null>(null);
   const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
   const [viewingResource, setViewingResource] = useState<ForwardResource | null>(null);
@@ -3227,8 +3233,10 @@ export default function App() {
                     {label}
                   </button>
                 ))}
-                <div className="mb-2 mt-5 px-2 text-[11px] font-medium uppercase tracking-wider text-black/30">模板资源</div>
-                {SIDEBAR_ITEMS.slice(5, 9).map(({ id, label }) => (
+                {developerMode && (
+                  <div className="mb-2 mt-5 px-2 text-[11px] font-medium uppercase tracking-wider text-black/30">模板资源</div>
+                )}
+                {developerMode && SIDEBAR_ITEMS.slice(5, 9).map(({ id, label }) => (
                   <button
                     key={id}
                     onClick={() => {
@@ -3281,6 +3289,37 @@ export default function App() {
 
               {/* Spacer */}
               <div className="flex-1" />
+
+              {/* Developer mode toggle */}
+              <div className="shrink-0">
+                <div className="flex items-center justify-between gap-2 rounded-xl px-2.5 py-2">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <svg className="h-4 w-4 shrink-0 text-black/45" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}><path strokeLinecap="round" strokeLinejoin="round" d="m6.75 7.5 3 2.25-3 2.25m4.5 0h3m-9 8.25h13.5A2.25 2.25 0 0 0 21 18V6a2.25 2.25 0 0 0-2.25-2.25H5.25A2.25 2.25 0 0 0 3 6v12a2.25 2.25 0 0 0 2.25 2.25Z" /></svg>
+                    <span className="truncate text-sm font-medium text-black/60">开发者模式</span>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={developerMode}
+                    title={developerMode ? '关闭开发者模式' : '开启开发者模式'}
+                    onClick={() => {
+                      if (developerMode) {
+                        setDeveloperMode(false);
+                        try { localStorage.setItem('developer_mode', '0'); } catch { /* ignore */ }
+                        // If currently viewing a template-resource panel, fall back to chat.
+                        if (['skills', 'files', 'environments', 'vaults'].includes(activePanel)) {
+                          setActivePanel('chat');
+                        }
+                      } else {
+                        setShowDevModeConfirm(true);
+                      }
+                    }}
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition ${developerMode ? 'bg-[#3550FF]' : 'bg-black/15'}`}
+                  >
+                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition ${developerMode ? 'translate-x-4' : 'translate-x-0.5'}`} />
+                  </button>
+                </div>
+              </div>
 
               {/* User info at bottom */}
               <div className="mt-3 shrink-0 border-t border-[#EEF0F6] pt-3">
@@ -3575,13 +3614,15 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-3">
                       <span className="text-sm text-black/40">{templates.length} 个模板</span>
-                      <button
-                        onClick={openTemplateModal}
-                        disabled={!ctx || loading}
-                        className="rounded-full bg-[#3550FF] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:opacity-50"
-                      >
-                        + 新建模板
-                      </button>
+                      {developerMode && (
+                        <button
+                          onClick={openTemplateModal}
+                          disabled={!ctx || loading}
+                          className="rounded-full bg-[#3550FF] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:opacity-50"
+                        >
+                          + 新建模板
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -3673,9 +3714,11 @@ export default function App() {
                 {templates.length === 0 && (
                   <div className="rounded-2xl border border-dashed border-[#DDE2F2] bg-white px-5 py-12 text-center">
                     <div className="text-sm text-black/40">暂无模板</div>
-                    <button onClick={openTemplateModal} className="mt-4 rounded-full bg-[#EDEEF6] px-4 py-2 text-xs font-medium text-black hover:bg-[#E3E6F3]">
-                      新建第一个模板
-                    </button>
+                    {developerMode && (
+                      <button onClick={openTemplateModal} className="mt-4 rounded-full bg-[#EDEEF6] px-4 py-2 text-xs font-medium text-black hover:bg-[#E3E6F3]">
+                        新建第一个模板
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
@@ -4012,6 +4055,7 @@ export default function App() {
                           })}
                         </div>
                         <div className="border-t border-gray-100 p-1.5">
+                          {developerMode ? (
                           <button
                             onClick={() => { setShowTemplateSwitcher(false); openTemplateModal(); }}
                             className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium text-[#3550FF] transition hover:bg-[#F4F6FC]"
@@ -4019,6 +4063,15 @@ export default function App() {
                             <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
                             新建模板
                           </button>
+                          ) : (
+                          <button
+                            onClick={() => { setShowTemplateSwitcher(false); setActivePanel('templates'); }}
+                            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium text-black/50 transition hover:bg-gray-50"
+                          >
+                            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 0 1-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H6.75a9.06 9.06 0 0 1 1.5.124m7.5 10.376h3.375c.621 0 1.125-.504 1.125-1.125V11.25c0-4.46-3.243-8.161-7.5-8.876a9.06 9.06 0 0 0-1.5-.124H9.375c-.621 0-1.125.504-1.125 1.125v3.5m7.5 10.375H9.375a1.125 1.125 0 0 1-1.125-1.125v-9.25m12 6.625v-1.875a3.375 3.375 0 0 0-3.375-3.375h-1.5a1.125 1.125 0 0 1-1.125-1.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H9.75" /></svg>
+                            查看全部模板
+                          </button>
+                          )}
                         </div>
                       </div>
                     )}
@@ -4576,6 +4629,30 @@ export default function App() {
             {loading ? '删除中...' : '确认删除'}
           </button>
           <button onClick={() => setDeleteConfirmResource(null)} className="rounded-full border border-gray-200 px-5 py-2.5 text-sm text-black/60 hover:bg-gray-50">取消</button>
+        </div>
+      </Modal>
+
+      {/* Developer mode confirmation */}
+      <Modal open={showDevModeConfirm} onClose={() => setShowDevModeConfirm(false)} title="开启开发者模式？">
+        <div className="text-sm leading-relaxed text-black/70">
+          <p>开启后将解锁<strong className="text-black">模板</strong>与<strong className="text-black">模板资源（技能 / 文件 / 环境 / 凭据）</strong>的完整管理权限，你可以新建、修改和删除这些内容。</p>
+          <div className="mt-3 flex gap-2 rounded-xl border border-[#F5C6C6] bg-[#FEF2F2] px-3.5 py-3 text-[13px] leading-relaxed text-[#b42318]">
+            <svg className="mt-0.5 h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" /></svg>
+            <span>模板与资源由<strong>所有终端用户共享</strong>。你的任何新建、修改或删除都会<strong>立即对全体用户生效且不可撤销</strong>，请务必谨慎操作。</span>
+          </div>
+        </div>
+        <div className="mt-6 flex items-center gap-3">
+          <button
+            onClick={() => {
+              setDeveloperMode(true);
+              try { localStorage.setItem('developer_mode', '1'); } catch { /* ignore */ }
+              setShowDevModeConfirm(false);
+            }}
+            className="flex-1 rounded-full bg-[#3550FF] py-2.5 text-center text-sm font-medium text-white transition hover:bg-[#2a42e0]"
+          >
+            确认开启，我已知晓风险
+          </button>
+          <button onClick={() => setShowDevModeConfirm(false)} className="rounded-full border border-gray-200 px-5 py-2.5 text-sm text-black/60 hover:bg-gray-50">取消</button>
         </div>
       </Modal>
 
@@ -5193,12 +5270,14 @@ export default function App() {
               >
                 {vtIsActive ? '当前使用中' : '使用此模板对话'}
               </button>
-              <button
-                onClick={() => openEditTemplateModal(vt)}
-                className="rounded-full border border-[#DDE2F2] px-5 py-2.5 text-sm font-medium text-[#3550FF] transition hover:bg-[#F4F6FC]"
-              >
-                编辑
-              </button>
+              {developerMode && (
+                <button
+                  onClick={() => openEditTemplateModal(vt)}
+                  className="rounded-full border border-[#DDE2F2] px-5 py-2.5 text-sm font-medium text-[#3550FF] transition hover:bg-[#F4F6FC]"
+                >
+                  编辑
+                </button>
+              )}
               <button onClick={() => setViewingTemplate(null)} className="rounded-full border border-gray-200 px-5 py-2.5 text-sm text-black/60 hover:bg-gray-50">关闭</button>
             </div>
           </Modal>
