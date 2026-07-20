@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run build --workspace=client",
+  "outputDirectory": "client/dist",
+  "functions": {
+    "api/**/*.ts": {
+      "maxDuration": 300
+    }
+  }
+}

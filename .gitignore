@@ -5,3 +5,5 @@ dist/
 .DS_Store
 worktrees/
 server/logs/
+.vercel
+.env*

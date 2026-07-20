@@ -2425,28 +2425,6 @@ export default function App() {
     }
   }, [ctx, newEnvName, newEnvDescription, newEnvNetworking, loadResources]);
 
-  const addResourceReference = useCallback((resource: ForwardResource) => {
-    if (resource.type === 'skill') {
-      setSkillIdsText((prev) => splitTokens(`${prev}\n${resource.id}`).join('\n'));
-      return;
-    }
-    if (resource.type === 'file') {
-      setFileIdsText((prev) => splitTokens(`${prev}\n${resource.id}`).join('\n'));
-      return;
-    }
-    if (resource.type === 'environment') {
-      setEnvironmentId(resource.id);
-      return;
-    }
-    if (resource.type === 'vault') {
-      setVaultIdsText((prev) => splitTokens(`${prev}\n${resource.id}`).join('\n'));
-      return;
-    }
-    if (resource.type === 'memory_store') {
-      setError('记忆库已支持注册和列表，但当前模板接口暂不支持绑定 memory_store。');
-    }
-  }, []);
-
   const activeResourceType = resourceTypeForPanel(activePanel) ?? 'skill';
   const activeResourceLabel = RESOURCE_TYPE_LABELS[activeResourceType];
 

@@ -553,7 +553,13 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', forwardApiBaseUrls: API_BASE_URLS });
 });
 
-app.listen(PORT, () => {
-  console.log(`Forward quickstart server running on http://localhost:${PORT}`);
-  console.log('Forward API targets:', API_BASE_URLS);
-});
+export default app;
+
+// Vercel imports the Express app as a serverless function. Keep the listener
+// for the existing local development and standalone production commands.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Forward quickstart server running on http://localhost:${PORT}`);
+    console.log('Forward API targets:', API_BASE_URLS);
+  });
+}

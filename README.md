@@ -104,6 +104,39 @@ npm run dev
 
 如果端口被占用，可以先停止占用 `5173` 或 `3001` 的本地进程，再重新执行 `npm run dev`。
 
+## Vercel 部署
+
+本仓库同时支持本地运行和 Vercel 部署：
+
+- 本地运行继续使用 `npm run dev`，Vite 会将 `/api` 请求代理到本地 Express 服务。
+- Vercel 会构建 `client/dist` 并将现有 Express API 作为 Serverless Functions 部署；前端和 API 使用同一域名。
+
+建议先 Fork 本仓库到自己的 GitHub 账号，再在 Vercel 导入 Fork 后的仓库。Vercel 检测到根目录的 `vercel.json` 后会自动使用正确的构建命令和 API 函数配置。
+
+也可以使用 Vercel CLI 部署：
+
+```bash
+npm install
+npx vercel link
+npx vercel
+npx vercel --prod
+```
+
+- `npx vercel` 创建 Preview 部署，用于测试。
+- `npx vercel --prod` 发布到正式域名。
+- 连接 GitHub 后，推送到配置的生产分支会自动触发 Vercel 部署。
+
+默认的 CN / Global API 地址已经内置，不需要在 Vercel 保存 PAT。若需要覆盖 API 地址，可在 Vercel Project Settings 的 Environment Variables 中配置：
+
+```text
+CN_PROD_FORWARD_API_BASE_URL
+GLOBAL_PROD_FORWARD_API_BASE_URL
+CN_PROD_CLOUD_API_BASE_URL
+GLOBAL_PROD_CLOUD_API_BASE_URL
+```
+
+不要将 PAT、Vault 凭据或其他密钥提交到 Git 仓库或写入 Vercel 的公开前端变量。
+
 ## 体验流程
 
 1. 打开前端页面。
