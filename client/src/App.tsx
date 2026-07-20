@@ -144,6 +144,15 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   lite: '轻量版',
 };
 
+function getTemplateModelId(model: ForwardTemplate['model'] | unknown): string {
+  if (typeof model === 'string') return model;
+  if (model && typeof model === 'object') {
+    const id = (model as Record<string, unknown>).id;
+    if (typeof id === 'string') return id;
+  }
+  return '';
+}
+
 function fileCount(files: unknown): number {
   if (!files || typeof files !== 'object') return 0;
   return Object.keys(files as Record<string, unknown>).length;
@@ -1778,7 +1787,9 @@ export default function App() {
     }
   }, [templateModel]);
 
-  const getModelLabel = useCallback((modelId: string): string => {
+  const getModelLabel = useCallback((model: ForwardTemplate['model'] | unknown): string => {
+    const modelId = getTemplateModelId(model);
+    if (!modelId) return '未知模型';
     const fromApi = cloudModels.find((m) => m.id === modelId);
     if (fromApi) return fromApi.display_name;
     return MODEL_DISPLAY_NAMES[modelId] ?? modelId;
@@ -2296,7 +2307,7 @@ export default function App() {
     setEditingTemplateId(template.id);
     setTemplateName(template.name || '');
     setTemplateDescription(template.description || '');
-    setTemplateModel(template.model || 'ultimate');
+    setTemplateModel(getTemplateModelId(template.model) || 'ultimate');
     setTemplateSystem(template.system || '');
     setEnvironmentId(template.environment_id || '');
     // Skills → skill IDs
@@ -3150,7 +3161,16 @@ export default function App() {
               </form>
             </div>
             <p className="mt-5 text-center text-xs text-black/30">
-              需要 PAT？前往 <span className="text-[#3550FF]">Qoder 控制台</span> 获取访问令牌
+              需要 PAT？前往{' '}
+              <a
+                href={apiEnvironment === 'cn-prod' ? 'https://qoder.com.cn/cloud/pat-keys' : 'https://qoder.com/cloud/pat-keys'}
+                target="_blank"
+                rel="noreferrer"
+                className="text-[#3550FF] hover:underline"
+              >
+                Qoder 控制台
+              </a>{' '}
+              获取访问令牌
             </p>
           </div>
         </div>

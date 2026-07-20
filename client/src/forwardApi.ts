@@ -15,12 +15,19 @@ export interface ForwardIdentity {
   metadata?: Record<string, unknown>;
 }
 
+export type ForwardTemplateModel = string | {
+  id?: string;
+  effort?: string;
+  context_window?: number;
+  [key: string]: unknown;
+};
+
 export interface ForwardTemplate {
   id: string;
   name: string;
   description?: string;
   status: string;
-  model: string;
+  model: ForwardTemplateModel;
   system?: string;
   tools?: unknown[];
   mcp_servers?: unknown[];
