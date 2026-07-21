@@ -121,11 +121,13 @@ function summarizeSseFrame(frame: string) {
     return { id: idLine, type: eventName, rawData: dataLines.length > 0 };
   }
   const record = data as Record<string, unknown>;
+  const delta = record.delta as Record<string, unknown> | undefined;
   return {
     id: String(record.id ?? idLine ?? ''),
     type: String(record.type ?? eventName ?? ''),
     turnId: String(record.turn_id ?? ''),
     toolUseId: String(record.tool_use_id ?? record.custom_tool_use_id ?? record.mcp_tool_use_id ?? record.tool_call_id ?? ''),
+    ...(delta ? { deltaType: String(delta.type ?? ''), deltaPreview: String(delta.thinking ?? delta.text ?? '').slice(0, 60) } : {}),
   };
 }
 
