@@ -490,10 +490,14 @@ type EventViewKind =
   | 'agent_thinking'
   | 'tool_use'
   | 'tool_result'
+  | 'session_error'
   | 'hidden';
 
 function eventViewKind(event: ForwardEvent): EventViewKind {
   if (event.type === 'user.message') return 'user';
+  // session.error must stay visible in the chat: it clears the local thinking
+  // bubble, so hiding it would make the turn end silently with no feedback.
+  if (event.type === 'session.error') return 'session_error';
   if (event.type === 'agent.message') return 'agent_message';
   if (event.type === 'agent.thinking') return 'agent_thinking';
   if (
@@ -1253,9 +1257,15 @@ function renderMarkdown(text: string): React.ReactNode {
       paraLines.push(lines[i]);
       i++;
     }
-    if (paraLines.length > 0) {
-      blocks.push(<p key={key++} className="my-1.5">{renderInline(paraLines.join(' '))}</p>);
+    if (paraLines.length === 0) {
+      // No block matched and the paragraph collector refused this line (e.g. a
+      // streaming table header whose separator row hasn't arrived yet, or a bare
+      // '## ' with no text). Consume it as plain text to guarantee forward
+      // progress — otherwise the while(i) loop spins forever and freezes the tab.
+      paraLines.push(lines[i]);
+      i++;
     }
+    blocks.push(<p key={key++} className="my-1.5">{renderInline(paraLines.join(' '))}</p>);
   }
 
   return <>{blocks}</>;
@@ -1321,6 +1331,29 @@ function renderInline(text: string): React.ReactNode {
 
   return <>{parts}</>;
 }
+
+function sessionErrorDetail(event: ForwardEvent): string {
+  const err = event.error;
+  if (typeof err === 'string') return err;
+  if (err && typeof err === 'object') {
+    const rec = err as { message?: string; type?: string };
+    return rec.message || rec.type || '';
+  }
+  return '';
+}
+
+const SessionErrorMessage = memo(function SessionErrorMessage({ event }: { event: ForwardEvent }) {
+  const detail = sessionErrorDetail(event);
+  return (
+    <div className="flex justify-start">
+      <div className="max-w-[85%] rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 text-[13px] leading-6 text-red-600">
+        <span className="font-medium">本轮回复失败</span>
+        {detail && <span className="ml-1 text-red-500/80">（{detail}）</span>}
+        <span className="ml-1">请稍后重新发送。</span>
+      </div>
+    </div>
+  );
+});
 
 const ChatTextMessage = memo(function ChatTextMessage({ event, user }: { event: ForwardEvent; user?: boolean }) {
   const item = eventDisplay(event);
@@ -4293,6 +4326,7 @@ export default function App() {
                             />
                           );
                         }
+                        if (kind === 'session_error') return <SessionErrorMessage key={event.id} event={event} />;
                         if (kind === 'user') return <ChatTextMessage key={event.id} event={event} user />;
                         return <ChatTextMessage key={event.id} event={event} />;
                       })}
