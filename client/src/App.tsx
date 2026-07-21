@@ -1803,6 +1803,9 @@ export default function App() {
   const stickToBottomRef = useRef(true);
   const startStreamRef = useRef<(sessionId: string, lastEventId?: string, turnStartedAt?: string) => void>(() => {});
   const streamAbort = useRef<AbortController | null>(null);
+  // Tracks the session currently shown in the chat view ('' = new-conversation
+  // screen), so background stream/poll callbacks never paint into another view.
+  const currentSessionIdRef = useRef('');
 
   const ctx = useMemo<ForwardContext | null>(
     () => (pat.trim() ? { pat: pat.trim(), environment: apiEnvironment } : null),
@@ -1872,12 +1875,17 @@ export default function App() {
     }
   }, [templateId, apiEnvironment, externalId]);
 
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId;
+  }, [currentSessionId]);
+
   const refreshSessions = useCallback(async (nextIdentity = identity, nextTemplateId = templateId) => {
     if (!ctx || !nextIdentity) return;
     const page = await listSessions(ctx, nextIdentity.id, nextTemplateId || undefined);
     setSessions(page.data);
-    if (!currentSessionId && page.data[0]) setCurrentSessionId(page.data[0].id);
-  }, [ctx, currentSessionId, identity, templateId]);
+    // Never auto-select a session here: background polling calls this while the
+    // user may be sitting on the new-conversation screen (currentSessionId === '').
+  }, [ctx, identity, templateId]);
 
   const loadSessionEvents = useCallback(async (sessionId: string) => {
     if (!ctx || !sessionId) return;
@@ -1891,10 +1899,11 @@ export default function App() {
     const page = await listEvents(ctx, sessionId);
     // Reverse to chronological order before merging
     const chronologicalData = [...page.data].reverse();
-    setEvents((prev) => {
-      if (prev.length > 0 && !prev.some((event) => event.session_id === sessionId)) return prev;
-      return mergeIncomingEvents(prev, chronologicalData);
-    });
+    // Only merge into the view when this session is still the one on screen;
+    // background polling must not repopulate the new-conversation screen.
+    if (currentSessionIdRef.current === sessionId) {
+      setEvents((prev) => mergeIncomingEvents(prev, chronologicalData));
+    }
     return { ...page, data: chronologicalData };
   }, [ctx]);
 
@@ -2006,6 +2015,7 @@ export default function App() {
       setTemplateId(schedule.template_id);
       setActivePanel('chat');
       if (currentRun.session_id) {
+        currentSessionIdRef.current = currentRun.session_id;
         setCurrentSessionId(currentRun.session_id);
         await loadSessionEvents(currentRun.session_id);
         // Start streaming the session
@@ -2384,6 +2394,7 @@ export default function App() {
         const sessionPage = await listSessions(ctx, nextIdentity.id, nextTemplateId);
         setSessions(sessionPage.data);
         // Don't auto-select a session - show empty chat welcome screen
+        currentSessionIdRef.current = '';
         setCurrentSessionId('');
       }
     } catch (err) {
@@ -2659,6 +2670,7 @@ export default function App() {
   const selectSession = useCallback(async (sessionId: string) => {
     setActivePanel('chat');
     stickToBottomRef.current = true;
+    currentSessionIdRef.current = sessionId;
     setCurrentSessionId(sessionId);
     setEvents([]);
     setError('');
@@ -2705,6 +2717,9 @@ export default function App() {
     const flushStreamingText = () => {
       streamFlushTimer = null;
       lastStreamFlush = Date.now();
+      // Don't paint into the view if the user has navigated away from this session
+      // (e.g. opened the new-conversation screen while this stream keeps running).
+      if (currentSessionIdRef.current !== sessionId) return;
       const text = _streamingTextBySession.get(sessionId);
       const msgId = _streamingMsgIdBySession.get(sessionId);
       if (text == null || !msgId) return;
@@ -2833,7 +2848,9 @@ export default function App() {
           _streamingTextBySession.delete(sessionId);
           _streamingMsgIdBySession.delete(sessionId);
 
-          if (thinkingText) {
+          if (currentSessionIdRef.current !== sessionId) {
+            // View moved to another session / new-conversation screen: skip painting.
+          } else if (thinkingText) {
             setEvents((prev) => {
               // Remove synthetic streaming message if present
               const next = streamMsgId ? prev.filter((e) => e.id !== streamMsgId) : [...prev];
@@ -2853,7 +2870,9 @@ export default function App() {
             });
           }
         } else {
-          setEvents((prev) => mergeIncomingEvents(prev, [event]));
+          if (currentSessionIdRef.current === sessionId) {
+            setEvents((prev) => mergeIncomingEvents(prev, [event]));
+          }
         }
 
         // Auto-confirm tool calls when session enters requires_action
@@ -2933,7 +2952,10 @@ export default function App() {
   const send = useCallback(async () => {
     const text = input.trim();
     if (!ctx || !identity || !templateId || !text) return;
-    if (streaming || stopping) return; // prevent send while agent is processing
+    // Block sending only while the on-screen session is processing; starting a
+    // brand-new conversation is always allowed even if a background task runs.
+    if (stopping) return;
+    if (streaming && currentSessionId) return;
     const turnStartedAt = new Date().toISOString();
     let localThinkingId = '';
     setInput('');
@@ -2943,6 +2965,9 @@ export default function App() {
       if (!sessionId) {
         const session = await createSession(ctx, identity.id, templateId, sessionTitle(text));
         setSessions((prev) => [session, ...prev]);
+        // Sync the ref immediately: startStream below runs before the effect that
+        // mirrors currentSessionId into the ref, and its guards need the new id.
+        currentSessionIdRef.current = session.id;
         setCurrentSessionId(session.id);
         sessionId = session.id;
       }
@@ -2983,6 +3008,7 @@ export default function App() {
       if (!sessionId) {
         const session = await createSession(ctx, identity.id, templateId, sessionTitle(text));
         setSessions((prev) => [session, ...prev]);
+        currentSessionIdRef.current = session.id;
         setCurrentSessionId(session.id);
         sessionId = session.id;
       }
@@ -4028,6 +4054,7 @@ export default function App() {
                                 key={template.id}
                                 onClick={() => {
                                   setTemplateId(template.id);
+                                  currentSessionIdRef.current = '';
                                   setCurrentSessionId('');
                                   setEvents([]);
                                   setShowTemplateSwitcher(false);
@@ -4075,7 +4102,7 @@ export default function App() {
                     )}
                   </div>
                   <button
-                    onClick={() => { setCurrentSessionId(''); setEvents([]); }}
+                    onClick={() => { currentSessionIdRef.current = ''; setCurrentSessionId(''); setEvents([]); }}
                     className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/45 transition hover:bg-gray-100 hover:text-black"
                     title="新建对话"
                   >
