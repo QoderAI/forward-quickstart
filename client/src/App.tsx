@@ -29,6 +29,7 @@ import {
   listSessions,
   listTemplates,
   registerResource,
+  addSessionFileResource,
   deleteForwardResource,
   ForwardApiError,
   sendUserMessage,
@@ -877,6 +878,70 @@ function localTurnEvents(sessionId: string, text: string) {
   };
 }
 
+// ─── Chat attachments ─────────────────────────────────────────────
+// Files API only accepts text-like files (see Files API docs), and the live
+// Forward API rejects event.file_attachments, so attachments are delivered by
+// mounting the uploaded file into the agent workspace and appending a marker
+// block to the user message text. The bubble parses the marker back into
+// chips, which also keeps attachments visible after history reloads.
+const ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
+const ATTACHMENT_EXTENSIONS = [
+  'txt', 'md', 'csv', 'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'conf', 'cfg', 'env', 'log',
+  'html', 'htm', 'css', 'scss', 'less', 'js', 'jsx', 'ts', 'tsx', 'vue', 'svelte',
+  'py', 'go', 'rs', 'java', 'kt', 'scala', 'c', 'cpp', 'cc', 'h', 'hpp', 'rb', 'php',
+  'swift', 'r', 'lua', 'pl', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'sql', 'graphql', 'gql',
+  'proto', 'dockerfile', 'makefile', 'gitignore', 'editorconfig', 'eslintrc', 'prettierrc',
+  'tex', 'rst', 'adoc', 'org', 'svg',
+];
+const ATTACHMENT_ACCEPT = ATTACHMENT_EXTENSIONS.map((ext) => `.${ext}`).join(',');
+
+interface PendingAttachment {
+  localId: string;
+  file: File;
+  name: string;
+  size: number;
+  status: 'uploading' | 'done' | 'error';
+  fileId?: string;
+  storedName?: string;
+  error?: string;
+}
+
+function attachmentMountPath(storedName: string): string {
+  return `/data/workspace/${storedName}`;
+}
+
+function formatBytes(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// Marker block appended to the user message text: the agent learns where the
+// files are, and the UI parses it back into chips after history reloads (the
+// server stores message text verbatim).
+function composeMessageWithAttachments(text: string, storedNames: string[]): string {
+  if (storedNames.length === 0) return text;
+  const markers = storedNames.map((name) => `[附件] ${name} → ${attachmentMountPath(name)}`);
+  return `${text}\n\n${markers.join('\n')}`;
+}
+
+const ATTACHMENT_MARKER_RE = /^\[附件\] (.+?) → (\/\S+)$/;
+
+function splitAttachmentMarkers(text: string): { body: string; attachments: Array<{ name: string; path: string }> } {
+  const lines = text.split('\n');
+  const attachments: Array<{ name: string; path: string }> = [];
+  let i = lines.length - 1;
+  while (i >= 0) {
+    const match = ATTACHMENT_MARKER_RE.exec(lines[i]);
+    if (!match) break;
+    attachments.unshift({ name: match[1], path: match[2] });
+    i -= 1;
+  }
+  if (attachments.length === 0) return { body: text, attachments: [] };
+  const body = lines.slice(0, i + 1).join('\n').replace(/\s+$/, '');
+  return { body, attachments };
+}
+
 function groupSessionsByDate(sessions: ForwardSession[]): Array<{ label: string; items: ForwardSession[] }> {
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -1403,6 +1468,56 @@ const SessionErrorMessage = memo(function SessionErrorMessage({ event }: { event
   );
 });
 
+// Chips above the composer textarea for picked attachments, ChatGPT-style:
+// spinner while uploading, error state with retry, and a remove button.
+const AttachmentChips = memo(function AttachmentChips({
+  attachments,
+  onRemove,
+  onRetry,
+}: {
+  attachments: PendingAttachment[];
+  onRemove: (localId: string) => void;
+  onRetry: (localId: string) => void;
+}) {
+  if (attachments.length === 0) return null;
+  return (
+    <div className="mb-2 flex flex-wrap gap-1.5">
+      {attachments.map((a) => (
+        <span
+          key={a.localId}
+          title={a.status === 'error' ? (a.error || '上传失败') : a.name}
+          className={`inline-flex max-w-[240px] items-center gap-1.5 rounded-lg border px-2 py-1 text-[12px] leading-4 ${
+            a.status === 'error'
+              ? 'border-red-200 bg-red-50 text-red-600'
+              : 'border-black/10 bg-[#F7F8FC] text-black/70'
+          }`}
+        >
+          {a.status === 'uploading' ? (
+            <svg className="h-3 w-3 shrink-0 animate-spin text-[#3550FF]" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-90" fill="currentColor" d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2Z" />
+            </svg>
+          ) : (
+            <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+            </svg>
+          )}
+          <span className="truncate">{a.name}</span>
+          <span className={`shrink-0 ${a.status === 'error' ? 'text-red-400' : 'text-black/30'}`}>
+            {a.status === 'error' ? '上传失败' : formatBytes(a.size)}
+          </span>
+          {a.status === 'error' && (
+            <button type="button" onClick={() => onRetry(a.localId)} className="shrink-0 font-medium text-[#3550FF] hover:underline">重试</button>
+          )}
+          <button type="button" onClick={() => onRemove(a.localId)} className="shrink-0 text-black/30 hover:text-black/60" title="移除附件">
+            <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+});
+
 // Gear button next to the send button that opens a small popover holding the
 // "show thinking / show tool calls" switches, replacing the old inline toggles.
 const ChatSettingsButton = memo(function ChatSettingsButton({
@@ -1464,10 +1579,23 @@ const ChatTextMessage = memo(function ChatTextMessage({ event, user }: { event: 
   const item = eventDisplay(event);
 
   if (user) {
+    const { body, attachments: msgAttachments } = splitAttachmentMarkers(item.message);
     return (
       <div className="flex justify-end">
         <div className="max-w-[70%] rounded-2xl bg-[#EBF0FF] px-4 py-2.5 text-[14px] leading-6 text-black">
-          <div className="whitespace-pre-wrap break-words">{item.message}</div>
+          {msgAttachments.length > 0 && (
+            <div className="mb-1.5 flex flex-wrap gap-1.5">
+              {msgAttachments.map((a) => (
+                <span key={a.path} title={a.path} className="inline-flex max-w-[220px] items-center gap-1 rounded-lg bg-white/80 px-2 py-0.5 text-[12px] leading-4 text-black/60">
+                  <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="m18.375 12.739-7.693 7.693a4.5 4.5 0 0 1-6.364-6.364l10.94-10.94A3 3 0 1 1 19.5 7.372L8.552 18.32a1.5 1.5 0 0 1-2.122-2.122l7.693-7.693" />
+                  </svg>
+                  <span className="truncate">{a.name}</span>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="whitespace-pre-wrap break-words">{body}</div>
         </div>
       </div>
     );
@@ -1989,6 +2117,62 @@ export default function App() {
     () => (pat.trim() ? { pat: pat.trim(), environment: apiEnvironment } : null),
     [apiEnvironment, pat],
   );
+
+  // Attachments picked in the composer. They upload immediately on selection
+  // (ChatGPT-style progress chips), then get mounted into the session
+  // workspace when the message is sent.
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
+
+  const uploadAttachment = useCallback(async (localId: string, file: File) => {
+    if (!ctx) return;
+    try {
+      const uploaded = await uploadCloudFile(ctx, { file, name: file.name, metadata: { source: 'chat-attachment' } });
+      setAttachments((prev) => prev.map((a) => (
+        a.localId === localId ? { ...a, status: 'done', fileId: uploaded.id, storedName: uploaded.filename } : a
+      )));
+    } catch (err) {
+      setAttachments((prev) => prev.map((a) => (
+        a.localId === localId ? { ...a, status: 'error', error: err instanceof Error ? err.message : String(err) } : a
+      )));
+    }
+  }, [ctx]);
+
+  const pickAttachments = useCallback((files: FileList | null) => {
+    if (!files || files.length === 0 || !ctx) return;
+    const accepted: PendingAttachment[] = [];
+    const rejected: string[] = [];
+    for (const file of Array.from(files)) {
+      const ext = (file.name.includes('.') ? file.name.split('.').pop()! : file.name).toLowerCase();
+      if (!ATTACHMENT_EXTENSIONS.includes(ext)) { rejected.push(`「${file.name}」类型不支持`); continue; }
+      if (file.size > ATTACHMENT_MAX_BYTES) { rejected.push(`「${file.name}」超过 5 MB 限制`); continue; }
+      accepted.push({
+        localId: `att-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        file,
+        name: file.name,
+        size: file.size,
+        status: 'uploading',
+      });
+    }
+    if (rejected.length > 0) setError(`附件已跳过：${rejected.join('、')}（仅支持单个 ≤5MB 的文本类文件）`);
+    else setError('');
+    if (accepted.length > 0) {
+      setAttachments((prev) => [...prev, ...accepted]);
+      for (const a of accepted) void uploadAttachment(a.localId, a.file);
+    }
+  }, [ctx, uploadAttachment]);
+
+  const removeAttachment = useCallback((localId: string) => {
+    setAttachments((prev) => prev.filter((a) => a.localId !== localId));
+  }, []);
+
+  const retryAttachment = useCallback((localId: string) => {
+    setAttachments((prev) => {
+      const target = prev.find((a) => a.localId === localId);
+      if (target && target.status === 'error') void uploadAttachment(localId, target.file);
+      return prev.map((a) => (a.localId === localId && a.status === 'error' ? { ...a, status: 'uploading', error: undefined } : a));
+    });
+  }, [uploadAttachment]);
 
   useEffect(() => () => streamAbort.current?.abort(), []);
 
@@ -3133,11 +3317,27 @@ export default function App() {
 
   const send = useCallback(async () => {
     const text = input.trim();
-    if (!ctx || !identity || !templateId || !text) return;
+    if (!ctx || !identity || !templateId) return;
     // Block sending only while the on-screen session is processing; starting a
     // brand-new conversation is always allowed even if a background task runs.
     if (stopping) return;
     if (streaming && currentSessionId) return;
+    // Wait until every attachment finished uploading (or was removed) —
+    // sending with a half-uploaded attachment would confuse the agent.
+    if (attachments.some((a) => a.status !== 'done')) return;
+    const readyAttachments = attachments.filter((a) => a.fileId && a.storedName);
+    if (!text && readyAttachments.length === 0) return;
+    // Dedupe mount names within this batch so same-named files don't collide
+    // on the workspace path.
+    const usedNames = new Set<string>();
+    const mountNames = readyAttachments.map((a) => {
+      let name = a.storedName!;
+      if (usedNames.has(name)) name = `${a.fileId}-${name}`;
+      usedNames.add(name);
+      return name;
+    });
+    const displayText = text || '请查看我上传的附件。';
+    const finalText = composeMessageWithAttachments(displayText, mountNames);
     const turnStartedAt = new Date().toISOString();
     let localThinkingId = '';
     setInput('');
@@ -3145,22 +3345,32 @@ export default function App() {
     try {
       let sessionId = currentSessionId;
       if (!sessionId) {
-        const session = await createSession(ctx, identity.id, templateId, sessionTitle(text));
+        const session = await createSession(ctx, identity.id, templateId, sessionTitle(displayText), readyAttachments.map((a) => a.fileId!));
         setSessions((prev) => [session, ...prev]);
         // Sync the ref immediately: startStream below runs before the effect that
         // mirrors currentSessionId into the ref, and its guards need the new id.
         currentSessionIdRef.current = session.id;
         setCurrentSessionId(session.id);
         sessionId = session.id;
+      } else {
+        // Existing session: mount each attachment into the agent workspace
+        // BEFORE the message lands, so the agent can read it immediately.
+        for (let i = 0; i < readyAttachments.length; i += 1) {
+          await addSessionFileResource(ctx, sessionId, {
+            file_id: readyAttachments[i].fileId!,
+            mount_path: attachmentMountPath(mountNames[i]),
+          });
+        }
       }
       recordTurnStart(sessionId);
-      const localEvents = localTurnEvents(sessionId, text);
+      const localEvents = localTurnEvents(sessionId, finalText);
       localThinkingId = localEvents.thinking.id;
       // Sending a new message should always bring the view back to the bottom.
       stickToBottomRef.current = true;
       setEvents((prev) => [...prev, localEvents.user, localEvents.thinking]);
-      const result = await sendUserMessage(ctx, sessionId, text);
+      const result = await sendUserMessage(ctx, sessionId, finalText);
       setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
+      setAttachments([]);
       startStream(sessionId, lastRemoteEventId(result.data ?? []), turnStartedAt);
       window.setTimeout(() => {
         void mergeSessionEvents(sessionId);
@@ -3177,7 +3387,7 @@ export default function App() {
       setError(err instanceof Error ? err.message : String(err));
       setInput(text);
     }
-  }, [ctx, currentSessionId, identity, input, mergeSessionEvents, refreshSessions, startStream, templateId, streaming, stopping]);
+  }, [attachments, ctx, currentSessionId, identity, input, mergeSessionEvents, refreshSessions, startStream, templateId, streaming, stopping]);
 
   const sendQuick = useCallback(async (text: string) => {
     if (!ctx || !identity || !templateId || !text.trim()) return;
@@ -3277,6 +3487,10 @@ export default function App() {
     currentSessionId &&
     !isCurrentTurnCanceling &&
     (streaming || hasPendingLocalThinking || currentSessionStatus === 'running' || currentSessionStatus === 'processing'),
+  );
+  const attachmentsBusy = attachments.some((a) => a.status !== 'done');
+  const canSendMessage = Boolean(
+    identity && templateId && !attachmentsBusy && (input.trim() || attachments.length > 0),
   );
   const displayName = externalId || identity?.external_id || identity?.id || 'Forward 用户';
   const selectedSkillIds = splitTokens(skillIdsText);
@@ -4403,6 +4617,17 @@ export default function App() {
 
               {/* ── Chat content area ── */}
               <div className="flex min-w-0 flex-1 flex-col bg-white">
+                <input
+                  ref={attachmentInputRef}
+                  type="file"
+                  multiple
+                  accept={ATTACHMENT_ACCEPT}
+                  className="hidden"
+                  onChange={(e) => {
+                    pickAttachments(e.target.files);
+                    e.target.value = '';
+                  }}
+                />
                 {events.length === 0 && sessionLoading && (
                   <div className="flex min-h-0 flex-1 items-center justify-center">
                     <svg className="h-7 w-7 animate-spin text-[#3550FF]" fill="none" viewBox="0 0 24 24">
@@ -4426,6 +4651,7 @@ export default function App() {
                         </p>
                       </div>
                       <div className="rounded-2xl border border-[#E5E7EB] bg-white px-4 py-3 shadow-[0_1px_3px_rgba(0,0,0,0.04)] transition focus-within:border-[#3550FF] focus-within:shadow-[0_0_0_3px_rgba(53,80,255,0.06)]">
+                        <AttachmentChips attachments={attachments} onRemove={removeAttachment} onRetry={retryAttachment} />
                         <textarea
                           ref={inputRef}
                           value={input}
@@ -4450,6 +4676,16 @@ export default function App() {
                             <span>换行</span>
                           </div>
                           <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              title="添加附件（文本类文件，单个 ≤5MB）"
+                              onClick={() => attachmentInputRef.current?.click()}
+                              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/40 transition hover:bg-black/5 hover:text-black/70"
+                            >
+                              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="m18.375 12.739-7.693 7.693a4.5 4.5 0 0 1-6.364-6.364l10.94-10.94A3 3 0 1 1 19.5 7.372L8.552 18.32a1.5 1.5 0 0 1-2.122-2.122l7.693-7.693" />
+                              </svg>
+                            </button>
                             <ChatSettingsButton
                               showThinking={showThinking}
                               showToolCalls={showToolCalls}
@@ -4458,9 +4694,9 @@ export default function App() {
                             />
                             <button
                               onClick={() => void send()}
-                              disabled={!identity || !templateId || !input.trim()}
+                              disabled={!canSendMessage}
                               className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
-                                (identity && templateId && input.trim())
+                                canSendMessage
                                   ? 'bg-[#3550FF] text-white hover:bg-[#2a42e0]'
                                   : 'bg-[#F3F4F6] text-black/20'
                               }`}
@@ -4540,6 +4776,7 @@ export default function App() {
                   <div className="shrink-0 px-8 pb-6 pt-2">
                     <div className="mx-auto max-w-[860px]">
                       <div className="rounded-2xl border border-[#E5E7EB] bg-white px-4 py-3 shadow-[0_1px_3px_rgba(0,0,0,0.04)] transition focus-within:border-[#3550FF] focus-within:shadow-[0_0_0_3px_rgba(53,80,255,0.06)]">
+                        <AttachmentChips attachments={attachments} onRemove={removeAttachment} onRetry={retryAttachment} />
                         <textarea
                           value={input}
                           onChange={(event) => setInput(event.target.value)}
@@ -4563,6 +4800,16 @@ export default function App() {
                             <span>换行</span>
                           </div>
                           <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              title="添加附件（文本类文件，单个 ≤5MB）"
+                              onClick={() => attachmentInputRef.current?.click()}
+                              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/40 transition hover:bg-black/5 hover:text-black/70"
+                            >
+                              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="m18.375 12.739-7.693 7.693a4.5 4.5 0 0 1-6.364-6.364l10.94-10.94A3 3 0 1 1 19.5 7.372L8.552 18.32a1.5 1.5 0 0 1-2.122-2.122l7.693-7.693" />
+                              </svg>
+                            </button>
                             <ChatSettingsButton
                               showThinking={showThinking}
                               showToolCalls={showToolCalls}
@@ -4571,11 +4818,11 @@ export default function App() {
                             />
                             <button
                               onClick={() => ((canStopCurrentTurn || stopping) ? void stop() : void send())}
-                              disabled={!(canStopCurrentTurn || stopping) && (!identity || !templateId || !input.trim())}
+                              disabled={!(canStopCurrentTurn || stopping) && !canSendMessage}
                               className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
                                 (canStopCurrentTurn || stopping)
                                   ? 'bg-red-500 text-white hover:bg-red-600'
-                                  : (identity && templateId && input.trim())
+                                  : canSendMessage
                                     ? 'bg-[#3550FF] text-white hover:bg-[#2a42e0]'
                                     : 'bg-[#F3F4F6] text-black/20'
                               }`}

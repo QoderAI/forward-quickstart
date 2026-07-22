@@ -645,6 +645,7 @@ export async function createSession(
   identityId: string,
   templateId: string,
   title: string,
+  fileIds?: string[],
 ) {
   return forwardRequest<ForwardSession>(ctx, 'POST', '/sessions', {
     identity_id: identityId,
@@ -652,7 +653,28 @@ export async function createSession(
     title,
     incremental_streaming_enabled: true,
     metadata: { created_by: 'forward-quickstart' },
+    // Mount chat attachments into the agent workspace at session creation.
+    ...(fileIds && fileIds.length > 0
+      ? { resources: fileIds.map((file_id) => ({ type: 'file', file_id })) }
+      : {}),
   });
+}
+
+// Mount an already-uploaded file into an EXISTING session's workspace.
+// Uses the Managed-layer resource API (Forward sessions accept it). The
+// mount_path must live under /data/workspace — the default
+// /mnt/session/uploads path never materializes into the agent sandbox.
+export async function addSessionFileResource(
+  ctx: ForwardContext,
+  sessionId: string,
+  input: { file_id: string; mount_path: string },
+) {
+  return cloudRequest<{ id: string; type: string; file_id: string; mount_path: string }>(
+    ctx,
+    'POST',
+    `/sessions/${encodeURIComponent(sessionId)}/resources`,
+    { type: 'file', file_id: input.file_id, mount_path: input.mount_path },
+  );
 }
 
 export async function getSession(ctx: ForwardContext, sessionId: string) {
