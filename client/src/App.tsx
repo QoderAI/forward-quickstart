@@ -795,6 +795,20 @@ function mergeIncomingEvents(prev: ForwardEvent[], incoming: ForwardEvent[]) {
         continue;
       }
     }
+    // When a remote agent.thinking event arrives with no content, check if there
+    // is a local thinking event that already has accumulated thinking text.
+    // If so, transfer the content to the remote event instead of losing it.
+    if (event.type === 'agent.thinking' && !eventThinkingText(event)) {
+      const localIdx = next.findIndex((item) => (
+        isLocalThinkingEvent(item) &&
+        item.session_id === event.session_id &&
+        eventThinkingText(item)
+      ));
+      if (localIdx >= 0) {
+        next[localIdx] = { ...event, content: next[localIdx].content };
+        continue;
+      }
+    }
     if (shouldClearLocalThinking(event)) {
       next = next.filter((item) => !(
         isLocalThinkingEvent(item) &&
@@ -923,13 +937,13 @@ const ThinkingMessage = memo(function ThinkingMessage({ event }: { event: Forwar
             <span className="text-black/35 group-open:hidden">›</span>
             <span className="hidden text-black/35 group-open:inline">⌄</span>
           </summary>
-          {(text || payload) && (
-            <div className="mt-3 rounded-[18px] bg-white px-5 py-5 shadow-[0_8px_24px_rgba(47,58,128,0.05)]">
-              <div className="rounded-xl border border-amber-200 bg-[#FFFCF2] px-4 py-3 text-[13px] leading-5 text-[#4B5563]">
-                <div className="markdown-body whitespace-pre-wrap break-words">{text || payload}</div>
-              </div>
+          <div className="mt-3 rounded-[18px] bg-white px-5 py-5 shadow-[0_8px_24px_rgba(47,58,128,0.05)]">
+            <div className="rounded-xl border border-amber-200 bg-[#FFFCF2] px-4 py-3 text-[13px] leading-5 text-[#4B5563]">
+              {(text || payload)
+                ? <div className="markdown-body whitespace-pre-wrap break-words">{text || payload}</div>
+                : <div className="italic text-black/40">Agent 在此进行了思考。API 不对外公开思考的具体内容，此事件仅作为思考过程的标记。</div>}
             </div>
-          )}
+          </div>
         </details>
         {event.created_at && <div className="mt-1 px-1 text-[11px] text-black/30">{displayTime(event.created_at)}</div>}
       </div>
@@ -1719,6 +1733,12 @@ export default function App() {
   const [currentSessionId, setCurrentSessionId] = useState('');
   const [events, setEvents] = useState<ForwardEvent[]>([]);
   const [input, setInput] = useState('');
+  const [showThinking, setShowThinking] = useState<boolean>(() => {
+    try { return localStorage.getItem('show_thinking') !== '0'; } catch { return true; }
+  });
+  const [showToolCalls, setShowToolCalls] = useState<boolean>(() => {
+    try { return localStorage.getItem('show_tool_calls') !== '0'; } catch { return true; }
+  });
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -4273,6 +4293,29 @@ export default function App() {
                           </button>
                         </div>
                       </div>
+                      {/* Response options toggles */}
+                      <div className="mt-3 flex items-center gap-4">
+                        <label className="flex cursor-pointer items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => { const v = !showThinking; setShowThinking(v); try { localStorage.setItem('show_thinking', v ? '1' : '0'); } catch {} }}
+                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${showThinking ? 'bg-[#3550FF]' : 'bg-gray-200'}`}
+                          >
+                            <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${showThinking ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+                          </button>
+                          <span className="text-xs text-black/50">显示思考过程</span>
+                        </label>
+                        <label className="flex cursor-pointer items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => { const v = !showToolCalls; setShowToolCalls(v); try { localStorage.setItem('show_tool_calls', v ? '1' : '0'); } catch {} }}
+                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${showToolCalls ? 'bg-[#3550FF]' : 'bg-gray-200'}`}
+                          >
+                            <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${showToolCalls ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+                          </button>
+                          <span className="text-xs text-black/50">显示工具调用过程</span>
+                        </label>
+                      </div>
                       <div className="mt-6 grid grid-cols-2 gap-2.5">
                         {[
                           { icon: '💡', text: '你能做些什么？', desc: '了解我的能力' },
@@ -4304,8 +4347,12 @@ export default function App() {
                       {events.map((event, index) => {
                         const kind = eventViewKind(event);
                         if (kind === 'hidden') return null;
-                        if (kind === 'agent_thinking') return <ThinkingMessage key={event.id} event={event} />;
+                        if (kind === 'agent_thinking') {
+                          if (!showThinking) return null;
+                          return <ThinkingMessage key={event.id} event={event} />;
+                        }
                         if (kind === 'tool_use') {
+                          if (!showToolCalls) return null;
                           return (
                             <ToolEventMessage
                               key={event.id}
@@ -4316,6 +4363,7 @@ export default function App() {
                           );
                         }
                         if (kind === 'tool_result') {
+                          if (!showToolCalls) return null;
                           return (
                             <ToolEventMessage
                               key={event.id}
@@ -4378,6 +4426,29 @@ export default function App() {
                             )}
                           </button>
                         </div>
+                      </div>
+                      {/* Response options toggles */}
+                      <div className="mt-2 flex items-center gap-4">
+                        <label className="flex cursor-pointer items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => { const v = !showThinking; setShowThinking(v); try { localStorage.setItem('show_thinking', v ? '1' : '0'); } catch {} }}
+                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${showThinking ? 'bg-[#3550FF]' : 'bg-gray-200'}`}
+                          >
+                            <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${showThinking ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+                          </button>
+                          <span className="text-xs text-black/50">显示思考过程</span>
+                        </label>
+                        <label className="flex cursor-pointer items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => { const v = !showToolCalls; setShowToolCalls(v); try { localStorage.setItem('show_tool_calls', v ? '1' : '0'); } catch {} }}
+                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${showToolCalls ? 'bg-[#3550FF]' : 'bg-gray-200'}`}
+                          >
+                            <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${showToolCalls ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+                          </button>
+                          <span className="text-xs text-black/50">显示工具调用过程</span>
+                        </label>
                       </div>
                     </div>
                   </div>
