@@ -218,8 +218,8 @@ function resourceSubtitle(resource: ForwardResource): string {
 }
 
 const API_ENV_OPTIONS: Array<{ value: ForwardApiEnvironment; label: string }> = [
-  { value: 'cn-prod', label: 'cn线上' },
-  { value: 'global-prod', label: 'global线上' },
+  { value: 'cn-prod', label: '中国站' },
+  { value: 'global-prod', label: '国际站' },
 ];
 
 function isForwardApiEnvironment(value: unknown): value is ForwardApiEnvironment {
@@ -1847,6 +1847,23 @@ export default function App() {
   // True while a history session's events are being fetched after clicking it,
   // so the chat area can show a spinner instead of flashing the welcome screen.
   const [sessionLoading, setSessionLoading] = useState(false);
+  // Pinned session ids (most recently pinned first), persisted locally — the
+  // Forward API has no pin concept, so this is a pure client-side preference.
+  const [pinnedSessionIds, setPinnedSessionIds] = useState<string[]>(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('pinned_sessions') || '[]');
+      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+    } catch { return []; }
+  });
+  const togglePinSession = useCallback((sessionId: string) => {
+    setPinnedSessionIds((prev) => {
+      const next = prev.includes(sessionId)
+        ? prev.filter((id) => id !== sessionId)
+        : [sessionId, ...prev];
+      try { localStorage.setItem('pinned_sessions', JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -4300,7 +4317,16 @@ export default function App() {
                     const filtered = searchQuery
                       ? sessions.filter((s) => (s.title || '').toLowerCase().includes(searchQuery) || s.id.toLowerCase().includes(searchQuery))
                       : sessions;
-                    const groups = searchQuery ? [{ label: '', items: filtered }] : groupSessionsByDate(filtered);
+                    // Pinned sessions surface in their own group above the date groups,
+                    // ordered by pin recency (most recently pinned first).
+                    const pinnedItems = pinnedSessionIds
+                      .map((id) => filtered.find((s) => s.id === id))
+                      .filter((s): s is ForwardSession => Boolean(s));
+                    const rest = filtered.filter((s) => !pinnedSessionIds.includes(s.id));
+                    const groups = [
+                      ...(pinnedItems.length > 0 ? [{ label: '置顶', items: pinnedItems }] : []),
+                      ...(searchQuery ? [{ label: '', items: rest }] : groupSessionsByDate(rest)),
+                    ];
 
                     if (filtered.length === 0) {
                       return (
@@ -4323,30 +4349,52 @@ export default function App() {
                         {group.label && (
                           <div className="px-2.5 py-2 text-[11px] font-medium text-black/35">{group.label}</div>
                         )}
-                        {group.items.map((session) => (
-                          <button
-                            key={session.id}
-                            onClick={() => void selectSession(session.id)}
-                            className={`flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-left transition ${
-                              currentSessionId === session.id
-                                ? 'bg-white shadow-[0_1px_3px_rgba(0,0,0,0.06)]'
-                                : 'hover:bg-white/60'
-                            }`}
-                          >
-                            {isSessionOngoing(session.status) && (
-                              <span className="relative flex h-2 w-2 shrink-0">
-                                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
-                                <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
-                              </span>
-                            )}
-                            <div className="min-w-0 flex-1">
-                              <div className={`truncate text-[13px] ${currentSessionId === session.id ? 'font-medium text-black' : 'text-black/70'}`}>
-                                {session.title || 'Forward 会话'}
+                        {group.items.map((session) => {
+                          const isPinned = pinnedSessionIds.includes(session.id);
+                          return (
+                            <div
+                              key={session.id}
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => void selectSession(session.id)}
+                              onKeyDown={(e) => { if (e.key === 'Enter') void selectSession(session.id); }}
+                              className={`group flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-3 py-2.5 text-left transition ${
+                                currentSessionId === session.id
+                                  ? 'bg-white shadow-[0_1px_3px_rgba(0,0,0,0.06)]'
+                                  : 'hover:bg-white/60'
+                              }`}
+                            >
+                              {isSessionOngoing(session.status) && (
+                                <span className="relative flex h-2 w-2 shrink-0">
+                                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
+                                  <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
+                                </span>
+                              )}
+                              <div className="min-w-0 flex-1">
+                                <div className={`truncate text-[13px] ${currentSessionId === session.id ? 'font-medium text-black' : 'text-black/70'}`}>
+                                  {session.title || 'Forward 会话'}
+                                </div>
+                                <div className="mt-0.5 text-[11px] text-black/30">{relativeTime(session.created_at)}</div>
                               </div>
-                              <div className="mt-0.5 text-[11px] text-black/30">{relativeTime(session.created_at)}</div>
+                              {/* Pin toggle: hidden until hover for unpinned rows, always visible when pinned */}
+                              <button
+                                type="button"
+                                title={isPinned ? '取消置顶' : '置顶'}
+                                onClick={(e) => { e.stopPropagation(); togglePinSession(session.id); }}
+                                className={`shrink-0 rounded-md p-1 transition ${
+                                  isPinned
+                                    ? 'text-[#3550FF] hover:bg-black/5'
+                                    : 'text-black/30 opacity-0 hover:bg-black/5 hover:text-black/60 group-hover:opacity-100'
+                                }`}
+                              >
+                                <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill={isPinned ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M16 4v7l2 3v2H6v-2l2-3V4h8Z" />
+                                  <path d="M12 16v5" />
+                                </svg>
+                              </button>
                             </div>
-                          </button>
-                        ))}
+                          );
+                        })}
                       </div>
                     ));
                   })()}
