@@ -770,10 +770,44 @@ function shouldClearLocalThinkingForEvent(event: ForwardEvent, localEvent: Forwa
   return true;
 }
 
+function eventSortKey(event: ForwardEvent): string {
+  return event.processed_at || event.created_at || '';
+}
+
+function sortEventsForView(events: ForwardEvent[]): ForwardEvent[] {
+  // Merge paths append incoming events, so a late poll can deliver an older
+  // turn's canonical events AFTER a newer local message was pushed — which used
+  // to render the new question above the previous turn. Order remote events by
+  // server timestamps (stable sort keeps ties in arrival order), and keep local
+  // placeholders (in-flight user message / thinking bubble / streaming text)
+  // pinned to the tail: they always belong to the newest turn, and client/server
+  // clock skew makes their created_at incomparable with server timestamps.
+  // Remote events that don't carry a server timestamp yet (e.g. straight from
+  // the POST /events response) are also pinned until a poll backfills it.
+  const remote = events.filter((event) => !event.id.startsWith('local-') && eventSortKey(event));
+  const local = events.filter((event) => event.id.startsWith('local-') || !eventSortKey(event));
+  remote.sort((a, b) => {
+    const ka = eventSortKey(a);
+    const kb = eventSortKey(b);
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
+  return [...remote, ...local];
+}
+
 function mergeIncomingEvents(prev: ForwardEvent[], incoming: ForwardEvent[]) {
   let next = [...prev];
   for (const event of incoming) {
-    if (next.some((item) => item.id === event.id)) continue;
+    const existingIndex = next.findIndex((item) => item.id === event.id);
+    if (existingIndex >= 0) {
+      // Already known: only backfill the server timestamp (needed for ordering)
+      // without replacing the stored event — it may carry injected content
+      // (e.g. accumulated thinking text) that the polled copy lacks.
+      const existing = next[existingIndex];
+      if (!existing.processed_at && event.processed_at) {
+        next[existingIndex] = { ...existing, processed_at: event.processed_at };
+      }
+      continue;
+    }
     if (event.type === 'user.message') {
       const incomingText = eventContentText(event);
       const localIndex = next.findIndex((item) => (
@@ -818,7 +852,7 @@ function mergeIncomingEvents(prev: ForwardEvent[], incoming: ForwardEvent[]) {
     }
     next = [...next, event];
   }
-  return next;
+  return sortEventsForView(next);
 }
 
 function localTurnEvents(sessionId: string, text: string) {
