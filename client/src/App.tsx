@@ -1403,6 +1403,63 @@ const SessionErrorMessage = memo(function SessionErrorMessage({ event }: { event
   );
 });
 
+// Gear button next to the send button that opens a small popover holding the
+// "show thinking / show tool calls" switches, replacing the old inline toggles.
+const ChatSettingsButton = memo(function ChatSettingsButton({
+  showThinking,
+  showToolCalls,
+  onToggleThinking,
+  onToggleToolCalls,
+}: {
+  showThinking: boolean;
+  showToolCalls: boolean;
+  onToggleThinking: () => void;
+  onToggleToolCalls: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        title="回复显示设置"
+        onClick={() => setOpen((prev) => !prev)}
+        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
+          open ? 'bg-[#EEF1FF] text-[#3550FF]' : 'text-black/35 hover:bg-black/5 hover:text-black/60'
+        }`}
+      >
+        <svg className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.24-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.992a7.723 7.723 0 0 1 0-.255c.007-.378-.138-.75-.43-.991l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z" />
+          <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+        </svg>
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div className="absolute bottom-full right-0 z-20 mb-2 w-60 rounded-xl border border-black/8 bg-white p-1.5 shadow-[0_8px_24px_rgba(0,0,0,0.12)]">
+            <div className="px-2.5 pb-1 pt-1.5 text-[11px] font-medium text-black/35">回复显示设置</div>
+            {[
+              { label: '显示思考过程', checked: showThinking, onToggle: onToggleThinking },
+              { label: '显示工具调用过程', checked: showToolCalls, onToggle: onToggleToolCalls },
+            ].map((item) => (
+              <button
+                key={item.label}
+                type="button"
+                onClick={item.onToggle}
+                className="flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left transition hover:bg-black/[0.03]"
+              >
+                <span className="text-[13px] text-black/70">{item.label}</span>
+                <span className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition ${item.checked ? 'bg-[#3550FF]' : 'bg-gray-200'}`}>
+                  <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${item.checked ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+                </span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+});
+
 const ChatTextMessage = memo(function ChatTextMessage({ event, user }: { event: ForwardEvent; user?: boolean }) {
   const item = eventDisplay(event);
 
@@ -1773,6 +1830,23 @@ export default function App() {
   const [showToolCalls, setShowToolCalls] = useState<boolean>(() => {
     try { return localStorage.getItem('show_tool_calls') !== '0'; } catch { return true; }
   });
+  const toggleShowThinking = useCallback(() => {
+    setShowThinking((prev) => {
+      const v = !prev;
+      try { localStorage.setItem('show_thinking', v ? '1' : '0'); } catch { /* ignore */ }
+      return v;
+    });
+  }, []);
+  const toggleShowToolCalls = useCallback(() => {
+    setShowToolCalls((prev) => {
+      const v = !prev;
+      try { localStorage.setItem('show_tool_calls', v ? '1' : '0'); } catch { /* ignore */ }
+      return v;
+    });
+  }, []);
+  // True while a history session's events are being fetched after clicking it,
+  // so the chat area can show a spinner instead of flashing the welcome screen.
+  const [sessionLoading, setSessionLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -2761,6 +2835,7 @@ export default function App() {
     setCurrentSessionId(sessionId);
     setEvents([]);
     setError('');
+    setSessionLoading(true);
     streamAbort.current?.abort();
     try {
       const page = await listEvents(ctx!, sessionId);
@@ -2786,6 +2861,9 @@ export default function App() {
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      // Only clear the spinner if the user hasn't switched to another session meanwhile.
+      if (currentSessionIdRef.current === sessionId) setSessionLoading(false);
     }
   }, [ctx, sessions]);
 
@@ -4144,6 +4222,7 @@ export default function App() {
                                   currentSessionIdRef.current = '';
                                   setCurrentSessionId('');
                                   setEvents([]);
+                                  setSessionLoading(false);
                                   setShowTemplateSwitcher(false);
                                   void refreshSessions(identity, template.id);
                                 }}
@@ -4189,7 +4268,7 @@ export default function App() {
                     )}
                   </div>
                   <button
-                    onClick={() => { currentSessionIdRef.current = ''; setCurrentSessionId(''); setEvents([]); }}
+                    onClick={() => { currentSessionIdRef.current = ''; setCurrentSessionId(''); setEvents([]); setSessionLoading(false); }}
                     className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/45 transition hover:bg-gray-100 hover:text-black"
                     title="新建对话"
                   >
@@ -4276,7 +4355,15 @@ export default function App() {
 
               {/* ── Chat content area ── */}
               <div className="flex min-w-0 flex-1 flex-col bg-white">
-                {events.length === 0 && (
+                {events.length === 0 && sessionLoading && (
+                  <div className="flex min-h-0 flex-1 items-center justify-center">
+                    <svg className="h-7 w-7 animate-spin text-[#3550FF]" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                      <path className="opacity-90" fill="currentColor" d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2Z" />
+                    </svg>
+                  </div>
+                )}
+                {events.length === 0 && !sessionLoading && (
                   <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-8 pb-12 pt-4">
                     <div className="w-full max-w-[680px]">
                       <div className="mb-8 text-center">
@@ -4314,41 +4401,26 @@ export default function App() {
                             <span className="rounded border border-black/10 px-1 py-px font-mono text-[10px]">Shift+Enter</span>
                             <span>换行</span>
                           </div>
-                          <button
-                            onClick={() => void send()}
-                            disabled={!identity || !templateId || !input.trim()}
-                            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
-                              (identity && templateId && input.trim())
-                                ? 'bg-[#3550FF] text-white hover:bg-[#2a42e0]'
-                                : 'bg-[#F3F4F6] text-black/20'
-                            }`}
-                          >
-                            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18" /></svg>
-                          </button>
+                          <div className="flex items-center gap-1.5">
+                            <ChatSettingsButton
+                              showThinking={showThinking}
+                              showToolCalls={showToolCalls}
+                              onToggleThinking={toggleShowThinking}
+                              onToggleToolCalls={toggleShowToolCalls}
+                            />
+                            <button
+                              onClick={() => void send()}
+                              disabled={!identity || !templateId || !input.trim()}
+                              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
+                                (identity && templateId && input.trim())
+                                  ? 'bg-[#3550FF] text-white hover:bg-[#2a42e0]'
+                                  : 'bg-[#F3F4F6] text-black/20'
+                              }`}
+                            >
+                              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18" /></svg>
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                      {/* Response options toggles */}
-                      <div className="mt-3 flex items-center gap-4">
-                        <label className="flex cursor-pointer items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => { const v = !showThinking; setShowThinking(v); try { localStorage.setItem('show_thinking', v ? '1' : '0'); } catch {} }}
-                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${showThinking ? 'bg-[#3550FF]' : 'bg-gray-200'}`}
-                          >
-                            <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${showThinking ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
-                          </button>
-                          <span className="text-xs text-black/50">显示思考过程</span>
-                        </label>
-                        <label className="flex cursor-pointer items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => { const v = !showToolCalls; setShowToolCalls(v); try { localStorage.setItem('show_tool_calls', v ? '1' : '0'); } catch {} }}
-                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${showToolCalls ? 'bg-[#3550FF]' : 'bg-gray-200'}`}
-                          >
-                            <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${showToolCalls ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
-                          </button>
-                          <span className="text-xs text-black/50">显示工具调用过程</span>
-                        </label>
                       </div>
                       <div className="mt-6 grid grid-cols-2 gap-2.5">
                         {[
@@ -4442,47 +4514,32 @@ export default function App() {
                             <span className="rounded border border-black/10 px-1 py-px font-mono text-[10px]">Shift+Enter</span>
                             <span>换行</span>
                           </div>
-                          <button
-                            onClick={() => ((canStopCurrentTurn || stopping) ? void stop() : void send())}
-                            disabled={!(canStopCurrentTurn || stopping) && (!identity || !templateId || !input.trim())}
-                            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
-                              (canStopCurrentTurn || stopping)
-                                ? 'bg-red-500 text-white hover:bg-red-600'
-                                : (identity && templateId && input.trim())
-                                  ? 'bg-[#3550FF] text-white hover:bg-[#2a42e0]'
-                                  : 'bg-[#F3F4F6] text-black/20'
-                            }`}
-                          >
-                            {(canStopCurrentTurn || stopping) ? (
-                              <svg className="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
-                            ) : (
-                              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18" /></svg>
-                            )}
-                          </button>
+                          <div className="flex items-center gap-1.5">
+                            <ChatSettingsButton
+                              showThinking={showThinking}
+                              showToolCalls={showToolCalls}
+                              onToggleThinking={toggleShowThinking}
+                              onToggleToolCalls={toggleShowToolCalls}
+                            />
+                            <button
+                              onClick={() => ((canStopCurrentTurn || stopping) ? void stop() : void send())}
+                              disabled={!(canStopCurrentTurn || stopping) && (!identity || !templateId || !input.trim())}
+                              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
+                                (canStopCurrentTurn || stopping)
+                                  ? 'bg-red-500 text-white hover:bg-red-600'
+                                  : (identity && templateId && input.trim())
+                                    ? 'bg-[#3550FF] text-white hover:bg-[#2a42e0]'
+                                    : 'bg-[#F3F4F6] text-black/20'
+                              }`}
+                            >
+                              {(canStopCurrentTurn || stopping) ? (
+                                <svg className="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+                              ) : (
+                                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18" /></svg>
+                              )}
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                      {/* Response options toggles */}
-                      <div className="mt-2 flex items-center gap-4">
-                        <label className="flex cursor-pointer items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => { const v = !showThinking; setShowThinking(v); try { localStorage.setItem('show_thinking', v ? '1' : '0'); } catch {} }}
-                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${showThinking ? 'bg-[#3550FF]' : 'bg-gray-200'}`}
-                          >
-                            <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${showThinking ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
-                          </button>
-                          <span className="text-xs text-black/50">显示思考过程</span>
-                        </label>
-                        <label className="flex cursor-pointer items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => { const v = !showToolCalls; setShowToolCalls(v); try { localStorage.setItem('show_tool_calls', v ? '1' : '0'); } catch {} }}
-                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${showToolCalls ? 'bg-[#3550FF]' : 'bg-gray-200'}`}
-                          >
-                            <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition ${showToolCalls ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
-                          </button>
-                          <span className="text-xs text-black/50">显示工具调用过程</span>
-                        </label>
                       </div>
                     </div>
                   </div>
