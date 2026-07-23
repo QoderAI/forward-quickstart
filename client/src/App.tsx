@@ -839,6 +839,83 @@ function sortEventsForView(events: ForwardEvent[]): ForwardEvent[] {
   return [...remote, ...local];
 }
 
+/**
+ * Compute text similarity using character bigrams (Jaccard index).
+ * Works for both Chinese and English text without needing word segmentation.
+ * Returns a value between 0 (completely different) and 1 (identical).
+ */
+function textSimilarity(a: string, b: string): number {
+  if (a.length < 20 || b.length < 20) return 0;
+  const bigramsA = new Set<string>();
+  for (let i = 0; i < a.length - 1; i += 1) bigramsA.add(a.slice(i, i + 2));
+  const bigramsB = new Set<string>();
+  for (let i = 0; i < b.length - 1; i += 1) bigramsB.add(b.slice(i, i + 2));
+  if (bigramsA.size === 0 || bigramsB.size === 0) return 0;
+  let intersection = 0;
+  for (const bg of bigramsA) {
+    if (bigramsB.has(bg)) intersection += 1;
+  }
+  const union = bigramsA.size + bigramsB.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+/**
+ * If the last real agent.message in the events list has >60% text similarity
+ * to the incoming event, remove it. The coordinator sometimes outputs the
+ * same report twice (first a draft, then a "verified" version) — showing both
+ * is redundant and confuses users.
+ */
+function deduplicateAgentMessage(events: ForwardEvent[], sessionId: string, newEvent: ForwardEvent): ForwardEvent[] {
+  const newText = eventContentText(newEvent);
+  if (newText.length < 50) return events;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const e = events[i];
+    if (e.type === 'agent.message' && e.session_id === sessionId && !e.id.startsWith('local-stream-')) {
+      const prevText = eventContentText(e);
+      if (prevText.length >= 50 && textSimilarity(newText, prevText) > 0.6) {
+        return events.filter((_, idx) => idx !== i);
+      }
+      break; // Only check the last agent.message
+    }
+  }
+  return events;
+}
+
+/**
+ * Scan a merged events list and remove earlier agent.message events that
+ * are >60% similar to a later agent.message in the same session. Used by
+ * mergeSessionEvents to deduplicate after fetching from the API.
+ */
+function deduplicateAgentMessageList(events: ForwardEvent[]): ForwardEvent[] {
+  const result: ForwardEvent[] = [];
+  for (const event of events) {
+    if (
+      event.type === 'agent.message' &&
+      !event.id.startsWith('local-stream-') &&
+      eventContentText(event).length >= 50
+    ) {
+      // Check if the last agent.message in result is similar
+      for (let i = result.length - 1; i >= 0; i -= 1) {
+        const prev = result[i];
+        if (
+          prev.type === 'agent.message' &&
+          !prev.id.startsWith('local-stream-') &&
+          prev.session_id === event.session_id
+        ) {
+          const prevText = eventContentText(prev);
+          const newText = eventContentText(event);
+          if (prevText.length >= 50 && textSimilarity(newText, prevText) > 0.6) {
+            result.splice(i, 1); // Remove the previous duplicate
+          }
+          break; // Only check the last agent.message
+        }
+      }
+    }
+    result.push(event);
+  }
+  return result;
+}
+
 function mergeIncomingEvents(prev: ForwardEvent[], incoming: ForwardEvent[]) {
   let next = [...prev];
   for (const event of incoming) {
@@ -2358,7 +2435,10 @@ export default function App() {
         const filtered = hasRealMessage
           ? prev.filter((e) => !e.id.startsWith('local-stream-'))
           : prev;
-        return mergeIncomingEvents(filtered, chronologicalData);
+        const merged = mergeIncomingEvents(filtered, chronologicalData);
+        // Deduplicate similar consecutive agent.message events (the
+        // coordinator sometimes outputs the same report twice).
+        return deduplicateAgentMessageList(merged);
       });
     }
     return { ...page, data: chronologicalData };
@@ -3205,10 +3285,13 @@ export default function App() {
         setEvents((prev) => [...prev, thinkingEvent]);
         // Pass the last event ID to resume stream from the correct position
         const lastEventId = chronologicalData.length > 0 ? chronologicalData[chronologicalData.length - 1].id : undefined;
-        // If the session already has thread_created events, we're in multiagent mode —
-        // pass this so child thread_status_idle doesn't prematurely terminate the stream.
-        const hasMA = chronologicalData.some((e) => e.type === 'session.thread_created');
-        if (hasMA) multiagentSessionsRef.current.add(sessionId);
+        // If the session has ever had multiagent threads (tracked in
+        // multiagentSessionsRef), pass this so child thread_status_idle
+        // doesn't prematurely terminate the stream. NOTE: listEvents uses
+        // LIST_EVENT_TYPES which does NOT include session.thread_created, so
+        // we can't rely on fetched events for this check — the ref is the
+        // source of truth.
+        const hasMA = multiagentSessionsRef.current.has(sessionId);
         startStreamRef.current(sessionId, lastEventId, undefined, hasMA);
       }
     } catch (err) {
@@ -3389,7 +3472,11 @@ export default function App() {
           } else if (thinkingText) {
             setEvents((prev) => {
               // Remove synthetic streaming message if present
-              const next = streamMsgId ? prev.filter((e) => e.id !== streamMsgId) : [...prev];
+              const cleaned = streamMsgId ? prev.filter((e) => e.id !== streamMsgId) : [...prev];
+              // Deduplicate: if the previous agent.message has >60% similar
+              // content, remove it (coordinator sometimes outputs the same
+              // report twice — a draft then a "verified" version).
+              const next = deduplicateAgentMessage(cleaned, sessionId, event);
               // Find the last agent.thinking event for this session and update it
               for (let i = next.length - 1; i >= 0; i--) {
                 if (next[i].type === 'agent.thinking' && next[i].session_id === sessionId) {
@@ -3401,12 +3488,24 @@ export default function App() {
             });
           } else {
             setEvents((prev) => {
-              const next = streamMsgId ? prev.filter((e) => e.id !== streamMsgId) : prev;
+              const cleaned = streamMsgId ? prev.filter((e) => e.id !== streamMsgId) : prev;
+              const next = deduplicateAgentMessage(cleaned, sessionId, event);
               return mergeIncomingEvents(next, [event]);
             });
           }
         } else {
-          if (currentSessionIdRef.current === sessionId) {
+          // Skip stray multiagent thread events (session.thread_status_idle etc.)
+          // for sessions that don't have multiagent threads. These events may
+          // arrive from the backend when a child thread from a PREVIOUS
+          // multiagent session is still running and its status events leak
+          // into the new session's SSE stream.
+          const isStrayMultiagentEvent = !hasMultiagentThreads && (
+            event.type === 'session.thread_status_idle' ||
+            event.type === 'session.thread_status_running' ||
+            event.type === 'agent.thread_message_sent' ||
+            event.type === 'agent.thread_message_received'
+          );
+          if (!isStrayMultiagentEvent && currentSessionIdRef.current === sessionId) {
             setEvents((prev) => mergeIncomingEvents(prev, [event]));
           }
         }
