@@ -51,6 +51,10 @@ import {
   createQrSession,
   getQrSession,
   deleteChannel,
+  listManagedAgents,
+  type ManagedAgent,
+  type MultiagentConfig,
+  type MultiagentAgentEntry,
   type ForwardChannel,
   type ForwardQrSession,
   type ChannelType,
@@ -67,6 +71,7 @@ import {
 } from './forwardApi';
 import { PRODUCT_NAME } from './config/product';
 
+// Helpers for the multiagent roster form state.
 const AUTH_KEY = 'forward_quickstart_auth';
 const FORWARD_ICON = '/forward-icon.png';
 
@@ -492,6 +497,7 @@ type EventViewKind =
   | 'tool_use'
   | 'tool_result'
   | 'session_error'
+  | 'multiagent_status'
   | 'hidden';
 
 function eventViewKind(event: ForwardEvent): EventViewKind {
@@ -515,7 +521,42 @@ function eventViewKind(event: ForwardEvent): EventViewKind {
   ) {
     return 'tool_result';
   }
+  // Multiagent thread events — shown as subtle status indicators in the chat
+  // so the user can see delegation progress (e.g. "已委派任务给足球经理专家").
+  if (
+    event.type === 'session.thread_created' ||
+    event.type === 'session.thread_status_running' ||
+    event.type === 'session.thread_status_idle' ||
+    event.type === 'agent.thread_message_sent' ||
+    event.type === 'agent.thread_message_received'
+  ) {
+    return 'multiagent_status';
+  }
   return 'hidden';
+}
+
+/** Extract a short human-readable label for a multiagent thread event. */
+function multiagentEventInfo(event: ForwardEvent): string {
+  // Try to pull the agent name from common fields; fall back to generic text.
+  const name =
+    (typeof event.agent_name === 'string' && event.agent_name) ||
+    (typeof event.name === 'string' && event.name) ||
+    textFromUnknown(event.content) ||
+    '';
+  switch (event.type) {
+    case 'session.thread_created':
+      return name ? `已创建子线程：${name}` : '已创建子线程';
+    case 'session.thread_status_running':
+      return name ? `${name} 开始执行` : '子线程运行中';
+    case 'session.thread_status_idle':
+      return name ? `${name} 已完成` : '子线程已完成';
+    case 'agent.thread_message_sent':
+      return name ? `已委派任务给 ${name}` : '已委派任务给子线程';
+    case 'agent.thread_message_received':
+      return name ? `已收到 ${name} 的回复` : '已收到子线程回复';
+    default:
+      return '';
+  }
 }
 
 function getEventValue(event: ForwardEvent, keys: string[]): unknown {
@@ -731,7 +772,7 @@ function shouldClearLocalThinking(event: ForwardEvent) {
   return isTerminalSessionEvent(event);
 }
 
-function isTerminalSessionEvent(event: ForwardEvent) {
+function isTerminalSessionEvent(event: ForwardEvent, hasMultiagentThreads = false) {
   if (
     event.type === 'session.error' ||
     event.type === 'session.completed' ||
@@ -746,8 +787,11 @@ function isTerminalSessionEvent(event: ForwardEvent) {
     if (stopReason?.type === 'requires_action') return false;
     return true;
   }
-  // thread_status_idle is a thread-level terminal event (new API addition)
-  if (event.type === 'session.thread_status_idle') return true;
+  // thread_status_idle is a thread-level terminal event for non-multiagent sessions.
+  // In multiagent mode, child threads going idle should NOT terminate the stream —
+  // only session.status_idle signals session-level completion. The coordinator is
+  // still processing the child's result and will emit its own events afterwards.
+  if (event.type === 'session.thread_status_idle') return !hasMultiagentThreads;
   return false;
 }
 
@@ -1944,6 +1988,17 @@ export default function App() {
   const [selectedTools, setSelectedTools] = useState<string[]>([...BUILTIN_TOOLS]);
   const [toolsJson, setToolsJson] = useState('');
   const [mcpServersJson, setMcpServersJson] = useState('');
+  // Multi-agent (coordinator) config in the template editor. The Forward API's
+  // multiagent roster references Managed Agent IDs (agent_xxx), not template IDs
+  // — Forward templates don't expose their backing agent_id, so the editor
+  // lists managed agents by name and stores the agent ID. Toolset
+  // (agent_toolset_20260401) is a hard prerequisite: the UI gates the section
+  // until the user has picked at least one built-in tool.
+  const [managedAgents, setManagedAgents] = useState<ManagedAgent[]>([]);
+  const [managedAgentsLoading, setManagedAgentsLoading] = useState(false);
+  const [multiagentEnabled, setMultiagentEnabled] = useState(false);
+  const [multiagentSelectedAgentIds, setMultiagentSelectedAgentIds] = useState<string[]>([]);
+  const [multiagentIncludeSelf, setMultiagentIncludeSelf] = useState(false);
   const [resourceType, setResourceType] = useState<ForwardResourceType>('skill');
   const [resourceId, setResourceId] = useState('');
   const [resources, setResources] = useState<ForwardResource[]>([]);
@@ -2093,6 +2148,21 @@ export default function App() {
     }
   }, [templateModel]);
 
+  // Load managed agents for the multiagent roster picker. Forward templates
+  // don't expose their backing agent_id, so the editor lists agents by name
+  // (each template compiles to a managed agent with a matching name).
+  const loadManagedAgents = useCallback(async (context: ForwardContext) => {
+    setManagedAgentsLoading(true);
+    try {
+      const res = await listManagedAgents(context);
+      setManagedAgents(res.data ?? []);
+    } catch {
+      setManagedAgents([]);
+    } finally {
+      setManagedAgentsLoading(false);
+    }
+  }, []);
+
   const getModelLabel = useCallback((model: ForwardTemplate['model'] | unknown): string => {
     const modelId = getTemplateModelId(model);
     if (!modelId) return '未知模型';
@@ -2107,8 +2177,13 @@ export default function App() {
   // Whether the chat should auto-stick to the bottom. Turns off when the user
   // scrolls up, so streaming updates during a running task won't yank them back.
   const stickToBottomRef = useRef(true);
-  const startStreamRef = useRef<(sessionId: string, lastEventId?: string, turnStartedAt?: string) => void>(() => {});
+  const startStreamRef = useRef<(sessionId: string, lastEventId?: string, turnStartedAt?: string, initialHasMultiagent?: boolean) => void>(() => {});
   const streamAbort = useRef<AbortController | null>(null);
+  // Tracks sessions that have multiagent child threads (session.thread_created
+  // seen at any point). Used to pass hasMultiagentThreads to startStream when a
+  // follow-up message is sent, so session.thread_status_idle from a lingering
+  // child doesn't prematurely terminate the new turn's stream.
+  const multiagentSessionsRef = useRef<Set<string>>(new Set());
   // Tracks the session currently shown in the chat view ('' = new-conversation
   // screen), so background stream/poll callbacks never paint into another view.
   const currentSessionIdRef = useRef('');
@@ -2237,17 +2312,26 @@ export default function App() {
     }
   }, [templateId, apiEnvironment, externalId]);
 
+  // Keep a ref in sync so that refreshSessions (called from background polling /
+  // SSE closures) always reads the *current* templateId, not a stale value from
+  // the closure when startStream was created.  Without this, switching templates
+  // while a task is running causes the old closure to overwrite the session list
+  // with the previous template's sessions.
+  const templateIdRef = useRef(templateId);
+  useEffect(() => { templateIdRef.current = templateId; }, [templateId]);
+
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId;
   }, [currentSessionId]);
 
-  const refreshSessions = useCallback(async (nextIdentity = identity, nextTemplateId = templateId) => {
+  const refreshSessions = useCallback(async (nextIdentity = identity, nextTemplateId?: string) => {
     if (!ctx || !nextIdentity) return;
-    const page = await listSessions(ctx, nextIdentity.id, nextTemplateId || undefined);
+    const tplId = nextTemplateId ?? templateIdRef.current;
+    const page = await listSessions(ctx, nextIdentity.id, tplId || undefined);
     setSessions(page.data);
     // Never auto-select a session here: background polling calls this while the
     // user may be sitting on the new-conversation screen (currentSessionId === '').
-  }, [ctx, identity, templateId]);
+  }, [ctx, identity]);
 
   const loadSessionEvents = useCallback(async (sessionId: string) => {
     if (!ctx || !sessionId) return;
@@ -2264,7 +2348,18 @@ export default function App() {
     // Only merge into the view when this session is still the one on screen;
     // background polling must not repopulate the new-conversation screen.
     if (currentSessionIdRef.current === sessionId) {
-      setEvents((prev) => mergeIncomingEvents(prev, chronologicalData));
+      setEvents((prev) => {
+        // If real agent.message events exist in the fetched data, remove any
+        // leftover synthetic streaming messages (local-stream-*) from a
+        // prematurely terminated stream.
+        const hasRealMessage = chronologicalData.some(
+          (e) => e.type === 'agent.message' && !e.id.startsWith('local-stream-'),
+        );
+        const filtered = hasRealMessage
+          ? prev.filter((e) => !e.id.startsWith('local-stream-'))
+          : prev;
+        return mergeIncomingEvents(filtered, chronologicalData);
+      });
     }
     return { ...page, data: chronologicalData };
   }, [ctx]);
@@ -2669,11 +2764,14 @@ export default function App() {
     setSelectedTools([...BUILTIN_TOOLS]);
     setToolsJson('');
     setMcpServersJson('');
+    setMultiagentEnabled(false);
+    setMultiagentSelectedAgentIds([]);
+    setMultiagentIncludeSelf(false);
     setError('');
     setShowTemplateModal(true);
     void loadTemplateResourceOptions();
-    if (ctx) void loadModels(ctx);
-  }, [ctx, loadModels, loadTemplateResourceOptions]);
+    if (ctx) { void loadModels(ctx); void loadManagedAgents(ctx); }
+  }, [ctx, loadModels, loadManagedAgents, loadTemplateResourceOptions]);
 
   const openEditTemplateModal = useCallback((template: ForwardTemplate) => {
     setEditingTemplateId(template.id);
@@ -2715,12 +2813,23 @@ export default function App() {
         ? JSON.stringify(template.mcp_servers, null, 2)
         : '',
     );
+    // Multi-agent config → form state. The roster stores Managed Agent IDs;
+    // self entries map to the include-self toggle, agent entries to chips.
+    const ma = template.multiagent;
+    const maAgents = ma && Array.isArray(ma.agents) ? ma.agents : [];
+    setMultiagentEnabled(!!ma && ma.type === 'coordinator' && maAgents.length > 0);
+    setMultiagentSelectedAgentIds(
+      maAgents
+        .filter((e: MultiagentAgentEntry) => e.type === 'agent' && typeof e.id === 'string')
+        .map((e: MultiagentAgentEntry) => e.id as string),
+    );
+    setMultiagentIncludeSelf(maAgents.some((e: MultiagentAgentEntry) => e.type === 'self'));
     setError('');
     setViewingTemplate(null);
     setShowTemplateModal(true);
     void loadTemplateResourceOptions();
-    if (ctx) void loadModels(ctx);
-  }, [ctx, loadModels, loadTemplateResourceOptions]);
+    if (ctx) { void loadModels(ctx); void loadManagedAgents(ctx); }
+  }, [ctx, loadModels, loadManagedAgents, loadTemplateResourceOptions]);
 
   const connect = useCallback(async () => {
     if (!ctx || !externalId.trim()) {
@@ -2969,6 +3078,28 @@ export default function App() {
           }]
         : [];
     const fileIds = splitTokens(fileIdsText);
+    // Toolset prerequisite: multiagent only takes effect when the tools array
+    // contains an agent_toolset_20260401 entry. The UI also gates on this, but
+    // buildTemplateInput double-checks so a saved template never has a
+    // multiagent block without a toolset.
+    const hasToolset = tools.some(
+      (t) => t && typeof t === 'object' && (t as Record<string, unknown>).type === 'agent_toolset_20260401',
+    );
+    const rosterAgents: MultiagentAgentEntry[] = multiagentSelectedAgentIds
+      .map((id) => {
+        const agent = managedAgents.find((a) => a.id === id);
+        return { type: 'agent' as const, id, ...(agent?.name ? { name: agent.name } : {}) };
+      });
+    const multiagent: MultiagentConfig | null =
+      multiagentEnabled && hasToolset && (rosterAgents.length > 0 || multiagentIncludeSelf)
+        ? {
+            type: 'coordinator',
+            agents: [
+              ...rosterAgents,
+              ...(multiagentIncludeSelf ? [{ type: 'self' as const }] : []),
+            ],
+          }
+        : null;
 
     return {
       name: templateName,
@@ -2982,13 +3113,18 @@ export default function App() {
       environment_variables: parseEnvironmentVariables(envVarsText),
       tools,
       mcp_servers: parseJsonArray(mcpServersJson, 'MCP 服务 JSON'),
+      multiagent,
     };
   }, [
     selectedTools,
     environmentId,
     envVarsText,
     fileIdsText,
+    managedAgents,
     mcpServersJson,
+    multiagentEnabled,
+    multiagentIncludeSelf,
+    multiagentSelectedAgentIds,
     skillIdsText,
     templateDescription,
     templateModel,
@@ -2997,6 +3133,17 @@ export default function App() {
     toolsJson,
     vaultIdsText,
   ]);
+
+  // Whether the tools config includes an agent_toolset_20260401 entry — the
+  // hard prerequisite for multiagent. Drives the UI gate in the editor.
+  const toolsetConfigured = useMemo(() => {
+    if (selectedTools.length > 0) return true;
+    try {
+      return parseJsonArray(toolsJson, '').some(
+        (t) => t && typeof t === 'object' && (t as Record<string, unknown>).type === 'agent_toolset_20260401',
+      );
+    } catch { return false; }
+  }, [selectedTools, toolsJson]);
 
   const createDefaultTemplate = useCallback(async () => {
     if (!ctx) return;
@@ -3058,7 +3205,11 @@ export default function App() {
         setEvents((prev) => [...prev, thinkingEvent]);
         // Pass the last event ID to resume stream from the correct position
         const lastEventId = chronologicalData.length > 0 ? chronologicalData[chronologicalData.length - 1].id : undefined;
-        startStreamRef.current(sessionId, lastEventId);
+        // If the session already has thread_created events, we're in multiagent mode —
+        // pass this so child thread_status_idle doesn't prematurely terminate the stream.
+        const hasMA = chronologicalData.some((e) => e.type === 'session.thread_created');
+        if (hasMA) multiagentSessionsRef.current.add(sessionId);
+        startStreamRef.current(sessionId, lastEventId, undefined, hasMA);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -3068,12 +3219,16 @@ export default function App() {
     }
   }, [ctx, sessions]);
 
-  const startStream = useCallback((sessionId: string, lastEventId?: string, turnStartedAt?: string) => {
+  const startStream = useCallback((sessionId: string, lastEventId?: string, turnStartedAt?: string, initialHasMultiagent?: boolean) => {
     if (!ctx) return;
     streamAbort.current?.abort();
     const controller = new AbortController();
     let pollTimer: number | undefined;
     let reconnecting = false;
+    // Track whether this session has spawned child threads (multiagent mode).
+    // In multiagent mode, child thread_status_idle must NOT terminate the SSE
+    // stream — only session.status_idle signals session-level completion.
+    let hasMultiagentThreads = !!initialHasMultiagent;
     // Throttle streaming UI updates so fast/long responses don't overwhelm the main
     // thread. Text deltas are coalesced and the synthetic streaming message is
     // flushed at most once per FLUSH_INTERVAL_MS, always with the latest text.
@@ -3128,6 +3283,9 @@ export default function App() {
       }
     };
     const finishStream = () => {
+      // Flush any pending streaming text so the user sees the latest content
+      // before the stream terminates.
+      flushStreamingText();
       cancelStreamFlush();
       stopPolling();
       controller.abort();
@@ -3141,7 +3299,12 @@ export default function App() {
       const newEvents = turnStartedAt
         ? (page?.data ?? []).filter((e) => (e.created_at || e.processed_at || '') > turnStartedAt)
         : (page?.data ?? []);
-      if (newEvents.some(isTerminalSessionEvent)) {
+      // Update multiagent tracking from polled events (thread_created may arrive
+      // via polling rather than SSE).
+      if (newEvents.some((e) => e.type === 'session.thread_created')) {
+        hasMultiagentThreads = true;
+      }
+      if (newEvents.some((e) => isTerminalSessionEvent(e, hasMultiagentThreads))) {
         finishStream();
       }
     };
@@ -3169,6 +3332,13 @@ export default function App() {
           _thinkingBySession.set(sessionId, '');
           _streamingTextBySession.delete(sessionId);
           _streamingMsgIdBySession.delete(sessionId);
+          // Remove old synthetic streaming messages from a previous turn.
+          setEvents((prev) => prev.filter((e) => !e.id.startsWith('local-stream-')));
+        }
+        // Track child thread creation for multiagent terminal-event gating.
+        if (event.type === 'session.thread_created') {
+          hasMultiagentThreads = true;
+          multiagentSessionsRef.current.add(sessionId);
         }
 
         // Accumulate deltas from incremental streaming events.
@@ -3264,8 +3434,8 @@ export default function App() {
               }
               // Wait then reconnect stream to get new events
               await new Promise((r) => setTimeout(r, 800));
-              // Reconnect using the last event id
-              startStreamRef.current?.(sessionId, event.id);
+              // Reconnect using the last event id, preserving multiagent tracking
+              startStreamRef.current?.(sessionId, event.id, undefined, hasMultiagentThreads);
             };
             void confirmAndReconnect();
             return; // Don't check isTerminal - we're handling reconnection
@@ -3281,7 +3451,7 @@ export default function App() {
             return;
           }
         }
-        if (isTerminalSessionEvent(event)) {
+        if (isTerminalSessionEvent(event, hasMultiagentThreads)) {
           finishStream();
           void mergeSessionEvents(sessionId);
           void refreshSessions();
@@ -3367,11 +3537,19 @@ export default function App() {
       localThinkingId = localEvents.thinking.id;
       // Sending a new message should always bring the view back to the bottom.
       stickToBottomRef.current = true;
-      setEvents((prev) => [...prev, localEvents.user, localEvents.thinking]);
+      // Remove old synthetic streaming messages from a previous turn that may
+      // not have been cleaned up (e.g. stream terminated before agent.message
+      // arrived). Also clear the streaming accumulators.
+      _streamingTextBySession.delete(sessionId);
+      _streamingMsgIdBySession.delete(sessionId);
+      setEvents((prev) => {
+        const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
+        return [...cleaned, localEvents.user, localEvents.thinking];
+      });
       const result = await sendUserMessage(ctx, sessionId, finalText);
       setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
       setAttachments([]);
-      startStream(sessionId, lastRemoteEventId(result.data ?? []), turnStartedAt);
+      startStream(sessionId, lastRemoteEventId(result.data ?? []), turnStartedAt, multiagentSessionsRef.current.has(sessionId));
       window.setTimeout(() => {
         void mergeSessionEvents(sessionId);
         void refreshSessions();
@@ -3409,10 +3587,16 @@ export default function App() {
       localThinkingId = localEvents.thinking.id;
       // Sending a new message should always bring the view back to the bottom.
       stickToBottomRef.current = true;
-      setEvents((prev) => [...prev, localEvents.user, localEvents.thinking]);
+      // Remove old synthetic streaming messages from a previous turn.
+      _streamingTextBySession.delete(sessionId);
+      _streamingMsgIdBySession.delete(sessionId);
+      setEvents((prev) => {
+        const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
+        return [...cleaned, localEvents.user, localEvents.thinking];
+      });
       const result = await sendUserMessage(ctx, sessionId, text);
       setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
-      startStream(sessionId, lastRemoteEventId(result.data ?? []), turnStartedAt);
+      startStream(sessionId, lastRemoteEventId(result.data ?? []), turnStartedAt, multiagentSessionsRef.current.has(sessionId));
       window.setTimeout(() => {
         void mergeSessionEvents(sessionId);
         void refreshSessions();
@@ -4449,6 +4633,11 @@ export default function App() {
                               <button
                                 key={template.id}
                                 onClick={() => {
+                                  // Abort any running SSE stream from the previous template
+                                  // so its background polling stops calling refreshSessions
+                                  // and streaming state is cleared for the new template.
+                                  streamAbort.current?.abort();
+                                  setStreaming(false);
                                   setTemplateId(template.id);
                                   currentSessionIdRef.current = '';
                                   setCurrentSessionId('');
@@ -4765,6 +4954,15 @@ export default function App() {
                           );
                         }
                         if (kind === 'session_error') return <SessionErrorMessage key={event.id} event={event} />;
+                        if (kind === 'multiagent_status') {
+                          const info = multiagentEventInfo(event);
+                          if (!info) return null;
+                          return (
+                            <div key={event.id} className="flex items-center justify-center py-1">
+                              <span className="rounded-full bg-[#F4F6FC] px-3 py-1 text-[11px] text-black/40">{info}</span>
+                            </div>
+                          );
+                        }
                         if (kind === 'user') return <ChatTextMessage key={event.id} event={event} user />;
                         return <ChatTextMessage key={event.id} event={event} />;
                       })}
@@ -5706,6 +5904,24 @@ export default function App() {
                 </div>
               )}
 
+              {/* Multi-agent coordinator */}
+              {vt.multiagent && vt.multiagent.type === 'coordinator' && Array.isArray(vt.multiagent.agents) && vt.multiagent.agents.length > 0 && (
+                <div>
+                  <div className="mb-2 text-xs font-semibold text-black/50">多 Agent 协作（Coordinator）</div>
+                  <div className="rounded-xl bg-[#FAFBFF] px-4 py-3">
+                    <div className="mb-2 text-[11px] text-black/40">可委派 Agent（{vt.multiagent.agents.length} 个）</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {vt.multiagent.agents.map((entry, i) => (
+                        <span key={i} className="rounded-md bg-white px-2 py-0.5 text-xs text-black/60 shadow-[inset_0_0_0_1px_#E8EBF5]" title={entry.id || ''}>
+                          {entry.type === 'self' ? '自身（self）' : (entry.name || entry.id || '未知 Agent')}
+                        </span>
+                      ))}
+                    </div>
+                    <div className="mt-2 text-[11px] text-black/35">运行时自动注入编排工具：Agent / create_agent / send_to_agent / list_agents</div>
+                  </div>
+                </div>
+              )}
+
               {/* Skills */}
               {vtSkills.length > 0 && (
                 <div>
@@ -5925,6 +6141,54 @@ export default function App() {
                 <span className="mb-1.5 block text-xs font-medium text-black/50">环境变量</span>
                 <textarea value={envVarsText} onChange={(e) => setEnvVarsText(e.target.value)} placeholder="每行 KEY=value" className="min-h-[60px] w-full resize-none rounded-xl border border-[#E5E7EB] bg-white px-3.5 py-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
               </label>
+              {/* Multi-Agent (coordinator) — gated on toolset prerequisite */}
+              <div className="block border-t border-[#EEF1F7] pt-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-xs font-medium text-black/50">多 Agent 协作（Coordinator）</span>
+                  {toolsetConfigured && (
+                    <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-black/55">
+                      <input type="checkbox" checked={multiagentEnabled} onChange={(e) => setMultiagentEnabled(e.target.checked)} className="h-3.5 w-3.5 rounded border-[#E5E7EB] text-[#3550FF] focus:ring-[#3550FF]" />
+                      启用
+                    </label>
+                  )}
+                </div>
+                {!toolsetConfigured ? (
+                  <div className="rounded-lg bg-[#F4F6FC] px-3 py-2 text-[11px] text-black/40">请先在上方选择至少一个内置工具（Toolset）后才能配置多 Agent 能力</div>
+                ) : multiagentEnabled ? (
+                  <div className="space-y-2">
+                    <div className="text-[11px] text-black/40">选择可委派的 Agent（对应其他模板）</div>
+                    {managedAgentsLoading ? (
+                      <div className="text-[11px] text-black/30">加载 Agent 列表...</div>
+                    ) : managedAgents.length === 0 ? (
+                      <div className="text-[11px] text-black/30">暂无可委派 Agent</div>
+                    ) : (
+                      <div className="flex flex-wrap gap-1.5">
+                        {managedAgents.map((agent) => {
+                          const isSelected = multiagentSelectedAgentIds.includes(agent.id);
+                          return (
+                            <button key={agent.id} type="button"
+                              onClick={() => setMultiagentSelectedAgentIds((prev) => isSelected ? prev.filter((id) => id !== agent.id) : [...prev, agent.id])}
+                              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${isSelected ? 'bg-[#3550FF] text-white shadow-sm' : 'bg-[#F4F6FC] text-black/55 hover:bg-[#E8EBF5]'}`}
+                              title={agent.id}
+                            >
+                              {agent.name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                    <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-black/55">
+                      <input type="checkbox" checked={multiagentIncludeSelf} onChange={(e) => setMultiagentIncludeSelf(e.target.checked)} className="h-3.5 w-3.5 rounded border-[#E5E7EB] text-[#3550FF] focus:ring-[#3550FF]" />
+                      包含自身（self）— 允许委派给自身
+                    </label>
+                    {(multiagentSelectedAgentIds.length > 0 || multiagentIncludeSelf) && (
+                      <div className="text-[11px] text-black/30">
+                        已配置 {multiagentSelectedAgentIds.length + (multiagentIncludeSelf ? 1 : 0)} 个可委派 Agent，运行时自动注入编排工具（Agent / create_agent / send_to_agent / list_agents）
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+              </div>
             </div>
           </details>
           <button

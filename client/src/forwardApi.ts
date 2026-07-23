@@ -22,6 +22,20 @@ export type ForwardTemplateModel = string | {
   [key: string]: unknown;
 };
 
+// A single entry in the multiagent roster. `type: 'self'` delegates to the
+// coordinator itself; `type: 'agent'` references another Managed Agent by id.
+export interface MultiagentAgentEntry {
+  type: 'self' | 'agent';
+  id?: string;
+  version?: number | string;
+  name?: string;
+}
+
+export interface MultiagentConfig {
+  type: 'coordinator';
+  agents: MultiagentAgentEntry[];
+}
+
 export interface ForwardTemplate {
   id: string;
   name: string;
@@ -32,6 +46,7 @@ export interface ForwardTemplate {
   tools?: unknown[];
   mcp_servers?: unknown[];
   skills?: unknown[];
+  multiagent?: MultiagentConfig | null;
   environment_id?: string;
   vault_ids?: string[];
   files?: unknown;
@@ -60,6 +75,7 @@ export interface CreateTemplateInput {
   tools: unknown[];
   mcp_servers: unknown[];
   skills: unknown[];
+  multiagent?: MultiagentConfig | null;
   environment_id: string;
   vault_ids: string[];
   files: Record<string, unknown>;
@@ -563,6 +579,7 @@ export async function createTemplate(ctx: ForwardContext, input?: Partial<Create
     tools: input?.tools ?? [],
     mcp_servers: input?.mcp_servers ?? [],
     skills: input?.skills ?? [],
+    ...(input?.multiagent ? { multiagent: input.multiagent } : {}),
     vault_ids: input?.vault_ids ?? [],
     files: input?.files ?? {},
     environment_variables: input?.environment_variables ?? {},
@@ -584,7 +601,29 @@ export async function updateTemplate(ctx: ForwardContext, templateId: string, in
   if (input.vault_ids !== undefined) body.vault_ids = input.vault_ids;
   if (input.files !== undefined) body.files = input.files;
   if (input.environment_variables !== undefined) body.environment_variables = input.environment_variables;
+  // multiagent uses replace semantics: send the field to replace it, or null to clear.
+  if (input.multiagent !== undefined) body.multiagent = input.multiagent ?? null;
   return forwardRequest<ForwardTemplate>(ctx, 'POST', `/templates/${encodeURIComponent(templateId)}`, body);
+}
+
+// Managed-layer Agent, the unit referenced by a multiagent roster entry.
+// Each Forward Template compiles to a Managed Agent; the roster `id` must be
+// an agent ID (agent_xxx), not a template ID.
+export interface ManagedAgent {
+  id: string;
+  name: string;
+  version: number;
+  model?: string | { id?: string };
+  status?: string;
+}
+
+// List Managed Agents so the template editor can offer them as multiagent
+// roster candidates. Forward Templates don't expose their backing agent ID,
+// so the editor lists agents by name and stores the agent ID in the roster.
+export async function listManagedAgents(ctx: ForwardContext) {
+  return cloudRequest<Page<ManagedAgent>>(ctx, 'GET', '/agents', undefined, {
+    limit: 100,
+  });
 }
 
 export async function registerResource(ctx: ForwardContext, type: ForwardResourceType, id: string, name?: string) {
