@@ -51,6 +51,8 @@ import {
   createQrSession,
   getQrSession,
   deleteChannel,
+  buildChannelCredentials,
+  waitForChannelBinding,
   listManagedAgents,
   type ManagedAgent,
   type MultiagentConfig,
@@ -69,6 +71,7 @@ import {
   type ForwardSession,
   type ForwardTemplate,
 } from './forwardApi';
+import { renderMarkdown } from './markdown';
 import { PRODUCT_NAME } from './config/product';
 
 // Helpers for the multiagent roster form state.
@@ -1345,226 +1348,6 @@ function getResponseTime(event: ForwardEvent): string | null {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-/** Lightweight Markdown renderer — handles common patterns without external deps */
-function renderMarkdown(text: string): React.ReactNode {
-  if (!text) return null;
-  const lines = text.split('\n');
-  const blocks: React.ReactNode[] = [];
-  let i = 0;
-  let key = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    // Code block
-    if (line.trimStart().startsWith('```')) {
-      const lang = line.trimStart().slice(3).trim();
-      const codeLines: string[] = [];
-      i++;
-      while (i < lines.length && !lines[i].trimStart().startsWith('```')) {
-        codeLines.push(lines[i]);
-        i++;
-      }
-      i++; // skip closing ```
-      blocks.push(
-        <pre key={key++} className="my-3 overflow-x-auto rounded-lg bg-[#1e1e2e] px-4 py-3 text-[13px] leading-5 text-[#cdd6f4]">
-          {lang && <div className="mb-1.5 text-[10px] uppercase tracking-wider text-[#cdd6f4]/40">{lang}</div>}
-          <code>{codeLines.join('\n')}</code>
-        </pre>
-      );
-      continue;
-    }
-
-    // Heading
-    const headingMatch = line.match(/^(#{1,3})\s+(.+)$/);
-    if (headingMatch) {
-      const level = headingMatch[1].length;
-      const content = headingMatch[2];
-      const cls = level === 1 ? 'text-lg font-bold mt-4 mb-2' : level === 2 ? 'text-base font-bold mt-3 mb-1.5' : 'text-sm font-bold mt-2.5 mb-1';
-      blocks.push(<div key={key++} className={cls}>{renderInline(content)}</div>);
-      i++;
-      continue;
-    }
-
-    // Blockquote
-    if (line.startsWith('> ')) {
-      const quoteLines: string[] = [];
-      while (i < lines.length && lines[i].startsWith('> ')) {
-        quoteLines.push(lines[i].slice(2));
-        i++;
-      }
-      blocks.push(
-        <blockquote key={key++} className="my-2 border-l-3 border-[#3550FF]/30 pl-3 text-black/60 italic">
-          {renderInline(quoteLines.join(' '))}
-        </blockquote>
-      );
-      continue;
-    }
-
-    // Unordered list
-    if (/^[-*]\s+/.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^[-*]\s+/, ''));
-        i++;
-      }
-      blocks.push(
-        <ul key={key++} className="my-2 list-disc pl-5 space-y-0.5">
-          {items.map((item, idx) => <li key={idx}>{renderInline(item)}</li>)}
-        </ul>
-      );
-      continue;
-    }
-
-    // Ordered list
-    if (/^\d+\.\s+/.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\d+\.\s+/, ''));
-        i++;
-      }
-      blocks.push(
-        <ol key={key++} className="my-2 list-decimal pl-5 space-y-0.5">
-          {items.map((item, idx) => <li key={idx}>{renderInline(item)}</li>)}
-        </ol>
-      );
-      continue;
-    }
-
-    // Horizontal rule
-    if (/^---+$/.test(line.trim())) {
-      blocks.push(<hr key={key++} className="my-3 border-black/10" />);
-      i++;
-      continue;
-    }
-
-    // Empty line
-    if (!line.trim()) {
-      i++;
-      continue;
-    }
-
-    // Table
-    if (line.trim().startsWith('|') && i + 1 < lines.length && /^\|?\s*[-:]+[-|:\s]+$/.test(lines[i + 1])) {
-      const tableLines: string[] = [];
-      while (i < lines.length && lines[i].trim().startsWith('|')) {
-        tableLines.push(lines[i]);
-        i++;
-      }
-      if (tableLines.length >= 2) {
-        const parseRow = (row: string) => row.split('|').slice(1, -1).map(cell => cell.trim());
-        const headers = parseRow(tableLines[0]);
-        const dataRows = tableLines.slice(2).map(parseRow);
-        blocks.push(
-          <div key={key++} className="my-3 overflow-x-auto">
-            <table className="min-w-full border-collapse border border-gray-200 text-sm">
-              <thead>
-                <tr className="bg-gray-50">
-                  {headers.map((header, idx) => (
-                    <th key={idx} className="border border-gray-200 px-3 py-2 text-left font-semibold text-black/70">
-                      {renderInline(header)}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {dataRows.map((row, rowIdx) => (
-                  <tr key={rowIdx} className={rowIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
-                    {row.map((cell, cellIdx) => (
-                      <td key={cellIdx} className="border border-gray-200 px-3 py-2 text-black/70">
-                        {renderInline(cell)}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        );
-      }
-      continue;
-    }
-
-    // Paragraph — collect consecutive non-empty lines
-    const paraLines: string[] = [];
-    while (i < lines.length && lines[i].trim() && !lines[i].trimStart().startsWith('```') && !/^#{1,3}\s/.test(lines[i]) && !/^[-*]\s+/.test(lines[i]) && !/^\d+\.\s+/.test(lines[i]) && !lines[i].startsWith('> ') && !/^---+$/.test(lines[i].trim()) && !lines[i].trim().startsWith('|')) {
-      paraLines.push(lines[i]);
-      i++;
-    }
-    if (paraLines.length === 0) {
-      // No block matched and the paragraph collector refused this line (e.g. a
-      // streaming table header whose separator row hasn't arrived yet, or a bare
-      // '## ' with no text). Consume it as plain text to guarantee forward
-      // progress — otherwise the while(i) loop spins forever and freezes the tab.
-      paraLines.push(lines[i]);
-      i++;
-    }
-    blocks.push(<p key={key++} className="my-1.5">{renderInline(paraLines.join(' '))}</p>);
-  }
-
-  return <>{blocks}</>;
-}
-
-function renderInline(text: string): React.ReactNode {
-  // Process inline markdown: bold, italic, code, links
-  const parts: React.ReactNode[] = [];
-  let remaining = text;
-  let k = 0;
-
-  while (remaining.length > 0) {
-    // Inline code
-    const codeMatch = remaining.match(/^`([^`]+)`/);
-    if (codeMatch) {
-      parts.push(<code key={k++} className="rounded bg-black/6 px-1.5 py-0.5 font-mono text-[13px]">{codeMatch[1]}</code>);
-      remaining = remaining.slice(codeMatch[0].length);
-      continue;
-    }
-
-    // Bold + italic
-    const boldItalicMatch = remaining.match(/^\*\*\*(.+?)\*\*\*/);
-    if (boldItalicMatch) {
-      parts.push(<strong key={k++} className="font-bold italic">{boldItalicMatch[1]}</strong>);
-      remaining = remaining.slice(boldItalicMatch[0].length);
-      continue;
-    }
-
-    // Bold
-    const boldMatch = remaining.match(/^\*\*(.+?)\*\*/);
-    if (boldMatch) {
-      parts.push(<strong key={k++} className="font-semibold">{boldMatch[1]}</strong>);
-      remaining = remaining.slice(boldMatch[0].length);
-      continue;
-    }
-
-    // Italic
-    const italicMatch = remaining.match(/^\*(.+?)\*/);
-    if (italicMatch) {
-      parts.push(<em key={k++} className="italic">{italicMatch[1]}</em>);
-      remaining = remaining.slice(italicMatch[0].length);
-      continue;
-    }
-
-    // Link
-    const linkMatch = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
-    if (linkMatch) {
-      parts.push(<a key={k++} href={linkMatch[2]} target="_blank" rel="noopener noreferrer" className="text-[#3550FF] underline decoration-[#3550FF]/30 hover:decoration-[#3550FF]">{linkMatch[1]}</a>);
-      remaining = remaining.slice(linkMatch[0].length);
-      continue;
-    }
-
-    // Plain text — consume until next special char
-    const nextSpecial = remaining.slice(1).search(/[`*[]/);
-    if (nextSpecial === -1) {
-      parts.push(<span key={k++}>{remaining}</span>);
-      remaining = '';
-    } else {
-      parts.push(<span key={k++}>{remaining.slice(0, nextSpecial + 1)}</span>);
-      remaining = remaining.slice(nextSpecial + 1);
-    }
-  }
-
-  return <>{parts}</>;
-}
 
 function sessionErrorDetail(event: ForwardEvent): string {
   const err = event.error;
@@ -2200,6 +1983,8 @@ export default function App() {
   const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
   const [qrSession, setQrSession] = useState<ForwardQrSession | null>(null);
   const [qrPolling, setQrPolling] = useState(false);
+  const [qrVerifying, setQrVerifying] = useState(false);
+  const [qrBindingIssue, setQrBindingIssue] = useState('');
   const qrPollTimerRef = useRef<number | null>(null);
   const stopQrPolling = useCallback(() => {
     if (qrPollTimerRef.current !== null) {
@@ -2642,9 +2427,40 @@ export default function App() {
     }
   }, [ctx, identity]);
 
+  // QR confirmed 只代表扫码动作完成；渠道要处理上行消息必须 enabled=true 且
+  // binding_status=bound。绑定生效前绝不能展示「绑定成功」，失败要给出可操作的提示。
+  const confirmQrBinding = useCallback(async (channelId: string, opts?: { enable?: boolean }): Promise<ForwardChannel | null> => {
+    if (!ctx) return null;
+    setQrVerifying(true);
+    setQrBindingIssue('');
+    try {
+      const channel = await waitForChannelBinding(ctx, channelId);
+      if (channel.binding_status !== 'bound') {
+        setQrBindingIssue(
+          channel.binding_status === 'expired'
+            ? '渠道授权已过期，请重新生成二维码扫码授权。'
+            : '扫码已确认，但渠道暂未生效。绑定可能仍在处理中，请稍后点击「重新检查」，或重新生成二维码扫码。',
+        );
+        return null;
+      }
+      if (opts?.enable && !channel.enabled) {
+        await updateChannel(ctx, channelId, { enabled: true });
+        channel.enabled = true;
+      }
+      return channel;
+    } catch (err) {
+      setQrBindingIssue(`渠道生效失败：${err instanceof Error ? err.message : String(err)}。请检查网络后点击「重新检查」。`);
+      return null;
+    } finally {
+      setQrVerifying(false);
+    }
+  }, [ctx]);
+
   const startQrSession = useCallback(async (channelId: string) => {
     if (!ctx) return;
     stopQrPolling();
+    setQrBindingIssue('');
+    setQrVerifying(false);
     try {
       const qr = await createQrSession(ctx, channelId);
       setQrSession(qr);
@@ -2660,15 +2476,18 @@ export default function App() {
           if (status.status === 'confirmed') {
             qrPollTimerRef.current = null;
             setQrPolling(false);
-            // Enable the channel, save, and auto-close
-            await updateChannel(ctx, channelId, { enabled: true });
-            await loadChannels();
-            // Auto-close the modal
-            setShowChannelModal(false);
-            setQrSession(null);
-            setChanName('');
-            setCreatedChannelId(null);
-            setChannelStep('config');
+            // 扫码确认后先验证渠道真正生效，再展示成功并关闭弹窗
+            const channel = await confirmQrBinding(channelId, { enable: true });
+            if (channel) {
+              await loadChannels();
+              setShowChannelModal(false);
+              setQrSession(null);
+              setChanName('');
+              setCreatedChannelId(null);
+              setChannelStep('config');
+            } else {
+              await loadChannels().catch(() => {});
+            }
           } else if (status.status === 'waiting' || status.status === 'scanned') {
             qrPollTimerRef.current = window.setTimeout(pollFn, pollInterval);
           } else {
@@ -2681,7 +2500,7 @@ export default function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [ctx, loadChannels, stopQrPolling]);
+  }, [ctx, loadChannels, stopQrPolling, confirmQrBinding]);
 
   // Step 2 QR: create channel + generate QR code
   const handleCreateChannelAndQr = useCallback(async () => {
@@ -2716,7 +2535,7 @@ export default function App() {
     setLoading(true);
     setError('');
     try {
-      const credentials: Record<string, string> = { app_key: chanAppKey.trim(), app_secret: chanAppSecret.trim() };
+      const credentials = buildChannelCredentials(chanType, chanAppKey.trim(), chanAppSecret.trim());
       if (chanAgentId.trim()) credentials.agent_id = chanAgentId.trim();
       // Create channel with credentials in one call (channel doesn't exist yet for manual mode)
       await createChannel(ctx, {
@@ -2747,6 +2566,8 @@ export default function App() {
   const handleRebindChannel = useCallback(async (channel: ForwardChannel) => {
     if (!ctx) return;
     stopQrPolling(); // stop any existing polling
+    setQrBindingIssue('');
+    setQrVerifying(false);
     try {
       const qr = await createQrSession(ctx, channel.id);
       setQrSession(qr);
@@ -2762,7 +2583,12 @@ export default function App() {
           if (status.status === 'confirmed') {
             qrPollTimerRef.current = null;
             setQrPolling(false);
-            await loadChannels();
+            const fresh = await confirmQrBinding(channel.id);
+            if (fresh) {
+              setEditingChannelItem((prev) => (prev && prev.id === fresh.id ? { ...prev, ...fresh } : prev));
+              setQrSession(null);
+            }
+            await loadChannels().catch(() => {});
           } else if (status.status === 'waiting' || status.status === 'scanned') {
             qrPollTimerRef.current = window.setTimeout(pollFn, pollInterval);
           } else {
@@ -2775,7 +2601,24 @@ export default function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [ctx, loadChannels]);
+  }, [ctx, loadChannels, stopQrPolling, confirmQrBinding]);
+
+  // 不重新扫码，仅重新检查渠道绑定状态（绑定可能异步生效）
+  const handleRecheckBinding = useCallback(async (channelId: string, opts?: { enable?: boolean; closeOnBound?: boolean }) => {
+    const channel = await confirmQrBinding(channelId, { enable: opts?.enable });
+    await loadChannels().catch(() => {});
+    if (!channel) return;
+    setEditingChannelItem((prev) => (prev && prev.id === channel.id ? { ...prev, ...channel } : prev));
+    if (opts?.closeOnBound) {
+      setShowChannelModal(false);
+      setQrSession(null);
+      setChanName('');
+      setCreatedChannelId(null);
+      setChannelStep('config');
+    } else {
+      setQrSession(null);
+    }
+  }, [confirmQrBinding, loadChannels]);
 
   const handleDeleteChannel = useCallback(async (channelId: string) => {
     if (!ctx) return;
@@ -2805,7 +2648,7 @@ export default function App() {
       };
       // If manual mode and credentials provided, include them
       if (chanMode === 'manual' && chanAppKey.trim()) {
-        const credentials: Record<string, string> = { app_key: chanAppKey.trim(), app_secret: chanAppSecret.trim() };
+        const credentials = buildChannelCredentials(editingChannelItem.channel_type, chanAppKey.trim(), chanAppSecret.trim());
         if (chanAgentId.trim()) credentials.agent_id = chanAgentId.trim();
         updatePayload.channel_config = {
           ...editingChannelItem.channel_config,
@@ -4243,6 +4086,11 @@ export default function App() {
         {channels.map((chan) => {
           const chanInfo = CHANNEL_TYPES.find((c) => c.value === chan.channel_type);
           const tpl = templates.find((t) => t.id === chan.template_id);
+          // 只有 enabled=true 且 binding_status=bound 时渠道才真正处理上行消息
+          const chanStatusLabel = chan.binding_status !== 'bound' ? (chan.binding_status === 'expired' ? '已过期' : '未绑定') : chan.enabled ? '生效中' : '已停用';
+          const chanStatusCls = chan.binding_status !== 'bound'
+            ? (chan.binding_status === 'expired' ? 'bg-amber-50 text-amber-600' : 'bg-gray-100 text-black/40')
+            : chan.enabled ? 'bg-emerald-50 text-emerald-600' : 'bg-gray-100 text-black/40';
           return (
             <div key={chan.id} className="rounded-2xl border border-[#DDE2F2] bg-white p-5 transition hover:shadow-md">
               <div className="flex items-start justify-between gap-3">
@@ -4253,6 +4101,7 @@ export default function App() {
                     <div className="text-xs text-black/40">{chanInfo?.label || chan.channel_type}</div>
                   </div>
                 </div>
+                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${chanStatusCls}`}>{chanStatusLabel}</span>
               </div>
               <div className="mt-3 flex items-center gap-3 text-xs text-black/40">
                 <span className="inline-flex items-center gap-1">
@@ -6359,11 +6208,12 @@ export default function App() {
                       {qrSession ? (
                         <>
                           <div className="mb-2 text-xs font-medium text-black">
-                            {qrSession.status === 'confirmed' ? '✅ 绑定成功！' :
-                             qrSession.status === 'waiting' ? `请使用${chanTypeInfo?.label || ''}扫码` :
-                             qrSession.status === 'scanned' ? '已扫码，请在手机上确认...' :
-                             qrSession.status === 'expired' ? '二维码已过期' :
-                             qrSession.status === 'denied' ? '用户已拒绝授权' : '发生错误'}
+                            {qrSession.status === 'confirmed'
+                              ? (qrVerifying ? '扫码成功，正在确认渠道绑定状态…' : qrBindingIssue ? '⚠️ 绑定未完成' : '✅ 绑定成功！')
+                              : qrSession.status === 'waiting' ? `请使用${chanTypeInfo?.label || ''}扫码` :
+                               qrSession.status === 'scanned' ? '已扫码，请在手机上确认...' :
+                               qrSession.status === 'expired' ? '二维码已过期' :
+                               qrSession.status === 'denied' ? '用户已拒绝授权' : '发生错误'}
                           </div>
                           {qrSession.qr_code_image_base64 && qrSession.status !== 'confirmed' && (
                             <div className="mx-auto mb-2 inline-block rounded-xl border border-[#E5E7EB] bg-white p-2">
@@ -6376,7 +6226,16 @@ export default function App() {
                               等待确认...
                             </div>
                           )}
+                          {qrVerifying && (
+                            <div className="mb-1 flex items-center justify-center gap-1.5 text-[11px] text-black/40">
+                              <span className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-black/20 border-t-[#3550FF]" />
+                              确认绑定状态中...
+                            </div>
+                          )}
                           {qrSession.err_msg && <div className="mb-1 text-[11px] text-red-500">{qrSession.err_msg}</div>}
+                          {qrBindingIssue && !qrVerifying && (
+                            <div className="mb-2 rounded-lg bg-amber-50 px-2.5 py-2 text-left text-[11px] leading-4 text-amber-700">{qrBindingIssue}</div>
+                          )}
                           {qrSession.status !== 'confirmed' && (
                             <button
                               onClick={() => void handleRebindChannel(editingChannelItem)}
@@ -6385,7 +6244,23 @@ export default function App() {
                               🔄 重新生成
                             </button>
                           )}
-                          {qrSession.status === 'confirmed' && (
+                          {qrSession.status === 'confirmed' && qrBindingIssue && !qrVerifying && (
+                            <div className="flex items-center justify-center gap-2">
+                              <button
+                                onClick={() => void handleRecheckBinding(editingChannelItem.id)}
+                                className="rounded-lg bg-[#3550FF] px-3 py-1.5 text-[11px] font-medium text-white transition hover:bg-[#2a42e0]"
+                              >
+                                重新检查
+                              </button>
+                              <button
+                                onClick={() => void handleRebindChannel(editingChannelItem)}
+                                className="rounded-lg border border-[#3550FF] bg-white px-3 py-1.5 text-[11px] font-medium text-[#3550FF] transition hover:bg-[#F0F2FF]"
+                              >
+                                🔄 重新扫码
+                              </button>
+                            </div>
+                          )}
+                          {qrSession.status === 'confirmed' && !qrBindingIssue && !qrVerifying && (
                             <div className="mt-1 flex items-center justify-center gap-1.5 text-xs font-medium text-emerald-600">
                               <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
                               已连接
@@ -6407,16 +6282,19 @@ export default function App() {
                   )}
 
                   {/* Manual config sub-section */}
-                  {chanMode === 'manual' && (
+                  {chanMode === 'manual' && (() => {
+                    const keyLabel = editingChannelItem.channel_type === 'feishu' ? 'App ID' : editingChannelItem.channel_type === 'dingtalk' ? 'Client ID' : 'Bot ID';
+                    const secretLabel = editingChannelItem.channel_type === 'feishu' ? 'App Secret' : editingChannelItem.channel_type === 'dingtalk' ? 'Client Secret' : 'Secret';
+                    return (
                     <div className="mt-3 space-y-2">
                       <div className="grid grid-cols-2 gap-2">
                         <label className="block">
-                          <span className="mb-1 block text-[10px] font-medium text-black/50">App Key</span>
-                          <input value={chanAppKey} onChange={(e) => setChanAppKey(e.target.value)} placeholder="App Key" className="h-8 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
+                          <span className="mb-1 block text-[10px] font-medium text-black/50">{keyLabel}</span>
+                          <input value={chanAppKey} onChange={(e) => setChanAppKey(e.target.value)} placeholder={keyLabel} className="h-8 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
                         </label>
                         <label className="block">
-                          <span className="mb-1 block text-[10px] font-medium text-black/50">App Secret</span>
-                          <input value={chanAppSecret} onChange={(e) => setChanAppSecret(e.target.value)} type="password" placeholder="App Secret" className="h-8 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
+                          <span className="mb-1 block text-[10px] font-medium text-black/50">{secretLabel}</span>
+                          <input value={chanAppSecret} onChange={(e) => setChanAppSecret(e.target.value)} type="password" placeholder={secretLabel} className="h-8 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
                         </label>
                       </div>
                       {(editingChannelItem.channel_type === 'wecom' || editingChannelItem.channel_type === 'dingtalk') && (
@@ -6426,7 +6304,8 @@ export default function App() {
                         </label>
                       )}
                     </div>
-                  )}
+                    );
+                  })()}
                 </div>
               )}
 
@@ -6727,11 +6606,12 @@ export default function App() {
                 {qrSession ? (
                   <>
                     <div className="mb-2 text-xs font-medium text-black">
-                      {qrSession.status === 'confirmed' ? '✅ 绑定成功！渠道已就绪' :
-                       qrSession.status === 'waiting' ? `请使用${CHANNEL_TYPES.find((c) => c.value === chanType)?.label || ''}扫码` :
-                       qrSession.status === 'scanned' ? '已扫码，请在手机上确认...' :
-                       qrSession.status === 'expired' ? '二维码已过期' :
-                       qrSession.status === 'denied' ? '用户已拒绝授权' : '发生错误'}
+                      {qrSession.status === 'confirmed'
+                        ? (qrVerifying ? '扫码成功，正在确认渠道绑定状态…' : qrBindingIssue ? '⚠️ 绑定未完成' : '✅ 绑定成功！渠道已就绪')
+                        : qrSession.status === 'waiting' ? `请使用${CHANNEL_TYPES.find((c) => c.value === chanType)?.label || ''}扫码` :
+                         qrSession.status === 'scanned' ? '已扫码，请在手机上确认...' :
+                         qrSession.status === 'expired' ? '二维码已过期' :
+                         qrSession.status === 'denied' ? '用户已拒绝授权' : '发生错误'}
                     </div>
                     {qrSession.qr_code_image_base64 && qrSession.status !== 'confirmed' && (
                       <div className="mx-auto mb-2 inline-block rounded-xl border border-[#E5E7EB] bg-white p-2">
@@ -6744,7 +6624,16 @@ export default function App() {
                         等待确认...
                       </div>
                     )}
+                    {qrVerifying && (
+                      <div className="mb-1 flex items-center justify-center gap-1.5 text-[11px] text-black/40">
+                        <span className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-black/20 border-t-[#3550FF]" />
+                        确认绑定状态中...
+                      </div>
+                    )}
                     {qrSession.err_msg && <div className="mb-1 text-[11px] text-red-500">{qrSession.err_msg}</div>}
+                    {qrBindingIssue && !qrVerifying && (
+                      <div className="mb-2 rounded-lg bg-amber-50 px-2.5 py-2 text-left text-[11px] leading-4 text-amber-700">{qrBindingIssue}</div>
+                    )}
                     {qrSession.status !== 'confirmed' && (
                       <button
                         onClick={() => { if (createdChannelId) void startQrSession(createdChannelId); }}
@@ -6752,6 +6641,22 @@ export default function App() {
                       >
                         🔄 重新生成
                       </button>
+                    )}
+                    {qrSession.status === 'confirmed' && qrBindingIssue && !qrVerifying && createdChannelId && (
+                      <div className="flex items-center justify-center gap-2">
+                        <button
+                          onClick={() => void handleRecheckBinding(createdChannelId, { enable: true, closeOnBound: true })}
+                          className="rounded-lg bg-[#3550FF] px-3 py-1.5 text-[11px] font-medium text-white transition hover:bg-[#2a42e0]"
+                        >
+                          重新检查
+                        </button>
+                        <button
+                          onClick={() => void startQrSession(createdChannelId)}
+                          className="rounded-lg border border-[#3550FF] bg-white px-3 py-1.5 text-[11px] font-medium text-[#3550FF] transition hover:bg-[#F0F2FF]"
+                        >
+                          🔄 重新扫码
+                        </button>
+                      </div>
                     )}
                   </>
                 ) : createdChannelId ? (
@@ -6778,12 +6683,12 @@ export default function App() {
               <div className="space-y-2">
                 <div className="grid grid-cols-2 gap-2">
                   <label className="block">
-                    <span className="mb-1 block text-[11px] font-medium text-black/50">App Key <span className="text-red-400">*</span></span>
-                    <input value={chanAppKey} onChange={(e) => setChanAppKey(e.target.value)} placeholder="App Key" className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
+                    <span className="mb-1 block text-[11px] font-medium text-black/50">{chanType === 'feishu' ? 'App ID' : chanType === 'dingtalk' ? 'Client ID' : 'Bot ID'} <span className="text-red-400">*</span></span>
+                    <input value={chanAppKey} onChange={(e) => setChanAppKey(e.target.value)} placeholder={chanType === 'feishu' ? 'App ID' : chanType === 'dingtalk' ? 'Client ID' : 'Bot ID'} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
                   </label>
                   <label className="block">
-                    <span className="mb-1 block text-[11px] font-medium text-black/50">App Secret <span className="text-red-400">*</span></span>
-                    <input value={chanAppSecret} onChange={(e) => setChanAppSecret(e.target.value)} type="password" placeholder="App Secret" className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
+                    <span className="mb-1 block text-[11px] font-medium text-black/50">{chanType === 'feishu' ? 'App Secret' : chanType === 'dingtalk' ? 'Client Secret' : 'Secret'} <span className="text-red-400">*</span></span>
+                    <input value={chanAppSecret} onChange={(e) => setChanAppSecret(e.target.value)} type="password" placeholder={chanType === 'feishu' ? 'App Secret' : chanType === 'dingtalk' ? 'Client Secret' : 'Secret'} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
                   </label>
                 </div>
                 {(chanType === 'wecom' || chanType === 'dingtalk') && (
@@ -6814,10 +6719,12 @@ export default function App() {
               </button>
               {(() => {
                 const isQr = chanMode === 'qr' && CHANNEL_TYPES.find((c) => c.value === chanType)?.qrSupport;
-                const qrConfirmed = isQr && qrSession?.status === 'confirmed';
+                const qrConfirmed = isQr && qrSession?.status === 'confirmed' && !qrBindingIssue && !qrVerifying;
                 const manualReady = chanMode === 'manual' && chanAppKey.trim() && chanAppSecret.trim();
                 const isDisabled = isQr ? !qrConfirmed : (!manualReady || loading);
-                const btnText = loading ? '保存中...' : isQr ? (qrConfirmed ? '保存' : '等待扫码确认...') : '保存';
+                const btnText = loading ? '保存中...' : isQr
+                  ? (qrVerifying ? '确认绑定状态中...' : qrBindingIssue ? '绑定未完成' : qrConfirmed ? '保存' : '等待扫码确认...')
+                  : '保存';
 
                 return (
                   <button

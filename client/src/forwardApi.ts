@@ -1066,3 +1066,38 @@ export async function getQrSession(ctx: ForwardContext, sessionKey: string) {
 export async function deleteChannel(ctx: ForwardContext, channelId: string) {
   return forwardRequest<{ id: string; deleted: boolean }>(ctx, 'DELETE', `/channels/${encodeURIComponent(channelId)}`);
 }
+
+export function buildChannelCredentials(
+  channelType: ChannelType,
+  key: string,
+  secret: string,
+): Record<string, string> {
+  switch (channelType) {
+    case 'feishu':
+      return { app_id: key, app_secret: secret };
+    case 'dingtalk':
+      return { client_id: key, client_secret: secret };
+    case 'wecom':
+      return { bot_id: key, secret };
+    default:
+      // wechat 仅支持扫码绑定，不使用直连凭据
+      return {};
+  }
+}
+
+// QR 扫码 confirmed 只代表扫码动作完成；渠道真正可处理上行消息需要
+// binding_status=bound。绑定落库可能是异步的，这里轮询等待最终结果。
+export async function waitForChannelBinding(
+  ctx: ForwardContext,
+  channelId: string,
+  opts?: { attempts?: number; intervalMs?: number },
+): Promise<ForwardChannel> {
+  const attempts = Math.max(1, opts?.attempts ?? 4);
+  const intervalMs = Math.max(0, opts?.intervalMs ?? 1500);
+  let channel = await getChannel(ctx, channelId);
+  for (let i = 1; i < attempts && channel.binding_status === 'unbound'; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    channel = await getChannel(ctx, channelId);
+  }
+  return channel;
+}
