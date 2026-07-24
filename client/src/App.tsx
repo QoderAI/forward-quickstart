@@ -2557,7 +2557,10 @@ export default function App() {
         identity_resolution: { mode: 'fixed' },
         channel_type: chanType,
         name: chanName.trim(),
-        enabled: false, // disabled until QR confirmed
+        // Keep the channel enabled while unbound so Gateway can start the
+        // WeChat iLink poller immediately after QR confirmation. The
+        // binding_status=unbound gate still prevents premature polling.
+        enabled: true,
         channel_config: {
           response_options: { include_tool_calls: chanShowTools, include_thinking: chanShowThinking },
         },
