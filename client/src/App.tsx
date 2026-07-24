@@ -6218,7 +6218,7 @@ export default function App() {
               </label>
               <label className="block">
                 <span className="mb-1 block text-[11px] font-medium text-black/50">绑定模板</span>
-                <select value={editingChannelItem.template_id} onChange={(e) => setEditingChannelItem({ ...editingChannelItem, template_id: e.target.value })} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 text-sm outline-none transition focus:border-[#3550FF]">
+                <select value={editingChannelItem.template_id ?? ''} onChange={(e) => setEditingChannelItem({ ...editingChannelItem, template_id: e.target.value })} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 text-sm outline-none transition focus:border-[#3550FF]">
                   {templates.map((t) => (<option key={t.id} value={t.id}>{t.name || t.id}</option>))}
                 </select>
               </label>
