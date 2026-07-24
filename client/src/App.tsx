@@ -74,6 +74,7 @@ import {
 import { renderMarkdown } from './markdown';
 import { ChatImage } from './chatImage';
 import { isImageFile } from './imageUtils';
+import { BatchPanel } from './batchPanel';
 import { PRODUCT_NAME } from './config/product';
 
 // Helpers for the multiagent roster form state.
@@ -276,7 +277,7 @@ function emptyResourceOptions(): Record<ForwardResourceType, ForwardResource[]> 
   };
 }
 
-type SidebarPanel = 'chat' | 'schedules' | 'channels' | 'templates' | 'skills' | 'files' | 'environments' | 'vaults' | 'memoryStores' | 'usage';
+type SidebarPanel = 'chat' | 'schedules' | 'channels' | 'batches' | 'templates' | 'skills' | 'files' | 'environments' | 'vaults' | 'memoryStores' | 'usage';
 
 const SIDEBAR_ITEMS: Array<{ id: SidebarPanel; label: string }> = [
   { id: 'chat', label: '对话' },
@@ -284,6 +285,8 @@ const SIDEBAR_ITEMS: Array<{ id: SidebarPanel; label: string }> = [
   { id: 'memoryStores', label: '个人记忆' },
   { id: 'schedules', label: '定时任务' },
   { id: 'channels', label: 'IM 渠道' },
+  // 批量任务：主菜单一级入口，但仅开发者模式可见（渲染处单独门控）
+  { id: 'batches', label: '批量任务' },
   { id: 'skills', label: '技能' },
   { id: 'files', label: '文件' },
   { id: 'environments', label: '环境' },
@@ -1569,6 +1572,7 @@ function NavIcon({ panel }: { panel: SidebarPanel }) {
   const c = 'h-4 w-4 shrink-0';
   if (panel === 'chat') return (<svg className={c} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M8.625 12a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H8.25m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H12m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 0 1-2.555-.337A5.972 5.972 0 0 1 5.41 20.97a5.969 5.969 0 0 1-.474-.065 4.48 4.48 0 0 0 .978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25Z" /></svg>);
   if (panel === 'schedules') return (<svg className={c} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg>);
+  if (panel === 'batches') return (<svg className={c} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3.75 12h16.5m-16.5 3.75h16.5M3.75 19.5h16.5M5.625 4.5h12.75a1.875 1.875 0 0 1 0 3.75H5.625a1.875 1.875 0 0 1 0-3.75Z" /></svg>);
   if (panel === 'channels') return (<svg className={c} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 0 1-.825-.242m9.345-8.334a2.126 2.126 0 0 0-.476-.095 48.64 48.64 0 0 0-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0 0 11.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155" /></svg>);
   if (panel === 'templates') return (<svg className={c} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25a2.25 2.25 0 0 1-2.25-2.25v-2.25Z" /></svg>);
   if (panel === 'skills') return (<svg className={c} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="m3.75 13.5 10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75Z" /></svg>);
@@ -3823,10 +3827,23 @@ export default function App() {
                     {label}
                   </button>
                 ))}
+                {/* 批量任务：主菜单内的开发者模式专属入口 */}
+                {developerMode && SIDEBAR_ITEMS.slice(5, 6).map(({ id, label }) => (
+                  <button
+                    key={id}
+                    onClick={() => setActivePanel(id)}
+                    className={`flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-sm transition ${
+                      activePanel === id ? 'bg-[#3550FF]/8 font-semibold text-[#3550FF]' : 'font-medium text-black/55 hover:bg-black/4 hover:text-black'
+                    }`}
+                  >
+                    <NavIcon panel={id} />
+                    {label}
+                  </button>
+                ))}
                 {developerMode && (
                   <div className="mb-2 mt-5 px-2 text-[11px] font-medium uppercase tracking-wider text-black/30">模板资源</div>
                 )}
-                {developerMode && SIDEBAR_ITEMS.slice(5, 9).map(({ id, label }) => (
+                {developerMode && SIDEBAR_ITEMS.slice(6, 10).map(({ id, label }) => (
                   <button
                     key={id}
                     onClick={() => {
@@ -3855,7 +3872,7 @@ export default function App() {
                   </button>
                 ))}
                 <div className="mb-2 mt-5 px-2 text-[11px] font-medium uppercase tracking-wider text-black/30">统计</div>
-                {SIDEBAR_ITEMS.slice(9).map(({ id, label }) => (
+                {SIDEBAR_ITEMS.slice(10).map(({ id, label }) => (
                   <button
                     key={id}
                     onClick={() => {
@@ -3896,8 +3913,8 @@ export default function App() {
                       if (developerMode) {
                         setDeveloperMode(false);
                         try { localStorage.setItem('developer_mode', '0'); } catch { /* ignore */ }
-                        // If currently viewing a template-resource panel, fall back to chat.
-                        if (['skills', 'files', 'environments', 'vaults'].includes(activePanel)) {
+                        // If currently viewing a developer-only panel, fall back to chat.
+                        if (['skills', 'files', 'environments', 'vaults', 'batches'].includes(activePanel)) {
                           setActivePanel('chat');
                         }
                       } else {
@@ -4189,6 +4206,8 @@ export default function App() {
       </div>
     </div>
   </div>
+) : activePanel === 'batches' ? (
+  <BatchPanel ctx={ctx} identityId={identity?.id || ''} templates={templates} defaultTemplateId={templateId || templates[0]?.id} />
 ) : activePanel === 'templates' ? (
             <div className="h-full overflow-y-auto bg-[#FAFBFF]">
               <div className="flex max-w-[1440px] flex-col gap-4 p-6">

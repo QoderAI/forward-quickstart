@@ -390,7 +390,7 @@ export async function getCloudFile(ctx: ForwardContext, fileId: string) {
 
 export async function uploadCloudFile(
   ctx: ForwardContext,
-  input: { file: File; name?: string; metadata?: Record<string, unknown> },
+  input: { file: File; name?: string; metadata?: Record<string, unknown>; purpose?: string },
 ) {
   const uploadForm = new FormData();
   uploadForm.append('pat', ctx.pat);
@@ -399,6 +399,8 @@ export async function uploadCloudFile(
   uploadForm.append('file', input.file);
   if (input.name) uploadForm.append('name', input.name);
   if (input.metadata) uploadForm.append('metadata', JSON.stringify(input.metadata));
+  // Batch 输入文件必须用 purpose=session_resource，否则后续下载可能失败
+  if (input.purpose) uploadForm.append('purpose', input.purpose);
 
   const res = await fetch('/api/cloud/upload', {
     method: 'POST',
@@ -1103,4 +1105,84 @@ export async function waitForChannelBinding(
     channel = await getChannel(ctx, channelId);
   }
   return channel;
+}
+
+// ─── Batches (Forward API) ──────────────────────────────────
+
+export type BatchStatus =
+  | 'validating' | 'queued' | 'processing'
+  | 'cancelling' | 'expiring' | 'finalizing'
+  | 'completed' | 'failed' | 'cancelled' | 'expired';
+
+export type BatchCompletionWindow = '24h' | '48h' | '72h';
+
+export interface BatchRequestCounts {
+  total: number;
+  pending: number;
+  running: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  expired: number;
+}
+
+export interface ForwardBatch {
+  id: string;                        // 前缀 batch_
+  object: 'batch';
+  status: BatchStatus;
+  input_file_id: string;
+  output_file_id?: string;           // 终态后才出现
+  error_file_id?: string;            // 有失败行时才出现
+  completion_window: BatchCompletionWindow;
+  created_at: string;                // RFC 3339
+  expires_at: string;
+  request_counts: BatchRequestCounts;
+  usage: null;                       // v1 预留
+  metadata?: Record<string, unknown>;
+  error_message?: string;            // 仅 failed 状态
+}
+
+// JSONL 行结构（前端构建/校验用）
+export interface BatchInputLine {
+  custom_id: string;
+  template_id: string;
+  identity_id: string;
+  body: Record<string, unknown>;
+}
+
+export const BATCH_TERMINAL_STATUSES: ReadonlySet<BatchStatus> =
+  new Set(['completed', 'failed', 'cancelled', 'expired']);
+
+export async function listBatches(
+  ctx: ForwardContext,
+  opts?: { status?: BatchStatus; limit?: number; afterId?: string },
+) {
+  return forwardRequest<Page<ForwardBatch>>(ctx, 'GET', '/batches', undefined, {
+    ...(opts?.status ? { status: opts.status } : {}),
+    ...(opts?.afterId ? { after_id: opts.afterId } : {}),
+    limit: opts?.limit ?? 20,
+  });
+}
+
+export async function createBatch(
+  ctx: ForwardContext,
+  input: {
+    input_file_id: string;
+    completion_window: BatchCompletionWindow;
+    metadata?: Record<string, unknown>;
+  },
+) {
+  return forwardRequest<ForwardBatch>(ctx, 'POST', '/batches', input);
+}
+
+export async function getBatch(ctx: ForwardContext, batchId: string) {
+  return forwardRequest<ForwardBatch>(ctx, 'GET', `/batches/${encodeURIComponent(batchId)}`);
+}
+
+export async function cancelBatch(ctx: ForwardContext, batchId: string) {
+  return forwardRequest<ForwardBatch>(ctx, 'POST', `/batches/${encodeURIComponent(batchId)}/cancel`);
+}
+
+export async function getBatchOutput(ctx: ForwardContext, batchId: string) {
+  return forwardRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/batches/${encodeURIComponent(batchId)}/output`);
 }
