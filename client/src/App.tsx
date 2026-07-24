@@ -76,6 +76,7 @@ import { ChatImage } from './chatImage';
 import { isImageFile } from './imageUtils';
 import { BatchPanel } from './batchPanel';
 import { PRODUCT_NAME } from './config/product';
+import { BUILTIN_TOOLS, buildToolsetEntry, extractBuiltinToolNames, extractToolNames } from './templateTools';
 
 // Helpers for the multiagent roster form state.
 const AUTH_KEY = 'forward_quickstart_auth';
@@ -88,37 +89,6 @@ const _thinkingBySession = new Map<string, string>();
 // Streaming text accumulators for real-time agent message display
 const _streamingTextBySession = new Map<string, string>();
 const _streamingMsgIdBySession = new Map<string, string>();
-/** Extract user-friendly built-in tool names from template tools array */
-function extractToolNames(tools: unknown[] | undefined): string[] {
-  if (!Array.isArray(tools)) return [];
-  const names: string[] = [];
-  for (const tool of tools) {
-    if (!tool || typeof tool !== 'object') continue;
-    const record = tool as Record<string, unknown>;
-    if (record.type === 'agent_toolset_20260401') {
-      // Extract from enabled_tools (convenience allowlist)
-      if (Array.isArray(record.enabled_tools)) {
-        names.push(...record.enabled_tools.filter((t): t is string => typeof t === 'string'));
-      }
-      // Extract from configs (per-tool {name, enabled} objects)
-      if (Array.isArray(record.configs)) {
-        for (const config of record.configs) {
-          if (config && typeof config === 'object') {
-            const c = config as Record<string, unknown>;
-            if (typeof c.name === 'string' && c.enabled !== false) {
-              names.push(c.name);
-            }
-          }
-        }
-      }
-    }
-    if (record.type === 'custom' && typeof record.name === 'string') {
-      names.push(record.name);
-    }
-  }
-  return names;
-}
-
 /** Extract MCP server display names from template */
 function extractMcpNames(mcpServers: unknown[] | undefined): string[] {
   if (!Array.isArray(mcpServers)) return [];
@@ -138,10 +108,6 @@ function extractSkillInfo(skills: unknown[] | undefined): Array<{ id: string; na
       enabled: s.enabled !== false && s.state !== 'disabled',
     }));
 }
-
-const BUILTIN_TOOLS = [
-  'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'DeliverArtifacts',
-];
 
 const CHANNEL_TYPES: Array<{ value: ChannelType; label: string; icon: string; qrSupport: boolean; manualSupport: boolean }> = [
   { value: 'wechat', label: '微信', icon: '💬', qrSupport: true, manualSupport: false },
@@ -2770,8 +2736,7 @@ export default function App() {
         : '',
     );
     // Builtin tools → checkboxes; non-builtin tool entries preserved via toolsJson
-    const builtinNames = extractToolNames(template.tools).filter((name) => BUILTIN_TOOLS.includes(name));
-    setSelectedTools(builtinNames);
+    setSelectedTools(extractBuiltinToolNames(template.tools));
     const nonBuiltinTools = Array.isArray(template.tools)
       ? template.tools.filter((tool) => {
           if (!tool || typeof tool !== 'object') return false;
@@ -3043,10 +3008,7 @@ export default function App() {
     const tools = explicitTools.length > 0
       ? explicitTools
       : selectedTools.length > 0
-        ? [{
-            type: 'agent_toolset_20260401',
-            configs: selectedTools.map((name) => ({ name, enabled: true })),
-          }]
+        ? [buildToolsetEntry(selectedTools)]
         : [];
     const fileIds = splitTokens(fileIdsText);
     // Toolset prerequisite: multiagent only takes effect when the tools array
