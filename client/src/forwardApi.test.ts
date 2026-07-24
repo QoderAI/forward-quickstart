@@ -13,7 +13,7 @@ describe('listEvents', () => {
   });
 
   test('passes event type filters using the supported types query parameter', async () => {
-    let requestBody: any;
+    let requestBody: { query?: Record<string, unknown> } = {};
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       requestBody = JSON.parse(String(init?.body));
       return new Response(JSON.stringify({ data: [], has_more: false }), {

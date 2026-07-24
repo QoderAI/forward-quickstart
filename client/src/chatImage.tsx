@@ -8,7 +8,16 @@ const DownloadIcon = (
 );
 
 /** 对话内图片预览：缩略图内联展示，点击放大（Lightbox），支持下载原图；加载失败回退为链接。 */
-export const ChatImage = memo(function ChatImage({ src, alt }: { src: string; alt?: string }) {
+export const ChatImage = memo(function ChatImage({
+  src,
+  alt,
+  showDownload = true,
+}: {
+  src: string;
+  alt?: string;
+  /** 是否显示悬浮下载按钮（外层已有下载按钮时可设为 false） */
+  showDownload?: boolean;
+}) {
   const [failed, setFailed] = useState(false);
   const [zoomed, setZoomed] = useState(false);
 
@@ -31,14 +40,16 @@ export const ChatImage = memo(function ChatImage({ src, alt }: { src: string; al
           onClick={() => setZoomed(true)}
           className="max-h-64 max-w-full cursor-zoom-in rounded-xl border border-black/10 bg-white object-contain"
         />
-        <button
-          type="button"
-          title="下载原图"
-          onClick={(event) => { event.stopPropagation(); void downloadImage(src); }}
-          className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-lg bg-black/55 text-white opacity-0 transition hover:bg-black/75 group-hover:opacity-100"
-        >
-          {DownloadIcon}
-        </button>
+        {showDownload && (
+          <button
+            type="button"
+            title="下载原图"
+            onClick={(event) => { event.stopPropagation(); void downloadImage(src); }}
+            className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-lg bg-black/55 text-white opacity-0 transition hover:bg-black/75 group-hover:opacity-100"
+          >
+            {DownloadIcon}
+          </button>
+        )}
       </span>
       {zoomed && (
         <div

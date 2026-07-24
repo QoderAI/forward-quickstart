@@ -1,7 +1,15 @@
 const IMAGE_EXT_RE = /\.(?:png|jpe?g|gif|webp|bmp|svg|avif)(?:[?#].*)?$/i;
+const IMAGE_MIME_RE = /^image\/(?:png|jpe?g|gif|webp|bmp|svg|avif|\*)$/i;
 
 export function isImageUrl(url: string): boolean {
   return /^https?:\/\/\S+/i.test(url) && IMAGE_EXT_RE.test(url);
+}
+
+/** 判断 Cloud 文件元数据是否为图片（优先看 mime_type，其次看文件名扩展名） */
+export function isImageFile(file: { mime_type?: string; filename?: string }): boolean {
+  if (file.mime_type && IMAGE_MIME_RE.test(file.mime_type)) return true;
+  if (file.filename && IMAGE_EXT_RE.test(file.filename)) return true;
+  return false;
 }
 
 export function imageFilename(url: string): string {

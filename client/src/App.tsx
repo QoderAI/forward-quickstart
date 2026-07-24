@@ -72,6 +72,8 @@ import {
   type ForwardTemplate,
 } from './forwardApi';
 import { renderMarkdown } from './markdown';
+import { ChatImage } from './chatImage';
+import { isImageFile } from './imageUtils';
 import { PRODUCT_NAME } from './config/product';
 
 // Helpers for the multiagent roster form state.
@@ -1176,6 +1178,7 @@ const ThinkingMessage = memo(function ThinkingMessage({ event }: { event: Forwar
 
 function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fileId: string }) {
   const [meta, setMeta] = useState<CloudFile | null>(null);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -1183,7 +1186,18 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
     if (!ctx) return;
     let cancelled = false;
     void getCloudFile(ctx, fileId)
-      .then((file) => { if (!cancelled) setMeta(file); })
+      .then((file) => {
+        if (cancelled) return;
+        setMeta(file);
+        // 图片类型：通过服务端代理预览（绕过 OSS CORS 和 attachment 头）
+        // dev 模式下直接请求 Express 端口（3001）避免 Vite proxy 覆盖 Content-Type；
+        // 生产环境同源，用相对路径即可。
+        if (isImageFile(file)) {
+          const base = import.meta.env.DEV ? 'http://localhost:3001' : '';
+          const previewUrl = `${base}/api/cloud/files/${encodeURIComponent(fileId)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`;
+          if (!cancelled) setImageUrl(previewUrl);
+        }
+      })
       .catch(() => { /* filename is best-effort; keep showing the id */ });
     return () => { cancelled = true; };
   }, [ctx, fileId]);
@@ -1213,6 +1227,33 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
       setLoading(false);
     }
   };
+
+  // 图片类型：内联预览 + 下载按钮
+  if (imageUrl) {
+    return (
+      <div className="flex w-full max-w-[420px] flex-col gap-2">
+        <ChatImage src={imageUrl} alt={filename} showDownload={false} />
+        <button
+          type="button"
+          onClick={handleDownload}
+          disabled={loading}
+          title={`下载 ${filename}`}
+          className="group flex items-center gap-2 self-start rounded-lg border border-[#DDE2F2] bg-white px-3 py-1.5 text-[12px] text-black/60 transition hover:border-[#3550FF] hover:text-[#3550FF] disabled:opacity-60"
+        >
+          {loading ? (
+            <span className="block h-3.5 w-3.5 animate-spin rounded-full border-2 border-[#D7DBEA] border-t-[#3550FF]" />
+          ) : (
+            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+            </svg>
+          )}
+          下载原图
+          {meta?.size_bytes != null ? ` · ${formatFileSize(meta.size_bytes)}` : ''}
+        </button>
+        {error && <span className="text-[11px] text-red-500">{error}</span>}
+      </div>
+    );
+  }
 
   return (
     <button
@@ -1458,7 +1499,7 @@ const ChatSettingsButton = memo(function ChatSettingsButton({
             <div className="px-2.5 pb-1 pt-1.5 text-[11px] font-medium text-black/35">回复显示设置</div>
             {[
               { label: '显示思考过程', checked: showThinking, onToggle: onToggleThinking },
-              { label: '显示工具调用过程', checked: showToolCalls, onToggle: onToggleToolCalls },
+              { label: '显示工具调用', checked: showToolCalls, onToggle: onToggleToolCalls },
             ].map((item) => (
               <button
                 key={item.label}
@@ -2142,7 +2183,7 @@ export default function App() {
   // Clean up QR polling on unmount
   useEffect(() => {
     return () => { stopQrPolling(); };
-  }, []);
+  }, [stopQrPolling]);
 
   useEffect(() => {
     if (!showTemplateSwitcher) return;
