@@ -976,12 +976,14 @@ export async function getMemoryEntry(ctx: ForwardContext, storeId: string, entry
 
 export type ChannelType = 'wechat' | 'wecom' | 'feishu' | 'dingtalk';
 export type BindingStatus = 'unbound' | 'bound' | 'expired';
+export type IdentityResolutionMode = 'fixed' | 'pairing';
 
 export interface ForwardChannel {
   id: string;
   type: 'channel';
-  identity_id: string;
-  template_id: string;
+  identity_id: string | null;
+  template_id: string | null;
+  identity_resolution: { mode: IdentityResolutionMode };
   channel_type: ChannelType;
   name: string;
   enabled: boolean;
@@ -1020,8 +1022,9 @@ export async function listChannels(ctx: ForwardContext, identityId?: string) {
 export async function createChannel(
   ctx: ForwardContext,
   input: {
-    identity_id: string;
-    template_id: string;
+    identity_id?: string;
+    template_id?: string;
+    identity_resolution?: { mode: IdentityResolutionMode };
     channel_type: ChannelType;
     name?: string;
     enabled?: boolean;

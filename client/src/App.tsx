@@ -2554,6 +2554,7 @@ export default function App() {
       const channel = await createChannel(ctx, {
         identity_id: identity.id,
         template_id: effectiveTemplateId,
+        identity_resolution: { mode: 'fixed' },
         channel_type: chanType,
         name: chanName.trim(),
         enabled: false, // disabled until QR confirmed
@@ -2577,11 +2578,11 @@ export default function App() {
     setError('');
     try {
       const credentials = buildChannelCredentials(chanType, chanAppKey.trim(), chanAppSecret.trim());
-      if (chanAgentId.trim()) credentials.agent_id = chanAgentId.trim();
       // Create channel with credentials in one call (channel doesn't exist yet for manual mode)
       await createChannel(ctx, {
         identity_id: identity.id,
         template_id: chanTemplateId,
+        identity_resolution: { mode: 'fixed' },
         channel_type: chanType,
         name: chanName.trim(),
         enabled: true,
@@ -2690,7 +2691,6 @@ export default function App() {
       // If manual mode and credentials provided, include them
       if (chanMode === 'manual' && chanAppKey.trim()) {
         const credentials = buildChannelCredentials(editingChannelItem.channel_type, chanAppKey.trim(), chanAppSecret.trim());
-        if (chanAgentId.trim()) credentials.agent_id = chanAgentId.trim();
         updatePayload.channel_config = {
           ...editingChannelItem.channel_config,
           credentials,
@@ -4147,7 +4147,7 @@ export default function App() {
               <div className="mt-3 flex items-center gap-3 text-xs text-black/40">
                 <span className="inline-flex items-center gap-1">
                   <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}><path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6Z" /></svg>
-                  {tpl?.name || chan.template_id.slice(0, 12) + '…'}
+                  {tpl?.name || (chan.template_id ? chan.template_id.slice(0, 12) + '…' : chan.identity_resolution?.mode === 'pairing' ? '配对模式' : '—')}
                 </span>
               </div>
               <div className="mt-4 flex items-center justify-end gap-2">
