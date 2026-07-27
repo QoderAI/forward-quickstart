@@ -4169,7 +4169,7 @@ export default function App() {
     </div>
   </div>
 ) : activePanel === 'batches' ? (
-  <BatchPanel ctx={ctx} identityId={identity?.id || ''} templates={templates} defaultTemplateId={templateId || templates[0]?.id} />
+  <BatchPanel ctx={ctx} identityId={identity?.id || ''} templates={templates} defaultTemplateId={templateId || templates[0]?.id} getModelLabel={getModelLabel} />
 ) : activePanel === 'templates' ? (
             <div className="h-full overflow-y-auto bg-[#FAFBFF]">
               <div className="flex max-w-[1440px] flex-col gap-4 p-6">

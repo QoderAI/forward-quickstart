@@ -156,11 +156,13 @@ function triggerDownload(url: string, filename?: string) {
 
 // ─── 批量任务面板 ───
 
-export function BatchPanel({ ctx, identityId, templates, defaultTemplateId }: {
+export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getModelLabel }: {
   ctx: ForwardContext | null;
   identityId: string;
   templates: ForwardTemplate[];
   defaultTemplateId?: string;
+  /** 模型展示名解析（复用 App 侧基于 cloudModels 的逻辑） */
+  getModelLabel?: (model: unknown) => string;
 }) {
   const [batches, setBatches] = useState<ForwardBatch[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -170,6 +172,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId }: {
   const [detailBatch, setDetailBatch] = useState<ForwardBatch | null>(null);
   const [cancelTarget, setCancelTarget] = useState<ForwardBatch | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  const [rerunningId, setRerunningId] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState('');
   const [showWizard, setShowWizard] = useState(false);
   const pollTimerRef = useRef<number | null>(null);
@@ -202,7 +205,8 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId }: {
 
   // 进入面板 / 切换筛选时自动刷新一次列表
   useEffect(() => {
-    void loadBatches();
+    const timer = window.setTimeout(() => void loadBatches(), 0);
+    return () => window.clearTimeout(timer);
   }, [loadBatches]);
 
   // 详情弹窗打开时：非终态自动轮询（5s 起步 ×1.5 退避至 30s，终态停止）
@@ -242,6 +246,33 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId }: {
       setCancelling(false);
     }
   }, [ctx, cancelTarget]);
+
+  // 再次执行：复用原输入文件与参数新建一个 Batch（仅 completed/cancelled 可用）
+  const handleRerun = useCallback(async (batch: ForwardBatch) => {
+    if (!ctx || rerunningId) return;
+    setRerunningId(batch.id);
+    setListError('');
+    try {
+      const fresh = await createBatch(ctx, {
+        input_file_id: batch.input_file_id,
+        completion_window: batch.completion_window,
+        ...(batch.metadata && Object.keys(batch.metadata).length > 0 ? { metadata: batch.metadata } : {}),
+      });
+      setBatches((prev) => [fresh, ...prev]);
+      setDetailBatch(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('rate_limit') || msg.includes('429')) {
+        setListError('进行中的批量任务数已达上限，请等待现有任务完成或取消部分任务');
+      } else if (msg.includes('404') || msg.includes('not_found')) {
+        setListError('原输入文件已不可用（可能超过保留期），请重新创建任务');
+      } else {
+        setListError(`再次执行失败：${msg}`);
+      }
+    } finally {
+      setRerunningId(null);
+    }
+  }, [ctx, rerunningId]);
 
   const handleDownloadOutput = useCallback(async (batch: ForwardBatch) => {
     if (!ctx) return;
@@ -354,6 +385,16 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId }: {
                         className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-medium text-red-500 transition hover:bg-red-50"
                       >
                         取消
+                      </button>
+                    )}
+                    {(batch.status === 'completed' || batch.status === 'cancelled') && (
+                      <button
+                        onClick={() => void handleRerun(batch)}
+                        disabled={rerunningId !== null}
+                        title="使用相同的输入文件和参数新建一个批量任务"
+                        className="rounded-lg border border-[#E5E7EB] bg-white px-3 py-1.5 text-xs font-medium text-black/60 transition hover:border-[#3550FF] hover:text-[#3550FF] disabled:opacity-50"
+                      >
+                        {rerunningId === batch.id ? '创建中...' : '↻ 再次执行'}
                       </button>
                     )}
                     {batch.output_file_id && (
@@ -581,6 +622,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId }: {
           identityId={identityId}
           templates={templates}
           defaultTemplateId={defaultTemplateId}
+          getModelLabel={getModelLabel}
           onClose={() => setShowWizard(false)}
           onCreated={(batch) => {
             setShowWizard(false);
@@ -594,11 +636,12 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId }: {
 
 // ─── 创建向导（3 步） ───
 
-function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, onClose, onCreated }: {
+function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, getModelLabel, onClose, onCreated }: {
   ctx: ForwardContext | null;
   identityId: string;
   templates: ForwardTemplate[];
   defaultTemplateId?: string;
+  getModelLabel?: (model: unknown) => string;
   onClose: () => void;
   onCreated: (batch: ForwardBatch) => void;
 }) {
@@ -765,7 +808,10 @@ function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, onCl
               <div>
                 <div className="mb-1 text-[11px] font-medium text-black/50">绑定模板</div>
                 <select value={formTemplateId} onChange={(e) => setFormTemplateId(e.target.value)} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 text-sm outline-none transition focus:border-[#3550FF]">
-                  {templates.map((t) => <option key={t.id} value={t.id}>{t.name || t.id}</option>)}
+                {templates.map((t) => {
+                  const modelLabel = getModelLabel ? getModelLabel(t.model) : '';
+                  return <option key={t.id} value={t.id}>{t.name || t.id}{modelLabel ? `（${modelLabel}）` : ''}</option>;
+                })}
                 </select>
               </div>
               <div>
