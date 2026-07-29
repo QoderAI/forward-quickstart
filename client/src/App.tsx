@@ -642,6 +642,12 @@ function extractArtifactFileIds(event: ForwardEvent): string[] {
   return Array.from(new Set(matches));
 }
 
+// Tools whose results deliver image/file artifacts (file_xxx ids) that should
+// be previewed inline in the chat. DeliverArtifacts is the classic delivery
+// tool; ImageGen (added to the builtin toolset later) returns generated
+// images the same way, so it must trigger the same inline preview.
+const ARTIFACT_TOOL_NAMES = new Set(['DeliverArtifacts', 'ImageGen']);
+
 function toolResultMatchesUse(resultEvent: ForwardEvent, useEvent: ForwardEvent) {
   if (eventViewKind(resultEvent) !== 'tool_result') return false;
   if (resultEvent.session_id !== useEvent.session_id) return false;
@@ -1273,7 +1279,7 @@ const ToolEventMessage = memo(function ToolEventMessage({
   const name = displayName || toolEventName(event);
   const payload = toolEventPayload(event);
   const id = toolEventId(event);
-  const artifactIds = result && name === 'DeliverArtifacts' ? extractArtifactFileIds(event) : [];
+  const artifactIds = result && ARTIFACT_TOOL_NAMES.has(name) ? extractArtifactFileIds(event) : [];
   const tone = result
     ? 'bg-emerald-50 text-emerald-700'
     : 'bg-orange-50 text-orange-600';
@@ -4915,7 +4921,26 @@ export default function App() {
                           );
                         }
                         if (kind === 'tool_result') {
-                          if (!showToolCalls) return null;
+                          if (!showToolCalls) {
+                            // Tool-call display is off, but generated artifacts (images/files)
+                            // are the deliverable, not process detail — keep their preview
+                            // cards visible even when the tool call bubble itself is hidden.
+                            const hiddenName = toolDisplayNameForEvent(events, event, index);
+                            const hiddenArtifactIds = ARTIFACT_TOOL_NAMES.has(hiddenName)
+                              ? extractArtifactFileIds(event)
+                              : [];
+                            if (hiddenArtifactIds.length === 0) return null;
+                            return (
+                              <div key={event.id} className="flex gap-4">
+                                <ChatAvatar />
+                                <div className="flex w-fit max-w-[92%] flex-col gap-2">
+                                  {hiddenArtifactIds.map((fileId) => (
+                                    <ArtifactDownloadCard key={fileId} ctx={ctx} fileId={fileId} />
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          }
                           return (
                             <ToolEventMessage
                               key={event.id}
