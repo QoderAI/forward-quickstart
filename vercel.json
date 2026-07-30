@@ -3,6 +3,9 @@
   "installCommand": "npm ci --registry=https://registry.npmjs.org/",
   "buildCommand": "npm run build --workspace=client",
   "outputDirectory": "client/dist",
+  "rewrites": [
+    { "source": "/quiz", "destination": "/index.html" }
+  ],
   "functions": {
     "api/**/*.ts": {
       "maxDuration": 300

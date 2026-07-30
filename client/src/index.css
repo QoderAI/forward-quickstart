@@ -226,3 +226,28 @@ body {
 .animate-loading-bar {
   animation: loading-bar 1.4s ease-in-out infinite;
 }
+
+/* 选型问卷（layerQuiz）：题目切换 / 结果揭晓的入场动画 */
+@keyframes quiz-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+    filter: blur(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+.animate-quiz-in {
+  animation: quiz-in 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-quiz-in {
+    animation-duration: 0.01s;
+  }
+}
+

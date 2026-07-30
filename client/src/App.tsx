@@ -75,6 +75,7 @@ import { renderMarkdown } from './markdown';
 import { ChatImage } from './chatImage';
 import { isImageFile } from './imageUtils';
 import { BatchPanel } from './batchPanel';
+import { LayerQuizButton } from './layerQuiz';
 import { PRODUCT_NAME } from './config/product';
 import { BUILTIN_TOOLS, buildToolsetEntry, extractBuiltinToolNames, extractToolNames } from './templateTools';
 
@@ -3649,6 +3650,10 @@ export default function App() {
   if (!identity) {
     return (
       <div className="flex min-h-screen flex-col bg-[#FAFBFF]">
+        {/* 右上角：层级选型助手入口 */}
+        <div className="flex shrink-0 justify-end px-6 pt-5">
+          <LayerQuizButton />
+        </div>
         <div className="flex flex-1 items-center justify-center px-4">
           <div className="w-full max-w-[420px]">
             <div className="mb-8 text-center">
