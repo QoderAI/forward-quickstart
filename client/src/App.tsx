@@ -1127,7 +1127,11 @@ const ThinkingMessage = memo(function ThinkingMessage({ event }: { event: Forwar
     <div className="flex gap-4">
       <ChatAvatar />
       <div className="w-fit max-w-[92%]">
-        <details className="group" open={!!(text || payload)}>
+        {/* Collapsed by default: the thinking block only shows its summary bar
+            until the user expands it. Do NOT pass `open` here — a controlled
+            value would also re-open the block on every streaming re-render,
+            overriding the user's manual collapse. */}
+        <details className="group">
           <summary className="flex w-fit cursor-pointer list-none items-center gap-2.5 rounded-[16px] bg-white px-3.5 py-2.5 text-[13px] text-black/55 shadow-[0_8px_24px_rgba(47,58,128,0.05)]">
             <span className="text-black/35">
               <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
