@@ -718,6 +718,23 @@ export async function addSessionFileResource(
   );
 }
 
+export interface SessionFileResource {
+  type: string;
+  file_id?: string;
+  mount_path?: string | null;
+}
+
+// List a session's mounted resources. Used to map an attachment marker's
+// mount_path back to its file id, so image attachments can be previewed after
+// a history reload (the message text only stores the name and path).
+export async function listSessionResources(ctx: ForwardContext, sessionId: string) {
+  return cloudRequest<Page<SessionFileResource>>(
+    ctx,
+    'GET',
+    `/sessions/${encodeURIComponent(sessionId)}/resources`,
+  );
+}
+
 export async function getSession(ctx: ForwardContext, sessionId: string) {
   return forwardRequest<ForwardSession>(ctx, 'GET', `/sessions/${encodeURIComponent(sessionId)}`);
 }

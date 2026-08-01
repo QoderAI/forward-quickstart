@@ -27,6 +27,7 @@ import {
   listEvents,
   listResources,
   listSessions,
+  listSessionResources,
   listTemplates,
   registerResource,
   addSessionFileResource,
@@ -78,6 +79,15 @@ import { BatchPanel } from './batchPanel';
 import { LayerQuizButton } from './layerQuiz';
 import { PRODUCT_NAME } from './config/product';
 import { BUILTIN_TOOLS, buildToolsetEntry, extractBuiltinToolNames, extractToolNames } from './templateTools';
+import {
+  ATTACHMENT_ACCEPT,
+  attachmentMountPath,
+  attachmentRejectReason,
+  composeMessageWithAttachments,
+  isImageAttachment,
+  namePastedImage,
+  splitAttachmentMarkers,
+} from './attachments';
 
 // Helpers for the multiagent roster form state.
 const AUTH_KEY = 'forward_quickstart_auth';
@@ -981,22 +991,6 @@ function localTurnEvents(sessionId: string, text: string) {
 }
 
 // ─── Chat attachments ─────────────────────────────────────────────
-// Files API only accepts text-like files (see Files API docs), and the live
-// Forward API rejects event.file_attachments, so attachments are delivered by
-// mounting the uploaded file into the agent workspace and appending a marker
-// block to the user message text. The bubble parses the marker back into
-// chips, which also keeps attachments visible after history reloads.
-const ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
-const ATTACHMENT_EXTENSIONS = [
-  'txt', 'md', 'csv', 'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'conf', 'cfg', 'env', 'log',
-  'html', 'htm', 'css', 'scss', 'less', 'js', 'jsx', 'ts', 'tsx', 'vue', 'svelte',
-  'py', 'go', 'rs', 'java', 'kt', 'scala', 'c', 'cpp', 'cc', 'h', 'hpp', 'rb', 'php',
-  'swift', 'r', 'lua', 'pl', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'sql', 'graphql', 'gql',
-  'proto', 'dockerfile', 'makefile', 'gitignore', 'editorconfig', 'eslintrc', 'prettierrc',
-  'tex', 'rst', 'adoc', 'org', 'svg',
-];
-const ATTACHMENT_ACCEPT = ATTACHMENT_EXTENSIONS.map((ext) => `.${ext}`).join(',');
-
 interface PendingAttachment {
   localId: string;
   file: File;
@@ -1006,42 +1000,16 @@ interface PendingAttachment {
   fileId?: string;
   storedName?: string;
   error?: string;
-}
-
-function attachmentMountPath(storedName: string): string {
-  return `/data/workspace/${storedName}`;
+  isImage?: boolean;
+  // Object URL for the picked image, so the chip shows a thumbnail without
+  // waiting for the upload. Revoked when the chip goes away.
+  previewUrl?: string;
 }
 
 function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
-}
-
-// Marker block appended to the user message text: the agent learns where the
-// files are, and the UI parses it back into chips after history reloads (the
-// server stores message text verbatim).
-function composeMessageWithAttachments(text: string, storedNames: string[]): string {
-  if (storedNames.length === 0) return text;
-  const markers = storedNames.map((name) => `[附件] ${name} → ${attachmentMountPath(name)}`);
-  return `${text}\n\n${markers.join('\n')}`;
-}
-
-const ATTACHMENT_MARKER_RE = /^\[附件\] (.+?) → (\/\S+)$/;
-
-function splitAttachmentMarkers(text: string): { body: string; attachments: Array<{ name: string; path: string }> } {
-  const lines = text.split('\n');
-  const attachments: Array<{ name: string; path: string }> = [];
-  let i = lines.length - 1;
-  while (i >= 0) {
-    const match = ATTACHMENT_MARKER_RE.exec(lines[i]);
-    if (!match) break;
-    attachments.unshift({ name: match[1], path: match[2] });
-    i -= 1;
-  }
-  if (attachments.length === 0) return { body: text, attachments: [] };
-  const body = lines.slice(0, i + 1).join('\n').replace(/\s+$/, '');
-  return { body, attachments };
 }
 
 function groupSessionsByDate(sessions: ForwardSession[]): Array<{ label: string; items: ForwardSession[] }> {
@@ -1422,6 +1390,13 @@ const AttachmentChips = memo(function AttachmentChips({
               <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-90" fill="currentColor" d="M12 2a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7V2Z" />
             </svg>
+          ) : a.isImage && a.previewUrl ? (
+            // Thumbnail from the local object URL — no round-trip needed.
+            <img src={a.previewUrl} alt="" className="h-4 w-4 shrink-0 rounded object-cover" />
+          ) : a.isImage ? (
+            <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 0 0 1.5-1.5V6a1.5 1.5 0 0 0-1.5-1.5H3.75A1.5 1.5 0 0 0 2.25 6v12a1.5 1.5 0 0 0 1.5 1.5Zm10.5-11.25h.008v.008h-.008V8.25Zm.375 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Z" />
+            </svg>
           ) : (
             <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
@@ -1500,7 +1475,59 @@ const ChatSettingsButton = memo(function ChatSettingsButton({
   );
 });
 
-const ChatTextMessage = memo(function ChatTextMessage({ event, user }: { event: ForwardEvent; user?: boolean }) {
+// Thumbnail for an image attachment inside a SENT user bubble. The message text
+// only records the name and mount_path, so the file id is recovered by matching
+// mount_path against the session's mounted resources. Falls back to a plain chip
+// whenever that can't produce a viewable image — no ctx, resource not mounted,
+// or a file stored without purpose=session_resource (those come back
+// downloadable:false and the preview proxy 403s, which the browser then reports
+// as an opaque ORB block).
+const SentImageAttachment = memo(function SentImageAttachment({
+  ctx,
+  sessionId,
+  name,
+  path,
+}: {
+  ctx: ForwardContext | null;
+  sessionId?: string;
+  name: string;
+  path: string;
+}) {
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!ctx || !sessionId) return;
+    let cancelled = false;
+    void listSessionResources(ctx, sessionId)
+      .then(async (page) => {
+        if (cancelled) return;
+        const hit = (page.data || []).find((r) => r.type === 'file' && r.mount_path === path);
+        if (!hit?.file_id) return;
+        // Ask the Files API first: a non-downloadable file would only produce a
+        // broken <img>, so keep the chip in that case.
+        const meta = await getCloudFile(ctx, hit.file_id);
+        if (cancelled || meta.downloadable === false) return;
+        const base = import.meta.env.DEV ? 'http://localhost:3001' : '';
+        setUrl(`${base}/api/cloud/files/${encodeURIComponent(hit.file_id)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`);
+      })
+      .catch(() => { /* preview is best-effort; the chip below still names the file */ });
+    return () => { cancelled = true; };
+  }, [ctx, sessionId, path]);
+
+  if (!url) {
+    return (
+      <span title={path} className="inline-flex max-w-[220px] items-center gap-1 rounded-lg bg-white/80 px-2 py-0.5 text-[12px] leading-4 text-black/60">
+        <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 0 0 1.5-1.5V6a1.5 1.5 0 0 0-1.5-1.5H3.75A1.5 1.5 0 0 0 2.25 6v12a1.5 1.5 0 0 0 1.5 1.5Zm10.5-11.25h.008v.008h-.008V8.25Zm.375 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Z" />
+        </svg>
+        <span className="truncate">{name}</span>
+      </span>
+    );
+  }
+  return <ChatImage src={url} alt={name} />;
+});
+
+const ChatTextMessage = memo(function ChatTextMessage({ event, user, ctx }: { event: ForwardEvent; user?: boolean; ctx?: ForwardContext | null }) {
   const item = eventDisplay(event);
 
   if (user) {
@@ -1509,18 +1536,26 @@ const ChatTextMessage = memo(function ChatTextMessage({ event, user }: { event: 
       <div className="flex justify-end">
         <div className="max-w-[70%] rounded-2xl bg-[#EBF0FF] px-4 py-2.5 text-[14px] leading-6 text-black">
           {msgAttachments.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {msgAttachments.map((a) => (
+            <div className="mb-1.5 flex flex-wrap items-start justify-end gap-1.5">
+              {msgAttachments.map((a) => (a.isImage ? (
+                <SentImageAttachment
+                  key={a.path}
+                  ctx={ctx ?? null}
+                  sessionId={event.session_id}
+                  name={a.name}
+                  path={a.path}
+                />
+              ) : (
                 <span key={a.path} title={a.path} className="inline-flex max-w-[220px] items-center gap-1 rounded-lg bg-white/80 px-2 py-0.5 text-[12px] leading-4 text-black/60">
                   <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="m18.375 12.739-7.693 7.693a4.5 4.5 0 0 1-6.364-6.364l10.94-10.94A3 3 0 1 1 19.5 7.372L8.552 18.32a1.5 1.5 0 0 1-2.122-2.122l7.693-7.693" />
                   </svg>
                   <span className="truncate">{a.name}</span>
                 </span>
-              ))}
+              )))}
             </div>
           )}
-          <div className="whitespace-pre-wrap break-words">{body}</div>
+          {body && <div className="whitespace-pre-wrap break-words">{body}</div>}
         </div>
       </div>
     );
@@ -2086,7 +2121,16 @@ export default function App() {
   const uploadAttachment = useCallback(async (localId: string, file: File) => {
     if (!ctx) return;
     try {
-      const uploaded = await uploadCloudFile(ctx, { file, name: file.name, metadata: { source: 'chat-attachment' } });
+      // purpose=session_resource is what makes the stored file downloadable
+      // again: without it the Files API returns downloadable:false and every
+      // later read 403s ("Files that you uploaded cannot be downloaded"), which
+      // breaks the image thumbnail in the sent bubble.
+      const uploaded = await uploadCloudFile(ctx, {
+        file,
+        name: file.name,
+        purpose: 'session_resource',
+        metadata: { source: 'chat-attachment' },
+      });
       setAttachments((prev) => prev.map((a) => (
         a.localId === localId ? { ...a, status: 'done', fileId: uploaded.id, storedName: uploaded.filename } : a
       )));
@@ -2102,18 +2146,23 @@ export default function App() {
     const accepted: PendingAttachment[] = [];
     const rejected: string[] = [];
     for (const file of Array.from(files)) {
-      const ext = (file.name.includes('.') ? file.name.split('.').pop()! : file.name).toLowerCase();
-      if (!ATTACHMENT_EXTENSIONS.includes(ext)) { rejected.push(`「${file.name}」类型不支持`); continue; }
-      if (file.size > ATTACHMENT_MAX_BYTES) { rejected.push(`「${file.name}」超过 5 MB 限制`); continue; }
+      const reason = attachmentRejectReason(file);
+      if (reason) {
+        rejected.push(`「${file.name}」${reason}`);
+        continue;
+      }
+      const image = isImageAttachment(file);
       accepted.push({
         localId: `att-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         file,
         name: file.name,
         size: file.size,
         status: 'uploading',
+        isImage: image,
+        previewUrl: image ? URL.createObjectURL(file) : undefined,
       });
     }
-    if (rejected.length > 0) setError(`附件已跳过：${rejected.join('、')}（仅支持单个 ≤5MB 的文本类文件）`);
+    if (rejected.length > 0) setError(`附件已跳过：${rejected.join('、')}（图片 ≤10MB，文本类文件 ≤5MB）`);
     else setError('');
     if (accepted.length > 0) {
       setAttachments((prev) => [...prev, ...accepted]);
@@ -2122,7 +2171,11 @@ export default function App() {
   }, [ctx, uploadAttachment]);
 
   const removeAttachment = useCallback((localId: string) => {
-    setAttachments((prev) => prev.filter((a) => a.localId !== localId));
+    setAttachments((prev) => {
+      const target = prev.find((a) => a.localId === localId);
+      if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((a) => a.localId !== localId);
+    });
   }, []);
 
   const retryAttachment = useCallback((localId: string) => {
@@ -2132,6 +2185,25 @@ export default function App() {
       return prev.map((a) => (a.localId === localId && a.status === 'error' ? { ...a, status: 'uploading', error: undefined } : a));
     });
   }, [uploadAttachment]);
+
+  // Pasting a screenshot is the most common way to attach an image, and the
+  // clipboard delivers it as a file with an empty name — synthesize one so the
+  // chip and the workspace mount path stay readable.
+  const handleComposerPaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(event.clipboardData?.files || []);
+    const images = items.filter((f) => isImageAttachment(f));
+    if (images.length === 0) return;
+    // Let text paste through normally; only take over when images are present.
+    event.preventDefault();
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const named = images.map((file, i) => {
+      const name = namePastedImage(file, stamp, i, images.length);
+      return name === file.name ? file : new File([file], name, { type: file.type });
+    });
+    const list = new DataTransfer();
+    for (const f of named) list.items.add(f);
+    pickAttachments(list.files);
+  }, [pickAttachments]);
 
   useEffect(() => () => streamAbort.current?.abort(), []);
 
@@ -3511,7 +3583,12 @@ export default function App() {
       });
       const result = await sendUserMessage(ctx, sessionId, finalText);
       setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
-      setAttachments([]);
+      setAttachments((prev) => {
+        // Release the thumbnail object URLs now that the chips are gone; the
+        // sent bubble re-fetches images through the server preview proxy.
+        for (const a of prev) if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+        return [];
+      });
       startStream(sessionId, lastRemoteEventId(result.data ?? []), turnStartedAt, multiagentSessionsRef.current.has(sessionId));
       window.setTimeout(() => {
         void mergeSessionEvents(sessionId);
@@ -4839,6 +4916,7 @@ export default function App() {
                               void send();
                             }
                           }}
+                          onPaste={handleComposerPaste}
                           placeholder={templateId ? '输入你的问题... (Enter 发送)' : '请先选择模板'}
                           disabled={!templateId}
                           className="min-h-[44px] max-h-[140px] w-full resize-none bg-transparent text-[15px] leading-6 outline-none placeholder:text-black/30 disabled:cursor-not-allowed"
@@ -4855,7 +4933,7 @@ export default function App() {
                           <div className="flex items-center gap-1.5">
                             <button
                               type="button"
-                              title="添加附件（文本类文件，单个 ≤5MB）"
+                              title="添加附件（图片 ≤10MB，文本类文件 ≤5MB）"
                               onClick={() => attachmentInputRef.current?.click()}
                               className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/40 transition hover:bg-black/5 hover:text-black/70"
                             >
@@ -4970,7 +5048,7 @@ export default function App() {
                             </div>
                           );
                         }
-                        if (kind === 'user') return <ChatTextMessage key={event.id} event={event} user />;
+                        if (kind === 'user') return <ChatTextMessage key={event.id} event={event} user ctx={ctx} />;
                         return <ChatTextMessage key={event.id} event={event} />;
                       })}
                     </div>
@@ -4992,6 +5070,7 @@ export default function App() {
                               void send();
                             }
                           }}
+                          onPaste={handleComposerPaste}
                           placeholder={canStopCurrentTurn ? 'Agent 正在回复中，请稍候...' : '继续对话... (Enter 发送)'}
                           className="min-h-[24px] max-h-[140px] w-full resize-none bg-transparent text-[15px] leading-6 outline-none placeholder:text-black/30"
                           rows={1}
@@ -5007,7 +5086,7 @@ export default function App() {
                           <div className="flex items-center gap-1.5">
                             <button
                               type="button"
-                              title="添加附件（文本类文件，单个 ≤5MB）"
+                              title="添加附件（图片 ≤10MB，文本类文件 ≤5MB）"
                               onClick={() => attachmentInputRef.current?.click()}
                               className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/40 transition hover:bg-black/5 hover:text-black/70"
                             >

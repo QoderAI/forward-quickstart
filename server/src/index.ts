@@ -5,7 +5,10 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import './utils/env.js';
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+// Headroom above the client-side caps (images 10 MB, text files 5 MB) so the
+// friendly client-side validation is what rejects oversized picks, rather than
+// a multer LIMIT_FILE_SIZE surfacing as an opaque upload failure.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 12 * 1024 * 1024 } });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
