@@ -4,6 +4,14 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 
 你可以先通过本项目理解 Forward API 的主流程，再将相关能力集成到自己的应用中。
 
+## Demo 体验地址
+
+无需本地部署，直接访问在线 Demo 体验产品能力：
+
+👉 **[https://qca-quick-start.us/](https://qca-quick-start.us/)**
+
+打开页面后选择 API 环境并输入对应的 Forward PAT 即可开始体验。
+
 ## 展示能力
 
 - **身份管理**：基于应用侧的 `external_id` 查找或创建 Forward Identity。
