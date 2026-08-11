@@ -76,6 +76,7 @@ import { renderMarkdown } from './markdown';
 import { ChatImage } from './chatImage';
 import { isImageFile } from './imageUtils';
 import { BatchPanel } from './batchPanel';
+import { UsagePanel } from './usagePanel';
 import { LayerQuizButton } from './layerQuiz';
 import { PRODUCT_NAME } from './config/product';
 import { BUILTIN_TOOLS, buildToolsetEntry, extractBuiltinToolNames, extractToolNames } from './templateTools';
@@ -353,13 +354,6 @@ function displayTime(value?: string) {
   return date.toLocaleTimeString();
 }
 
-function displayDateTime(value?: string) {
-  if (!value) return '—';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '—';
-  return date.toLocaleString();
-}
-
 function statusText(status?: string) {
   if (!status) return '';
   const normalized = status.replace(/^status_/, '');
@@ -381,63 +375,9 @@ function normalizeEventMessage(message: string) {
   return message;
 }
 
-function sessionStatusLabel(status?: string) {
-  if (!status) return '未知';
-  const labels: Record<string, string> = {
-    running: '运行中',
-    idle: '空闲',
-    completed: '已完成',
-    failed: '失败',
-    cancelled: '已取消',
-    canceled: '已取消',
-    archived: '已归档',
-  };
-  return labels[status] ?? status;
-}
-
 function isSessionOngoing(status?: string) {
   const normalized = status?.replace(/^status_/, '');
   return normalized === 'running' || normalized === 'processing' || normalized === 'canceling' || normalized === 'cancelling';
-}
-
-function sessionEndTime(session: ForwardSession) {
-  return isSessionOngoing(session.status) ? undefined : session.updated_at;
-}
-
-function sessionDuration(session: ForwardSession) {
-  // Use stats.duration_seconds from API if available
-  if (session.stats?.duration_seconds != null && session.stats.duration_seconds > 0) {
-    const seconds = session.stats.duration_seconds;
-    if (seconds < 60) return `${seconds}s`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-  }
-
-  const endTime = sessionEndTime(session);
-  if (!session.created_at || !endTime) return '—';
-
-  const start = new Date(session.created_at).getTime();
-  const end = new Date(endTime).getTime();
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return '—';
-
-  const seconds = Math.floor((end - start) / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-}
-
-function sessionStatusBadgeClass(status?: string) {
-  const normalized = status?.replace(/^status_/, '');
-  if (normalized === 'running' || normalized === 'processing') {
-    return 'border-[#B8C3FF] bg-[#EEF1FF] text-[#3550FF]';
-  }
-  if (normalized === 'failed') {
-    return 'border-[#FFD0D0] bg-[#FFF1F1] text-[#D92D20]';
-  }
-  if (normalized === 'cancelled' || normalized === 'canceled' || normalized === 'canceling' || normalized === 'cancelling') {
-    return 'border-[#FFE3B8] bg-[#FFF8ED] text-[#B54708]';
-  }
-  return 'border-[#DDE2F2] bg-[#F7F8FC] text-black/55';
 }
 
 function textFromUnknown(value: unknown, depth = 0): string {
@@ -4465,61 +4405,57 @@ export default function App() {
                 </div>
               </div>
             </div>
-          ) : isResourcePanel(activePanel) || activePanel === 'usage' ? (
+          ) : activePanel === 'usage' ? (
+            <UsagePanel ctx={ctx} identityId={identity?.id ?? ''} displayName={displayName} getModelLabel={getModelLabel} />
+          ) : isResourcePanel(activePanel) ? (
             <div className="h-full overflow-y-auto bg-[#FAFBFF]">
               <div className="flex max-w-[1440px] flex-col gap-5 p-6">
                 <div className="flex items-baseline justify-between">
                   <h1 className="text-lg font-medium text-black">
-                    {activePanel === 'usage' ? '我的用量' : `${activeResourceLabel}空间`}
+                    {`${activeResourceLabel}空间`}
                   </h1>
                   <span className="font-mono text-xs text-black/40">{displayName}</span>
                 </div>
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-black/60">
-                      {activePanel === 'usage' ? '当前统计' : `${activeResourceLabel}列表`}
+                      {`${activeResourceLabel}列表`}
                     </span>
-                    {activePanel !== 'usage' && (
-                      <button
-                        onClick={() => void loadResources(activeResourceType)}
-                        className="flex h-7 w-7 items-center justify-center rounded-full text-black/50 transition hover:bg-white hover:shadow-sm"
-                        aria-label={`刷新${activeResourceLabel}列表`}
-                        title={`刷新${activeResourceLabel}列表`}
-                      >
-                        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.58m15.36 2A8 8 0 0 0 4.58 9m0 0H9m11 11v-5h-.58m0 0A8 8 0 0 1 4.06 13m15.36 2H15" />
-                        </svg>
-                      </button>
-                    )}
+                    <button
+                      onClick={() => void loadResources(activeResourceType)}
+                      className="flex h-7 w-7 items-center justify-center rounded-full text-black/50 transition hover:bg-white hover:shadow-sm"
+                      aria-label={`刷新${activeResourceLabel}列表`}
+                      title={`刷新${activeResourceLabel}列表`}
+                    >
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.58m15.36 2A8 8 0 0 0 4.58 9m0 0H9m11 11v-5h-.58m0 0A8 8 0 0 1 4.06 13m15.36 2H15" />
+                      </svg>
+                    </button>
                   </div>
                   <div className="flex items-center gap-3">
                     <span className="text-sm text-black/40">
-                      {activePanel === 'usage' ? '本地 quickstart 概览' : `${resources.length} 个${activeResourceLabel}`}
+                      {`${resources.length} 个${activeResourceLabel}`}
                     </span>
-                    {activePanel !== 'usage' && (
-                      <>
-                        <button
-                          onClick={() => setShowCreateResourceModal(true)}
-                          disabled={!ctx || loading}
-                          className="rounded-full bg-[#3550FF] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:opacity-50"
-                        >
-                          + 创建{activeResourceLabel}
-                        </button>
-                        <button
-                          onClick={() => setShowResourceModal(true)}
-                          disabled={!ctx || loading}
-                          className="rounded-full border border-[#DDE2F2] bg-white px-3 py-2 text-xs font-medium text-black/55 transition hover:bg-gray-50 disabled:opacity-50"
-                          title="注册一个已有的资源 ID"
-                        >
-                          注册已有
-                        </button>
-                      </>
-                    )}
+                    <button
+                      onClick={() => setShowCreateResourceModal(true)}
+                      disabled={!ctx || loading}
+                      className="rounded-full bg-[#3550FF] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:opacity-50"
+                    >
+                      + 创建{activeResourceLabel}
+                    </button>
+                    <button
+                      onClick={() => setShowResourceModal(true)}
+                      disabled={!ctx || loading}
+                      className="rounded-full border border-[#DDE2F2] bg-white px-3 py-2 text-xs font-medium text-black/55 transition hover:bg-gray-50 disabled:opacity-50"
+                      title="注册一个已有的资源 ID"
+                    >
+                      注册已有
+                    </button>
                   </div>
                 </div>
 
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {(activePanel === 'usage' ? [] : resources).map((resource) => {
+                {resources.map((resource) => {
                   const subtitle = resourceSubtitle(resource);
                   const resName = resource.name || specString(resource, 'display_title', 'display_name', 'filename', 'name') || resource.id;
                   const version = specNumber(resource, 'latest_version', 'version');
@@ -4559,7 +4495,7 @@ export default function App() {
                     </button>
                   );
                 })}
-                {activePanel !== 'usage' && resources.length === 0 && (
+                {resources.length === 0 && (
                   <div className="rounded-2xl bg-white px-5 py-12 text-center shadow-[inset_0_0_0_1px_#2F3A801A]">
                     <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-[#F4F6FC] text-2xl">
                       {RESOURCE_ICONS[activeResourceType]}
@@ -4582,93 +4518,7 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                {activePanel === 'usage' && (
-                  <>
-                    <div className="rounded-2xl bg-white p-5 shadow-[inset_0_0_0_1px_#2F3A801A]">
-                      <div className="text-xs text-black/45">模板数量</div>
-                      <div className="mt-4 text-3xl font-semibold">{templates.length}</div>
-                    </div>
-                    <div className="rounded-2xl bg-white p-5 shadow-[inset_0_0_0_1px_#2F3A801A]">
-                      <div className="text-xs text-black/45">会话数量</div>
-                      <div className="mt-4 text-3xl font-semibold">{sessions.length}</div>
-                    </div>
-                  </>
-                )}
               </div>
-              {activePanel === 'usage' && (
-                <div className="rounded-2xl bg-white p-5 shadow-[inset_0_0_0_1px_#2F3A801A]">
-                  <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <h2 className="text-sm font-semibold text-black">Session 列表</h2>
-                      <p className="mt-1 text-xs text-black/40">展示当前身份与模板下的会话开始、结束时间和状态</p>
-                    </div>
-                    <button
-                      onClick={() => void refreshSessions(identity, templateId)}
-                      disabled={!ctx || loading}
-                      className="rounded-full border border-[#D9DCEA] bg-white px-4 py-2 text-xs font-medium text-black/65 transition hover:bg-[#F8F9FC] disabled:opacity-45"
-                    >
-                      刷新列表
-                    </button>
-                  </div>
-                  <div className="overflow-x-auto">
-                    <table className="min-w-[960px] w-full border-separate border-spacing-0 text-left text-sm">
-                      <thead>
-                        <tr className="text-xs text-black/40">
-                          <th className="border-b border-[#EEF1F7] px-3 py-3 font-medium">Session</th>
-                          <th className="border-b border-[#EEF1F7] px-3 py-3 font-medium">开始时间</th>
-                          <th className="border-b border-[#EEF1F7] px-3 py-3 font-medium">结束时间</th>
-                          <th className="border-b border-[#EEF1F7] px-3 py-3 font-medium">状态</th>
-                          <th className="border-b border-[#EEF1F7] px-3 py-3 font-medium">时长</th>
-                          <th className="border-b border-[#EEF1F7] px-3 py-3 font-medium">Template</th>
-                          <th className="border-b border-[#EEF1F7] px-3 py-3 font-medium">最近更新</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {sessions.map((session) => {
-                          const endTime = sessionEndTime(session);
-                          return (
-                            <tr key={`usage-${session.id}`} className="text-xs text-black/65">
-                              <td className="max-w-[260px] border-b border-[#F2F4FA] px-3 py-3">
-                                <div className="truncate font-medium text-black" title={session.title || session.id}>
-                                  {session.title || 'Forward 会话'}
-                                </div>
-                                <div className="mt-1 truncate font-mono text-[11px] text-black/35" title={session.id}>
-                                  {session.id}
-                                </div>
-                              </td>
-                              <td className="whitespace-nowrap border-b border-[#F2F4FA] px-3 py-3 font-mono text-[11px]">
-                                {displayDateTime(session.created_at)}
-                              </td>
-                              <td className="whitespace-nowrap border-b border-[#F2F4FA] px-3 py-3 font-mono text-[11px]">
-                                {displayDateTime(endTime)}
-                              </td>
-                              <td className="whitespace-nowrap border-b border-[#F2F4FA] px-3 py-3">
-                                <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-medium ${sessionStatusBadgeClass(session.status)}`}>
-                                  {sessionStatusLabel(session.status)}
-                                </span>
-                              </td>
-                              <td className="whitespace-nowrap border-b border-[#F2F4FA] px-3 py-3 font-mono text-[11px]">
-                                {sessionDuration(session)}
-                              </td>
-                              <td className="max-w-[180px] border-b border-[#F2F4FA] px-3 py-3">
-                                <span className="block truncate font-mono text-[11px] text-black/45" title={session.template_id}>
-                                  {session.template?.name || session.template_id || '—'}
-                                </span>
-                              </td>
-                              <td className="whitespace-nowrap border-b border-[#F2F4FA] px-3 py-3 font-mono text-[11px]">
-                                {displayDateTime(session.updated_at)}
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                    {sessions.length === 0 && (
-                      <div className="px-4 py-12 text-center text-sm text-black/35">暂无 Session</div>
-                    )}
-                  </div>
-                </div>
-              )}
               </div>
             </div>
           ) : (

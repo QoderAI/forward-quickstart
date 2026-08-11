@@ -92,6 +92,11 @@ export interface ForwardSession {
   source_type?: string;
   template?: { id: string; name?: string; model?: string };
   stats?: { active_seconds?: number; duration_seconds?: number };
+  // Credit consumption. `credits` is the field that reconciles with the
+  // /usage/identities aggregate; `total_credits` (what the docs recommend) is
+  // only sporadically present and drifts, so treat it as a fallback. Both may be
+  // absent when the billing module is off. See credits.ts for the details.
+  usage?: { credits?: number | null; total_credits?: number | null };
   created_at: string;
   updated_at: string;
   archived_at?: string | null;
@@ -679,6 +684,93 @@ export async function listSessions(ctx: ForwardContext, identityId: string, temp
   // Client-side filter: API may not strictly filter by identity_id in PAT mode
   page.data = page.data.filter((s) => s.identity_id === identityId);
   return page;
+}
+
+// Paged/date-filtered session query, used by the usage panel's credit ledger.
+//
+// Deliberately separate from listSessions() above: that one is on the chat hot
+// path with its own hardcoded params, and widening it risked regressing the
+// conversation flow. Note the API takes RFC 3339 strings here, unlike the usage
+// endpoints below which take Unix millis.
+export async function listSessionsPage(
+  ctx: ForwardContext,
+  opts: {
+    identityIds?: string | string[];
+    templateId?: string;
+    createdAtGte?: string;
+    createdAtLte?: string;
+    limit?: number;
+    afterId?: string;
+    includeArchived?: boolean;
+    order?: 'asc' | 'desc';
+  } = {},
+) {
+  const identityIds = Array.isArray(opts.identityIds) ? opts.identityIds.join(',') : opts.identityIds;
+  const page = await forwardRequest<Page<ForwardSession>>(ctx, 'GET', '/sessions', undefined, {
+    ...(identityIds ? { identity_ids: identityIds } : {}),
+    ...(opts.templateId ? { template_id: opts.templateId } : {}),
+    ...(opts.createdAtGte ? { 'created_at[gte]': opts.createdAtGte } : {}),
+    ...(opts.createdAtLte ? { 'created_at[lte]': opts.createdAtLte } : {}),
+    ...(opts.afterId ? { after_id: opts.afterId } : {}),
+    include_archived: opts.includeArchived ?? true,
+    order: opts.order ?? 'desc',
+    limit: Math.min(opts.limit ?? 100, 100),
+  });
+  return page;
+}
+
+// ─── Usage / credits ──────────────────────────────────────────────
+// Both endpoints take start_time/end_time as Unix MILLISECONDS (start inclusive,
+// end exclusive) and reject any span over 31 days with
+// 400 "time range must not exceed 31 days". `credits` is null when credit lookup
+// is unavailable, which is not the same as zero.
+
+export interface IdentityUsageRow {
+  type: string;
+  identity_id: string;
+  session_count: number;
+  duration_seconds: number;
+  credits: number | null;
+  session_ids?: string[];
+}
+
+export interface TemplateUsageRow {
+  type: string;
+  template_id: string;
+  active_identities: number;
+  session_count: number;
+  duration_seconds: number;
+  credits: number | null;
+}
+
+interface UsageEnvelope<T> {
+  type: string;
+  start_time: number;
+  end_time: number;
+  data: T[];
+}
+
+export async function listIdentityUsage(
+  ctx: ForwardContext,
+  opts: { startMs: number; endMs: number; identityId?: string },
+) {
+  return forwardRequest<UsageEnvelope<IdentityUsageRow>>(ctx, 'GET', '/usage/identities', undefined, {
+    start_time: Math.floor(opts.startMs),
+    end_time: Math.floor(opts.endMs),
+    ...(opts.identityId ? { identity_id: opts.identityId } : {}),
+  });
+}
+
+export async function listTemplateUsage(
+  ctx: ForwardContext,
+  opts: { startMs: number; endMs: number; identityId?: string; templateId?: string },
+) {
+  return forwardRequest<UsageEnvelope<TemplateUsageRow>>(ctx, 'GET', '/usage/templates', undefined, {
+    start_time: Math.floor(opts.startMs),
+    end_time: Math.floor(opts.endMs),
+    ...(opts.identityId ? { identity_id: opts.identityId } : {}),
+    ...(opts.templateId ? { template_id: opts.templateId } : {}),
+  });
 }
 
 export async function createSession(
