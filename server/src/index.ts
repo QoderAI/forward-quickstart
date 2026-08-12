@@ -352,33 +352,38 @@ app.post('/api/cloud/request', async (req, res) => {
 // 代理 Cloud 文件内容：客户端无法直接 fetch OSS 预签名 URL（CORS + content-disposition=attachment），
 // 由服务端获取预签名 URL 后 fetch 图片数据，以正确的 Content-Type 返回给浏览器内联显示。
 // Image preview proxy: fetches file metadata + a signed content URL, then
-// streams the bytes inline (stripping the attachment header). Migrated to the
-// Forward layer — chat-attachment files now live in the Forward file store.
-app.get('/api/forward/files/:fileId/preview', async (req, res) => {
-  const authToken = String(req.query.pat ?? req.query.userId ?? '').trim();
-  const fileId = String(req.params.fileId ?? '').trim();
-  const environment = parseApiEnvironment(req.query.environment);
-  if (!authToken || !fileId) {
-    res.status(400).json({ error: { message: 'pat and fileId are required' } });
-    return;
-  }
-  try {
-    // 1. 获取文件元数据（拿 mime_type 和 filename）
-    const fileMetaUrl = new URL(`${API_BASE_URLS[environment]}/files/${encodeURIComponent(fileId)}`);
-    const fileMetaRes = await fetch(fileMetaUrl, {
-      headers: { Accept: 'application/json', Authorization: `Bearer ${authToken}` },
-    });
-    let fileMeta: { mime_type?: string; filename?: string } | null = null;
+// streams the bytes inline (stripping the attachment header).
+//
+// Registered on BOTH layers. The client now uses the forward route (chat
+// attachments live in the Forward file store), but the cloud route is kept so a
+// browser still running a previously-cached bundle doesn't break, and so the
+// matching Vercel function shim stays valid.
+function makePreviewHandler(baseUrls: Record<ForwardApiEnvironment, string>, label: string) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    const authToken = String(req.query.pat ?? req.query.userId ?? '').trim();
+    const fileId = String(req.params.fileId ?? '').trim();
+    const environment = parseApiEnvironment(req.query.environment);
+    if (!authToken || !fileId) {
+      res.status(400).json({ error: { message: 'pat and fileId are required' } });
+      return;
+    }
+    try {
+      // 1. 获取文件元数据（拿 mime_type 和 filename）
+      const fileMetaUrl = new URL(`${baseUrls[environment]}/files/${encodeURIComponent(fileId)}`);
+      const fileMetaRes = await fetch(fileMetaUrl, {
+        headers: { Accept: 'application/json', Authorization: `Bearer ${authToken}` },
+      });
+      let fileMeta: { mime_type?: string; filename?: string } | null = null;
     if (fileMetaRes.ok) {
       fileMeta = await fileMetaRes.json() as { mime_type?: string; filename?: string };
     }
     // 2. 获取预签名下载 URL
-    const contentUrl = new URL(`${API_BASE_URLS[environment]}/files/${encodeURIComponent(fileId)}/content`);
+    const contentUrl = new URL(`${baseUrls[environment]}/files/${encodeURIComponent(fileId)}/content`);
     const contentRes = await fetch(contentUrl, {
       headers: { Accept: 'application/json', Authorization: `Bearer ${authToken}` },
     });
     if (!contentRes.ok) {
-      res.status(contentRes.status).json({ error: { message: `Forward API ${contentRes.status}` } });
+      res.status(contentRes.status).json({ error: { message: `${label} API ${contentRes.status}` } });
       return;
     }
     const { url } = await contentRes.json() as { url?: string };
@@ -402,12 +407,16 @@ app.get('/api/forward/files/:fileId/preview', async (req, res) => {
       'Cache-Control': 'private, max-age=300',
     });
     res.end(buf);
-  } catch (err) {
-    res.status(502).json({
-      error: { message: err instanceof Error ? err.message : 'Preview proxy error' },
-    });
-  }
-});
+    } catch (err) {
+      res.status(502).json({
+        error: { message: err instanceof Error ? err.message : 'Preview proxy error' },
+      });
+    }
+  };
+}
+
+app.get('/api/forward/files/:fileId/preview', makePreviewHandler(API_BASE_URLS, 'Forward'));
+app.get('/api/cloud/files/:fileId/preview', makePreviewHandler(CLOUD_API_BASE_URLS, 'Cloud'));
 
 app.get('/api/forward/sessions/:sessionId/events/stream', async (req, res) => {
   const startedAt = nowMs();
