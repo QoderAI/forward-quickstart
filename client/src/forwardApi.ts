@@ -250,7 +250,8 @@ export async function createCloudEnvironment(
   ctx: ForwardContext,
   input: { name: string; description?: string; networking?: 'unrestricted' | 'limited' },
 ) {
-  return cloudRequest<CloudEnvironment>(ctx, 'POST', '/environments', {
+  // Migrated to Forward layer (POST /api/v1/forward/environments).
+  return forwardRequest<CloudEnvironment>(ctx, 'POST', '/environments', {
     name: input.name,
     description: input.description || '',
     config: {
@@ -273,17 +274,18 @@ export interface CloudModel {
 }
 
 export async function listCloudModels(ctx: ForwardContext) {
+  // NOTE: stays on the cloud layer — Forward has no /models endpoint (verified 404).
   return cloudRequest<{ data: CloudModel[]; has_more: boolean }>(ctx, 'GET', '/models');
 }
 
 export async function listCloudEnvironments(ctx: ForwardContext) {
-  return cloudRequest<{ data: CloudEnvironment[] }>(ctx, 'GET', '/environments', undefined, {
+  return forwardRequest<{ data: CloudEnvironment[] }>(ctx, 'GET', '/environments', undefined, {
     limit: 50,
   });
 }
 
 export async function getCloudEnvironment(ctx: ForwardContext, envId: string) {
-  return cloudRequest<CloudEnvironment>(ctx, 'GET', `/environments/${encodeURIComponent(envId)}`);
+  return forwardRequest<CloudEnvironment>(ctx, 'GET', `/environments/${encodeURIComponent(envId)}`);
 }
 
 export async function updateCloudEnvironment(
@@ -291,23 +293,26 @@ export async function updateCloudEnvironment(
   envId: string,
   input: { name?: string; description?: string; config?: Record<string, unknown> },
 ) {
-  return cloudRequest<CloudEnvironment>(ctx, 'POST', `/environments/${encodeURIComponent(envId)}`, input);
+  return forwardRequest<CloudEnvironment>(ctx, 'POST', `/environments/${encodeURIComponent(envId)}`, input);
 }
 
 export async function archiveCloudEnvironment(ctx: ForwardContext, envId: string) {
-  return cloudRequest<CloudEnvironment>(ctx, 'POST', `/environments/${encodeURIComponent(envId)}/archive`);
+  return forwardRequest<CloudEnvironment>(ctx, 'POST', `/environments/${encodeURIComponent(envId)}/archive`);
 }
 
 export async function deleteCloudEnvironment(ctx: ForwardContext, envId: string) {
-  return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', `/environments/${encodeURIComponent(envId)}`);
+  return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/environments/${encodeURIComponent(envId)}`);
 }
 
 // ─── Skills (Cloud API) ────────────────────────────────────────────
 
+// ─── Skills (Forward layer) ────────────────────────────────────────
+// Forward returns the skill name as `display_title` (there is no `name` field);
+// `name` is kept optional here only for backward-compat with older callers.
 export interface CloudSkill {
   id: string;
   type: 'skill';
-  name: string;
+  name?: string;
   display_title?: string;
   description?: string;
   source?: string;
@@ -318,11 +323,11 @@ export interface CloudSkill {
 }
 
 export async function listCloudSkills(ctx: ForwardContext) {
-  return cloudRequest<{ data: CloudSkill[] }>(ctx, 'GET', '/skills', undefined, { limit: 50 });
+  return forwardRequest<{ data: CloudSkill[] }>(ctx, 'GET', '/skills', undefined, { limit: 50 });
 }
 
 export async function getCloudSkill(ctx: ForwardContext, skillId: string) {
-  return cloudRequest<CloudSkill>(ctx, 'GET', `/skills/${encodeURIComponent(skillId)}`);
+  return forwardRequest<CloudSkill>(ctx, 'GET', `/skills/${encodeURIComponent(skillId)}`);
 }
 
 export async function uploadCloudSkill(
@@ -337,7 +342,8 @@ export async function uploadCloudSkill(
   uploadForm.append('name', input.name);
   if (input.description) uploadForm.append('description', input.description);
 
-  const uploadRes = await fetch('/api/cloud/upload', {
+  // Forward-layer multipart upload (server forwards to /api/v1/forward/skills).
+  const uploadRes = await fetch('/api/forward/upload', {
     method: 'POST',
     body: uploadForm,
   });
@@ -365,14 +371,14 @@ export async function updateCloudSkill(
   const body: Record<string, unknown> = {};
   if (input.name !== undefined) body.name = input.name;
   if (input.description !== undefined) body.description = input.description;
-  return cloudRequest<CloudSkill>(ctx, 'PUT', `/skills/${encodeURIComponent(skillId)}`, body);
+  return forwardRequest<CloudSkill>(ctx, 'PUT', `/skills/${encodeURIComponent(skillId)}`, body);
 }
 
 export async function deleteCloudSkill(ctx: ForwardContext, skillId: string) {
-  return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', `/skills/${encodeURIComponent(skillId)}`);
+  return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/skills/${encodeURIComponent(skillId)}`);
 }
 
-// ─── Files (Cloud API) ─────────────────────────────────────────────
+// ─── Files (Forward layer) ─────────────────────────────────────────
 
 export interface CloudFile {
   id: string;
@@ -386,11 +392,11 @@ export interface CloudFile {
 }
 
 export async function listCloudFiles(ctx: ForwardContext) {
-  return cloudRequest<{ data: CloudFile[] }>(ctx, 'GET', '/files', undefined, { limit: 50 });
+  return forwardRequest<{ data: CloudFile[] }>(ctx, 'GET', '/files', undefined, { limit: 50 });
 }
 
 export async function getCloudFile(ctx: ForwardContext, fileId: string) {
-  return cloudRequest<CloudFile>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}`);
+  return forwardRequest<CloudFile>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}`);
 }
 
 export async function uploadCloudFile(
@@ -404,10 +410,12 @@ export async function uploadCloudFile(
   uploadForm.append('file', input.file);
   if (input.name) uploadForm.append('name', input.name);
   if (input.metadata) uploadForm.append('metadata', JSON.stringify(input.metadata));
-  // Batch 输入文件必须用 purpose=session_resource，否则后续下载可能失败
+  // purpose=session_resource is undocumented on Forward but verified live: without
+  // it the file comes back downloadable:false and /content 403s. Keep sending it.
   if (input.purpose) uploadForm.append('purpose', input.purpose);
 
-  const res = await fetch('/api/cloud/upload', {
+  // Forward-layer multipart upload (server forwards to /api/v1/forward/files).
+  const res = await fetch('/api/forward/upload', {
     method: 'POST',
     body: uploadForm,
   });
@@ -422,15 +430,21 @@ export async function uploadCloudFile(
 }
 
 export async function downloadCloudFile(ctx: ForwardContext, fileId: string) {
-  return cloudRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}/content`);
+  return forwardRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}/content`);
 }
 
 export async function deleteCloudFile(ctx: ForwardContext, fileId: string) {
-  return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', `/files/${encodeURIComponent(fileId)}`);
+  return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/files/${encodeURIComponent(fileId)}`);
 }
 
 // ─── Vaults (Cloud API) ────────────────────────────────────────────
 
+// ─── Vaults (Forward layer) ────────────────────────────────────────
+// Migrated from the cloud layer: Vaults are now first-class in Forward and
+// scoped to the identity/PAT. Paths are unchanged; only the transport flips to
+// forwardRequest (→ /api/v1/forward/vaults). Forward has no vault update
+// endpoint (returns 501), but the app doesn't use one. `archive` is undocumented
+// on Forward but verified live.
 export interface CloudVault {
   id: string;
   type: 'vault';
@@ -441,29 +455,31 @@ export interface CloudVault {
 }
 
 export async function listCloudVaults(ctx: ForwardContext) {
-  return cloudRequest<{ data: CloudVault[] }>(ctx, 'GET', '/vaults', undefined, { limit: 50 });
+  return forwardRequest<{ data: CloudVault[] }>(ctx, 'GET', '/vaults', undefined, { limit: 50 });
 }
 
 export async function getCloudVault(ctx: ForwardContext, vaultId: string) {
-  return cloudRequest<CloudVault>(ctx, 'GET', `/vaults/${encodeURIComponent(vaultId)}`);
+  return forwardRequest<CloudVault>(ctx, 'GET', `/vaults/${encodeURIComponent(vaultId)}`);
 }
 
 export async function createCloudVault(ctx: ForwardContext, input: { display_name: string; metadata?: Record<string, unknown> }) {
-  return cloudRequest<CloudVault>(ctx, 'POST', '/vaults', {
+  return forwardRequest<CloudVault>(ctx, 'POST', '/vaults', {
     display_name: input.display_name,
     metadata: input.metadata || { created_by: 'forward-quickstart' },
   });
 }
 
 export async function archiveCloudVault(ctx: ForwardContext, vaultId: string) {
-  return cloudRequest<CloudVault>(ctx, 'POST', `/vaults/${encodeURIComponent(vaultId)}/archive`);
+  return forwardRequest<CloudVault>(ctx, 'POST', `/vaults/${encodeURIComponent(vaultId)}/archive`);
 }
 
 export async function deleteCloudVault(ctx: ForwardContext, vaultId: string) {
-  return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', `/vaults/${encodeURIComponent(vaultId)}`);
+  return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/vaults/${encodeURIComponent(vaultId)}`);
 }
 
-// ─── Vault Credentials (Cloud API) ─────────────────────────────────
+// ─── Vault Credentials (Forward layer) ─────────────────────────────
+// Nested under a vault, migrated to forwardRequest. Credential id prefix is
+// vcred_; auth secrets are never echoed and display_name comes back empty.
 
 export interface CloudCredential {
   id: string;
@@ -475,7 +491,7 @@ export interface CloudCredential {
 }
 
 export async function listCloudCredentials(ctx: ForwardContext, vaultId: string) {
-  return cloudRequest<{ data: CloudCredential[] }>(ctx, 'GET', `/vaults/${encodeURIComponent(vaultId)}/credentials`, undefined, { limit: 50 });
+  return forwardRequest<{ data: CloudCredential[] }>(ctx, 'GET', `/vaults/${encodeURIComponent(vaultId)}/credentials`, undefined, { limit: 50 });
 }
 
 export type CredentialAuth =
@@ -489,14 +505,14 @@ export async function createCloudCredential(
   auth: CredentialAuth,
   metadata?: Record<string, unknown>,
 ) {
-  return cloudRequest<CloudCredential>(ctx, 'POST', `/vaults/${encodeURIComponent(vaultId)}/credentials`, {
+  return forwardRequest<CloudCredential>(ctx, 'POST', `/vaults/${encodeURIComponent(vaultId)}/credentials`, {
     auth,
     ...(metadata ? { metadata } : {}),
   });
 }
 
 export async function deleteCloudCredential(ctx: ForwardContext, vaultId: string, credentialId: string) {
-  return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', `/vaults/${encodeURIComponent(vaultId)}/credentials/${encodeURIComponent(credentialId)}`);
+  return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/vaults/${encodeURIComponent(vaultId)}/credentials/${encodeURIComponent(credentialId)}`);
 }
 
 export async function listIdentities(ctx: ForwardContext, externalId: string) {
@@ -794,15 +810,15 @@ export async function createSession(
 }
 
 // Mount an already-uploaded file into an EXISTING session's workspace.
-// Uses the Managed-layer resource API (Forward sessions accept it). The
-// mount_path must live under /data/workspace — the default
+// Migrated to the Forward layer (POST /api/v1/forward/sessions/{id}/resources,
+// verified live). The mount_path must live under /data/workspace — the default
 // /mnt/session/uploads path never materializes into the agent sandbox.
 export async function addSessionFileResource(
   ctx: ForwardContext,
   sessionId: string,
   input: { file_id: string; mount_path: string },
 ) {
-  return cloudRequest<{ id: string; type: string; file_id: string; mount_path: string }>(
+  return forwardRequest<{ id: string; type: string; file_id: string; mount_path: string }>(
     ctx,
     'POST',
     `/sessions/${encodeURIComponent(sessionId)}/resources`,
@@ -816,9 +832,10 @@ export interface SessionFileResource {
   mount_path?: string | null;
 }
 
-// List a session's mounted resources. Used to map an attachment marker's
-// mount_path back to its file id, so image attachments can be previewed after
-// a history reload (the message text only stores the name and path).
+// List a session's mounted resources. Stays on the CLOUD layer: Forward returns
+// 405 for GET /sessions/{id}/resources, and its GET /files?scope_id= filter does
+// not reflect session-mounted files (verified). Used to map an attachment
+// marker's mount_path back to its file id for previews after a history reload.
 export async function listSessionResources(ctx: ForwardContext, sessionId: string) {
   return cloudRequest<Page<SessionFileResource>>(
     ctx,

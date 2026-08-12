@@ -351,7 +351,10 @@ app.post('/api/cloud/request', async (req, res) => {
 
 // 代理 Cloud 文件内容：客户端无法直接 fetch OSS 预签名 URL（CORS + content-disposition=attachment），
 // 由服务端获取预签名 URL 后 fetch 图片数据，以正确的 Content-Type 返回给浏览器内联显示。
-app.get('/api/cloud/files/:fileId/preview', async (req, res) => {
+// Image preview proxy: fetches file metadata + a signed content URL, then
+// streams the bytes inline (stripping the attachment header). Migrated to the
+// Forward layer — chat-attachment files now live in the Forward file store.
+app.get('/api/forward/files/:fileId/preview', async (req, res) => {
   const authToken = String(req.query.pat ?? req.query.userId ?? '').trim();
   const fileId = String(req.params.fileId ?? '').trim();
   const environment = parseApiEnvironment(req.query.environment);
@@ -361,7 +364,7 @@ app.get('/api/cloud/files/:fileId/preview', async (req, res) => {
   }
   try {
     // 1. 获取文件元数据（拿 mime_type 和 filename）
-    const fileMetaUrl = new URL(`${CLOUD_API_BASE_URLS[environment]}/files/${encodeURIComponent(fileId)}`);
+    const fileMetaUrl = new URL(`${API_BASE_URLS[environment]}/files/${encodeURIComponent(fileId)}`);
     const fileMetaRes = await fetch(fileMetaUrl, {
       headers: { Accept: 'application/json', Authorization: `Bearer ${authToken}` },
     });
@@ -370,12 +373,12 @@ app.get('/api/cloud/files/:fileId/preview', async (req, res) => {
       fileMeta = await fileMetaRes.json() as { mime_type?: string; filename?: string };
     }
     // 2. 获取预签名下载 URL
-    const contentUrl = new URL(`${CLOUD_API_BASE_URLS[environment]}/files/${encodeURIComponent(fileId)}/content`);
+    const contentUrl = new URL(`${API_BASE_URLS[environment]}/files/${encodeURIComponent(fileId)}/content`);
     const contentRes = await fetch(contentUrl, {
       headers: { Accept: 'application/json', Authorization: `Bearer ${authToken}` },
     });
     if (!contentRes.ok) {
-      res.status(contentRes.status).json({ error: { message: `Cloud API ${contentRes.status}` } });
+      res.status(contentRes.status).json({ error: { message: `Forward API ${contentRes.status}` } });
       return;
     }
     const { url } = await contentRes.json() as { url?: string };
@@ -552,64 +555,73 @@ app.get('/api/forward/sessions/:sessionId/events/stream', async (req, res) => {
 
 // ─── Multipart upload proxy for Cloud API (Skills/Files) ──────────
 
-app.post('/api/cloud/upload', upload.single('file'), async (req, res) => {
-  const startedAt = nowMs();
-  const { pat, environment, path: targetPath } = req.body ?? {};
-  const apiEnvironment = parseApiEnvironment(environment);
-  const authToken = String(pat ?? '').trim();
-  const target = String(targetPath ?? '').trim();
+// Multipart upload proxy, shared by the cloud and forward layers. `baseUrls`
+// selects which layer the upload is forwarded to; the client picks the route
+// (/api/forward/upload vs /api/cloud/upload) and passes the same `path` field
+// (e.g. /files, /skills).
+function makeUploadHandler(baseUrls: Record<ForwardApiEnvironment, string>, label: string) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    const startedAt = nowMs();
+    const { pat, environment, path: targetPath } = req.body ?? {};
+    const apiEnvironment = parseApiEnvironment(environment);
+    const authToken = String(pat ?? '').trim();
+    const target = String(targetPath ?? '').trim();
 
-  if (!authToken || !target) {
-    res.status(400).json({ error: { message: 'pat and path are required' } });
-    return;
-  }
-
-  try {
-    const url = new URL(`${CLOUD_API_BASE_URLS[apiEnvironment]}${target}`);
-    const formData = new FormData();
-
-    // Forward file if present
-    if (req.file) {
-      formData.append('file', new Blob([req.file.buffer as unknown as BlobPart], { type: req.file.mimetype }), req.file.originalname);
+    if (!authToken || !target) {
+      res.status(400).json({ error: { message: 'pat and path are required' } });
+      return;
     }
 
-    // Forward other body fields
-    for (const [key, value] of Object.entries(req.body ?? {})) {
-      if (key !== 'pat' && key !== 'environment' && key !== 'path') {
-        formData.append(key, String(value));
+    try {
+      const url = new URL(`${baseUrls[apiEnvironment]}${target}`);
+      const formData = new FormData();
+
+      // Forward file if present
+      if (req.file) {
+        formData.append('file', new Blob([req.file.buffer as unknown as BlobPart], { type: req.file.mimetype }), req.file.originalname);
       }
+
+      // Forward other body fields
+      for (const [key, value] of Object.entries(req.body ?? {})) {
+        if (key !== 'pat' && key !== 'environment' && key !== 'path') {
+          formData.append(key, String(value));
+        }
+      }
+
+      const upstream = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: formData,
+      });
+
+      const text = await upstream.text();
+      const upstreamRequestId = upstream.headers.get('x-request-id') || upstream.headers.get('x-trace-id');
+      if (upstreamRequestId) res.setHeader('x-request-id', upstreamRequestId);
+
+      proxyLog(upstream.ok ? 'info' : 'warn', `${label} upload`, {
+        environment: apiEnvironment,
+        path: target,
+        status: upstream.status,
+        requestId: upstreamRequestId || undefined,
+        duration: requestMs(startedAt),
+        fileSize: req.file?.size,
+      });
+
+      res.status(upstream.status);
+      res.type(upstream.headers.get('content-type') || 'application/json');
+      res.send(text);
+    } catch (err) {
+      res.status(502).json({
+        error: { message: err instanceof Error ? err.message : `${label} upload proxy error` },
+      });
     }
+  };
+}
 
-    const upstream = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${authToken}`,
-      },
-      body: formData,
-    });
-
-    const text = await upstream.text();
-    const upstreamRequestId = upstream.headers.get('x-request-id') || upstream.headers.get('x-trace-id');
-    if (upstreamRequestId) res.setHeader('x-request-id', upstreamRequestId);
-
-    proxyLog(upstream.ok ? 'info' : 'warn', 'cloud upload', {
-      environment: apiEnvironment,
-      path: target,
-      status: upstream.status,
-      requestId: upstreamRequestId || undefined,
-      duration: requestMs(startedAt),
-      fileSize: req.file?.size,
-    });
-
-    res.status(upstream.status);
-    res.type(upstream.headers.get('content-type') || 'application/json');
-    res.send(text);
-  } catch (err) {
-    res.status(502).json({
-      error: { message: err instanceof Error ? err.message : 'Cloud upload proxy error' },
-    });
-  }
-});
+app.post('/api/cloud/upload', upload.single('file'), makeUploadHandler(CLOUD_API_BASE_URLS, 'cloud'));
+app.post('/api/forward/upload', upload.single('file'), makeUploadHandler(API_BASE_URLS, 'forward'));
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', forwardApiBaseUrls: API_BASE_URLS });

@@ -1082,7 +1082,7 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
         // 生产环境同源，用相对路径即可。
         if (isImageFile(file)) {
           const base = import.meta.env.DEV ? 'http://localhost:3001' : '';
-          const previewUrl = `${base}/api/cloud/files/${encodeURIComponent(fileId)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`;
+          const previewUrl = `${base}/api/forward/files/${encodeURIComponent(fileId)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`;
           if (!cancelled) setImageUrl(previewUrl);
         }
       })
@@ -1448,7 +1448,7 @@ const SentImageAttachment = memo(function SentImageAttachment({
         const meta = await getCloudFile(ctx, hit.file_id);
         if (cancelled || meta.downloadable === false) return;
         const base = import.meta.env.DEV ? 'http://localhost:3001' : '';
-        setUrl(`${base}/api/cloud/files/${encodeURIComponent(hit.file_id)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`);
+        setUrl(`${base}/api/forward/files/${encodeURIComponent(hit.file_id)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`);
       })
       .catch(() => { /* preview is best-effort; the chip below still names the file */ });
     return () => { cancelled = true; };
