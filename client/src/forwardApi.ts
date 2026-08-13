@@ -263,7 +263,9 @@ export async function createCloudEnvironment(
 
 export interface CloudModel {
   id: string;
-  type: 'model';
+  // Neither layer actually returns `type` on a model object (verified live),
+  // so it stays optional to match reality.
+  type?: 'model';
   display_name: string;
   source?: string;
   is_enabled?: boolean;
@@ -274,8 +276,11 @@ export interface CloudModel {
 }
 
 export async function listCloudModels(ctx: ForwardContext) {
-  // NOTE: stays on the cloud layer — Forward has no /models endpoint (verified 404).
-  return cloudRequest<{ data: CloudModel[]; has_more: boolean }>(ctx, 'GET', '/models');
+  // Migrated to Forward: /forward/models was 404 at the time of the original
+  // audit but is now available and equivalent to the cloud layer — same 15 model
+  // ids, same field set, identical values once the `efforts` array ordering is
+  // normalised (verified live).
+  return forwardRequest<{ data: CloudModel[]; has_more: boolean }>(ctx, 'GET', '/models');
 }
 
 export async function listCloudEnvironments(ctx: ForwardContext) {
