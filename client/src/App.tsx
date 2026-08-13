@@ -1080,9 +1080,10 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
         // 图片类型：通过服务端代理预览（绕过 OSS CORS 和 attachment 头）
         // dev 模式下直接请求 Express 端口（3001）避免 Vite proxy 覆盖 Content-Type；
         // 生产环境同源，用相对路径即可。
+        // 用 cloud 代理：这里的 fileId 是 Agent 生成的产物，Forward 文件存储看不到它。
         if (isImageFile(file)) {
           const base = import.meta.env.DEV ? 'http://localhost:3001' : '';
-          const previewUrl = `${base}/api/forward/files/${encodeURIComponent(fileId)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`;
+          const previewUrl = `${base}/api/cloud/files/${encodeURIComponent(fileId)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`;
           if (!cancelled) setImageUrl(previewUrl);
         }
       })
@@ -1448,7 +1449,9 @@ const SentImageAttachment = memo(function SentImageAttachment({
         const meta = await getCloudFile(ctx, hit.file_id);
         if (cancelled || meta.downloadable === false) return;
         const base = import.meta.env.DEV ? 'http://localhost:3001' : '';
-        setUrl(`${base}/api/forward/files/${encodeURIComponent(hit.file_id)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`);
+        // cloud 代理：会话挂载的文件既可能是我们上传的，也可能是 Agent 生成的，
+        // 只有 cloud 层能同时看到两者。
+        setUrl(`${base}/api/cloud/files/${encodeURIComponent(hit.file_id)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`);
       })
       .catch(() => { /* preview is best-effort; the chip below still names the file */ });
     return () => { cancelled = true; };

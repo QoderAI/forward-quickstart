@@ -378,7 +378,20 @@ export async function deleteCloudSkill(ctx: ForwardContext, skillId: string) {
   return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/skills/${encodeURIComponent(skillId)}`);
 }
 
-// ─── Files (Forward layer) ─────────────────────────────────────────
+// ─── Files (mixed layer — read the note) ───────────────────────────
+//
+// Files are the one family where the two layers are NOT interchangeable:
+//
+//   - Files uploaded by us land in the Forward store and are visible on BOTH
+//     layers, so uploading via Forward is safe.
+//   - Files produced by the AGENT during a session (ImageGen output, generated
+//     documents, batch error files) exist ONLY on the cloud layer. Verified
+//     live: GET /forward/files/{artifact_id} → 404 "resource not found", while
+//     GET /cloud/files/{artifact_id} → 200.
+//
+// So the cloud layer is a strict superset for reads. Any operation that takes a
+// file id we did not just create (metadata, download, preview, delete) must go
+// through cloud, or it 404s on agent-generated artifacts.
 
 export interface CloudFile {
   id: string;
@@ -395,8 +408,10 @@ export async function listCloudFiles(ctx: ForwardContext) {
   return forwardRequest<{ data: CloudFile[] }>(ctx, 'GET', '/files', undefined, { limit: 50 });
 }
 
+// Metadata for an arbitrary file id (chat artifacts, session-mounted files).
+// Cloud layer: see the note above — Forward cannot see agent-generated files.
 export async function getCloudFile(ctx: ForwardContext, fileId: string) {
-  return forwardRequest<CloudFile>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}`);
+  return cloudRequest<CloudFile>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}`);
 }
 
 export async function uploadCloudFile(
@@ -415,6 +430,7 @@ export async function uploadCloudFile(
   if (input.purpose) uploadForm.append('purpose', input.purpose);
 
   // Forward-layer multipart upload (server forwards to /api/v1/forward/files).
+  // Safe because the result is readable from both layers.
   const res = await fetch('/api/forward/upload', {
     method: 'POST',
     body: uploadForm,
@@ -429,12 +445,17 @@ export async function uploadCloudFile(
   return data as CloudFile;
 }
 
+// Signed download URL for an arbitrary file id. Cloud layer: this is what the
+// chat artifact download button and the batch error-file download both use, and
+// those ids are agent/system-generated, hence invisible to Forward.
 export async function downloadCloudFile(ctx: ForwardContext, fileId: string) {
-  return forwardRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}/content`);
+  return cloudRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}/content`);
 }
 
+// Cloud layer so that deleting a registered file resource works whether the file
+// originated from our upload or from the agent.
 export async function deleteCloudFile(ctx: ForwardContext, fileId: string) {
-  return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/files/${encodeURIComponent(fileId)}`);
+  return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', `/files/${encodeURIComponent(fileId)}`);
 }
 
 // ─── Vaults (Cloud API) ────────────────────────────────────────────
