@@ -572,6 +572,7 @@ function makeUploadHandler(baseUrls: Record<ForwardApiEnvironment, string>, labe
   return async (req: import('express').Request, res: import('express').Response) => {
     const startedAt = nowMs();
     const { pat, environment, path: targetPath } = req.body ?? {};
+    const idempotencyKey = req.get('idempotency-key')?.trim();
     const apiEnvironment = parseApiEnvironment(environment);
     const authToken = String(pat ?? '').trim();
     const target = String(targetPath ?? '').trim();
@@ -597,11 +598,14 @@ function makeUploadHandler(baseUrls: Record<ForwardApiEnvironment, string>, labe
         }
       }
 
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${authToken}`,
+      };
+      if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+
       const upstream = await fetch(url, {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${authToken}`,
-        },
+        headers,
         body: formData,
       });
 

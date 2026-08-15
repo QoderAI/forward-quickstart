@@ -3,8 +3,9 @@ import {
   cancelSession,
   createCloudEnvironment,
   createCloudVault,
+  updateCloudVault,
   createSession,
-  deleteCloudFile,
+  deleteForwardFile,
   getCloudFile,
   downloadCloudFile,
   type CloudFile,
@@ -15,7 +16,6 @@ import {
   uploadCloudFile,
   updateCloudEnvironment,
   updateCloudSkill,
-  listCloudSkills,
   listCloudCredentials,
   createCloudCredential,
   deleteCloudCredential,
@@ -23,17 +23,20 @@ import {
   listCloudModels,
   createTemplate,
   updateTemplate,
+  cloneTemplate,
+  archiveTemplate,
   ensureIdentity,
   listEvents,
+  listResourceCatalog,
   listResources,
   listSessions,
   listSessionResources,
   listTemplates,
-  registerResource,
   addSessionFileResource,
-  deleteForwardResource,
-  ForwardApiError,
   sendUserMessage,
+  sendToolConfirmation,
+  sendQuestionAnswer,
+  sendCustomToolResult,
   streamEvents,
   listSchedules,
   createSchedule,
@@ -53,6 +56,8 @@ import {
   getQrSession,
   deleteChannel,
   buildChannelCredentials,
+  channelTypesForEnvironment,
+  CHANNEL_MAX_COUNTS,
   waitForChannelBinding,
   listManagedAgents,
   type ManagedAgent,
@@ -79,7 +84,29 @@ import { BatchPanel } from './batchPanel';
 import { UsagePanel } from './usagePanel';
 import { LayerQuizButton } from './layerQuiz';
 import { PRODUCT_NAME } from './config/product';
-import { BUILTIN_TOOLS, buildToolsetEntry, extractBuiltinToolNames, extractToolNames } from './templateTools';
+import {
+  BUILTIN_TOOLS,
+  DEFAULT_TOOL_APPROVAL,
+  buildToolsetEntry,
+  extractBuiltinToolNames,
+  extractToolApproval,
+  extractToolNames,
+  type ToolApprovalConfig,
+  type ToolPermissionPolicy,
+} from './templateTools';
+import {
+  buildTemplateBindings,
+  buildTemplateModel,
+  parseTemplateBindingIds,
+  parseTemplateModel,
+} from './templateConfig';
+import {
+  derivePendingQuestion,
+  derivePendingToolApprovals,
+  encodeQuestionAnswers,
+  type PendingQuestion,
+  type PendingToolApproval,
+} from './chatActions';
 import {
   ATTACHMENT_ACCEPT,
   attachmentMountPath,
@@ -126,7 +153,16 @@ const CHANNEL_TYPES: Array<{ value: ChannelType; label: string; icon: string; qr
   { value: 'wecom', label: '企业微信', icon: '🏢', qrSupport: true, manualSupport: true },
   { value: 'dingtalk', label: '钉钉', icon: '📌', qrSupport: true, manualSupport: true },
   { value: 'feishu', label: '飞书', icon: '🐦', qrSupport: true, manualSupport: true },
+  { value: 'lark', label: 'Lark', icon: '🪽', qrSupport: false, manualSupport: true },
+  { value: 'slack', label: 'Slack', icon: '💠', qrSupport: false, manualSupport: true },
 ];
+
+function channelCredentialLabels(channelType: ChannelType): { key: string; secret: string } {
+  if (channelType === 'feishu' || channelType === 'lark') return { key: 'App ID', secret: 'App Secret' };
+  if (channelType === 'dingtalk') return { key: 'Client ID', secret: 'Client Secret' };
+  if (channelType === 'slack') return { key: 'App Token', secret: 'Bot Token' };
+  return { key: 'Bot ID', secret: 'Secret' };
+}
 
 const MODEL_DISPLAY_NAMES: Record<string, string> = {
   ultimate: '旗舰版',
@@ -199,7 +235,7 @@ function resourceSubtitle(resource: ForwardResource): string {
       return networking?.type === 'unrestricted' ? '完全开放网络' : '受限网络';
     }
     case 'vault':
-      return '凭据库';
+      return '密钥库';
     case 'memory_store':
       return specString(resource, 'description') || '记忆库';
     default:
@@ -239,7 +275,7 @@ const RESOURCE_TYPE_LABELS: Record<ForwardResourceType, string> = {
   skill: '技能',
   file: '文件',
   environment: '环境',
-  vault: '凭据库',
+  vault: '密钥库',
   memory_store: '记忆库',
 };
 
@@ -268,7 +304,7 @@ const SIDEBAR_ITEMS: Array<{ id: SidebarPanel; label: string }> = [
   { id: 'skills', label: '技能' },
   { id: 'files', label: '文件' },
   { id: 'environments', label: '环境' },
-  { id: 'vaults', label: '凭据' },
+  { id: 'vaults', label: '密钥' },
   { id: 'usage', label: '用量' },
 ];
 
@@ -1557,6 +1593,237 @@ function Modal({ open, onClose, title, children }: { open: boolean; onClose: () 
   );
 }
 
+function ToolApprovalPanel({
+  approvals,
+  loadingId,
+  onResolve,
+}: {
+  approvals: PendingToolApproval[];
+  loadingId: string | null;
+  onResolve: (approval: PendingToolApproval, result: 'allow' | 'deny') => void;
+}) {
+  if (approvals.length === 0) return null;
+  return (
+    <div className="space-y-3 rounded-2xl border border-amber-200 bg-amber-50 p-4">
+      <div>
+        <div className="text-sm font-semibold text-amber-900">Agent 请求执行工具</div>
+        <div className="mt-0.5 text-xs text-amber-700">请检查入参后决定允许或拒绝，Quickstart 不再自动放行。</div>
+      </div>
+      {approvals.map((approval) => (
+        <div key={approval.toolUseId} className="rounded-xl border border-amber-200 bg-white p-3">
+          <div className="flex items-center justify-between gap-3">
+            <span className="font-mono text-xs font-semibold text-black/70">{approval.toolName}</span>
+            <span className="truncate font-mono text-[10px] text-black/30">{approval.toolUseId}</span>
+          </div>
+          <pre className="mt-2 max-h-44 overflow-auto whitespace-pre-wrap rounded-lg bg-[#F7F8FC] p-2.5 font-mono text-[11px] leading-5 text-black/65">
+            {JSON.stringify(approval.input, null, 2)}
+          </pre>
+          <div className="mt-3 flex justify-end gap-2">
+            <button
+              type="button"
+              disabled={loadingId === approval.toolUseId}
+              onClick={() => onResolve(approval, 'deny')}
+              className="rounded-lg border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
+            >
+              拒绝
+            </button>
+            <button
+              type="button"
+              disabled={loadingId === approval.toolUseId}
+              onClick={() => onResolve(approval, 'allow')}
+              className="rounded-lg bg-[#3550FF] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#2a42e0] disabled:opacity-50"
+            >
+              {loadingId === approval.toolUseId ? '处理中...' : '允许'}
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function QuestionPanel({
+  pending,
+  loading,
+  onSubmit,
+  onDismiss,
+}: {
+  pending: PendingQuestion;
+  loading: boolean;
+  onSubmit: (answers: string[][]) => void;
+  onDismiss: () => void;
+}) {
+  const [answers, setAnswers] = useState<Record<number, string[]>>({});
+  const [other, setOther] = useState<Record<number, string>>({});
+  const normalizedAnswers = pending.questions.map((question, index) => {
+    const custom = other[index]?.trim();
+    const selected = answers[index] ?? [];
+    if (!custom) return selected;
+    return question.multiSelect ? [...selected, custom] : [custom];
+  });
+  const ready = normalizedAnswers.every((answer) => answer.length > 0);
+  return (
+    <div className="rounded-2xl border border-[#C9D1FF] bg-[#F6F7FF] p-4">
+      <div className="text-sm font-semibold text-black/80">Agent 需要你的选择</div>
+      <div className="mt-3 space-y-4">
+        {pending.questions.map((question, index) => (
+          <div key={`${pending.questionUseId}-${index}`} className="rounded-xl bg-white p-3">
+            <div className="mb-2 flex items-center gap-2">
+              {question.header && <span className="rounded-full bg-[#E9ECFF] px-2 py-0.5 text-[10px] font-medium text-[#3550FF]">{question.header}</span>}
+              <span className="text-sm font-medium text-black/75">{question.question}</span>
+            </div>
+            <div className="space-y-1.5">
+              {question.options.map((option) => {
+                const selected = (answers[index] ?? []).includes(option.label) && (question.multiSelect || !other[index]);
+                return (
+                  <button
+                    key={option.label}
+                    type="button"
+                    onClick={() => {
+                      if (!question.multiSelect) setOther((prev) => ({ ...prev, [index]: '' }));
+                      setAnswers((prev) => {
+                        const current = prev[index] ?? [];
+                        const next = question.multiSelect
+                          ? (current.includes(option.label) ? current.filter((value) => value !== option.label) : [...current, option.label])
+                          : [option.label];
+                        return { ...prev, [index]: next };
+                      });
+                    }}
+                    className={`w-full rounded-lg border px-3 py-2 text-left transition ${selected ? 'border-[#3550FF] bg-[#F2F4FF]' : 'border-[#E5E7EB] hover:border-[#B8C3FF]'}`}
+                  >
+                    <div className="text-xs font-medium text-black/70">{option.label}</div>
+                    {option.description && <div className="mt-0.5 text-[11px] text-black/40">{option.description}</div>}
+                  </button>
+                );
+              })}
+              <input
+                value={other[index] ?? ''}
+                onChange={(event) => setOther((prev) => ({ ...prev, [index]: event.target.value }))}
+                placeholder="其他（自行输入）"
+                className="h-9 w-full rounded-lg border border-[#E5E7EB] px-3 text-xs outline-none focus:border-[#3550FF]"
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 flex justify-end gap-2">
+        <button type="button" disabled={loading} onClick={onDismiss} className="rounded-lg px-3 py-1.5 text-xs text-black/45 hover:bg-white disabled:opacity-50">跳过</button>
+        <button
+          type="button"
+          disabled={loading || !ready}
+          onClick={() => onSubmit(normalizedAnswers)}
+          className="rounded-lg bg-[#3550FF] px-4 py-1.5 text-xs font-medium text-white hover:bg-[#2a42e0] disabled:opacity-40"
+        >
+          {loading ? '提交中...' : '提交答案'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function McpServerEditor({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const [editingIndex, setEditingIndex] = useState<number | 'new' | null>(null);
+  const [name, setName] = useState('');
+  const [url, setUrl] = useState('');
+  const [formError, setFormError] = useState('');
+  const parsed = useMemo(() => {
+    if (!value.trim()) return { items: [] as Record<string, unknown>[], error: '' };
+    try {
+      const raw = JSON.parse(value) as unknown;
+      if (!Array.isArray(raw)) return { items: [] as Record<string, unknown>[], error: 'MCP 配置必须是 JSON 数组' };
+      return {
+        items: raw.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item)),
+        error: '',
+      };
+    } catch {
+      return { items: [] as Record<string, unknown>[], error: 'JSON 格式不正确' };
+    }
+  }, [value]);
+
+  const openNew = () => {
+    setEditingIndex('new');
+    setName('');
+    setUrl('');
+    setFormError('');
+  };
+  const openEdit = (index: number) => {
+    const item = parsed.items[index];
+    setEditingIndex(index);
+    setName(typeof item.name === 'string' ? item.name : '');
+    setUrl(typeof item.url === 'string' ? item.url : '');
+    setFormError('');
+  };
+  const save = () => {
+    const cleanName = name.trim();
+    const cleanUrl = url.trim();
+    if (!cleanName) { setFormError('请输入 MCP 名称'); return; }
+    if (!/^https?:\/\/.+/.test(cleanUrl)) { setFormError('URL 需以 http:// 或 https:// 开头'); return; }
+    if (parsed.items.some((item, index) => index !== editingIndex && item.name === cleanName)) {
+      setFormError('MCP 名称已存在');
+      return;
+    }
+    const next = [...parsed.items];
+    if (editingIndex === 'new') next.push({ type: 'url', name: cleanName, url: cleanUrl });
+    else if (typeof editingIndex === 'number') next[editingIndex] = { ...next[editingIndex], type: 'url', name: cleanName, url: cleanUrl };
+    onChange(JSON.stringify(next, null, 2));
+    setEditingIndex(null);
+  };
+  const remove = (index: number) => {
+    const next = parsed.items.filter((_, itemIndex) => itemIndex !== index);
+    onChange(next.length ? JSON.stringify(next, null, 2) : '');
+    if (editingIndex === index) setEditingIndex(null);
+  };
+
+  return (
+    <div className="rounded-xl border border-[#E5E7EB] bg-white p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-xs font-medium text-black/55">MCP 服务</div>
+          <div className="mt-0.5 text-[10px] text-black/30">Streamable HTTP（名称 + URL）</div>
+        </div>
+        <button type="button" onClick={openNew} disabled={!!parsed.error} className="rounded-lg bg-[#EEF1FF] px-3 py-1.5 text-[11px] font-medium text-[#3550FF] hover:bg-[#E3E7FF] disabled:opacity-40">+ 添加 MCP</button>
+      </div>
+      {parsed.items.length > 0 ? (
+        <div className="mt-3 space-y-2">
+          {parsed.items.map((item, index) => (
+            <div key={`${String(item.name)}-${index}`} className="flex items-center gap-3 rounded-lg bg-[#F7F8FC] px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-xs font-medium text-black/65">{String(item.name || '未命名 MCP')}</div>
+                <div className="mt-0.5 truncate font-mono text-[10px] text-black/35">{String(item.url || '')}</div>
+              </div>
+              <button type="button" onClick={() => openEdit(index)} className="text-[11px] text-[#3550FF] hover:underline">编辑</button>
+              <button type="button" onClick={() => remove(index)} className="text-[11px] text-red-500 hover:underline">删除</button>
+            </div>
+          ))}
+        </div>
+      ) : !parsed.error ? (
+        <div className="mt-3 rounded-lg bg-[#FAFBFF] px-3 py-4 text-center text-[11px] text-black/35">暂无 MCP 服务</div>
+      ) : null}
+      {editingIndex !== null && (
+        <div className="mt-3 space-y-2 rounded-lg border border-[#DDE2F2] p-3">
+          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="MCP 名称" className="h-9 w-full rounded-lg border border-[#E5E7EB] px-3 text-xs outline-none focus:border-[#3550FF]" />
+          <input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/mcp" className="h-9 w-full rounded-lg border border-[#E5E7EB] px-3 font-mono text-xs outline-none focus:border-[#3550FF]" />
+          {formError && <div className="text-[11px] text-red-500">{formError}</div>}
+          <div className="flex justify-end gap-2">
+            <button type="button" onClick={() => setEditingIndex(null)} className="rounded-lg px-3 py-1.5 text-[11px] text-black/45 hover:bg-[#F4F6FC]">取消</button>
+            <button type="button" onClick={save} className="rounded-lg bg-[#3550FF] px-3 py-1.5 text-[11px] font-medium text-white hover:bg-[#2a42e0]">保存</button>
+          </div>
+        </div>
+      )}
+      <details className="mt-3">
+        <summary className="cursor-pointer text-[10px] text-black/35">高级：编辑原始 JSON</summary>
+        <textarea
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={'例如：[{"type":"url","name":"my-mcp","url":"https://example.com/mcp"}]'}
+          className="mt-2 min-h-[88px] w-full resize-y rounded-xl border border-[#E5E7EB] bg-white px-3.5 py-2.5 font-mono text-xs outline-none focus:border-[#3550FF]"
+        />
+        {parsed.error && <span className="mt-1 block text-[10px] text-red-500">{parsed.error}</span>}
+      </details>
+    </div>
+  );
+}
+
 function ResourceTokenSelect({
   label,
   placeholder,
@@ -1839,6 +2106,8 @@ export default function App() {
   const [templateName, setTemplateName] = useState('');
   const [templateDescription, setTemplateDescription] = useState('');
   const [templateModel, setTemplateModel] = useState('ultimate');
+  const [templateModelEffort, setTemplateModelEffort] = useState('');
+  const [templateContextWindow, setTemplateContextWindow] = useState('');
   const [templateSystem, setTemplateSystem] = useState('');
   const [environmentId, setEnvironmentId] = useState('');
   const [vaultIdsText, setVaultIdsText] = useState('');
@@ -1846,6 +2115,8 @@ export default function App() {
   const [fileIdsText, setFileIdsText] = useState('');
   const [envVarsText, setEnvVarsText] = useState('');
   const [selectedTools, setSelectedTools] = useState<string[]>([...BUILTIN_TOOLS]);
+  const [toolApproval, setToolApproval] = useState<ToolApprovalConfig>({ ...DEFAULT_TOOL_APPROVAL });
+  const [browserUseEnabled, setBrowserUseEnabled] = useState(false);
   const [toolsJson, setToolsJson] = useState('');
   const [mcpServersJson, setMcpServersJson] = useState('');
   // Multi-agent (coordinator) config in the template editor. The Forward API's
@@ -1860,7 +2131,6 @@ export default function App() {
   const [multiagentSelectedAgentIds, setMultiagentSelectedAgentIds] = useState<string[]>([]);
   const [multiagentIncludeSelf, setMultiagentIncludeSelf] = useState(false);
   const [resourceType, setResourceType] = useState<ForwardResourceType>('skill');
-  const [resourceId, setResourceId] = useState('');
   const [resources, setResources] = useState<ForwardResource[]>([]);
   const [resourceOptionsByType, setResourceOptionsByType] = useState<Record<ForwardResourceType, ForwardResource[]>>(emptyResourceOptions);
   const [sessions, setSessions] = useState<ForwardSession[]>([]);
@@ -1912,7 +2182,6 @@ export default function App() {
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const [showTemplateModal, setShowTemplateModal] = useState(false);
-  const [showResourceModal, setShowResourceModal] = useState(false);
   const [showTemplateSwitcher, setShowTemplateSwitcher] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
@@ -1924,6 +2193,9 @@ export default function App() {
   const [showDevModeConfirm, setShowDevModeConfirm] = useState(false);
   const [viewingTemplate, setViewingTemplate] = useState<ForwardTemplate | null>(null);
   const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+  const [templateSearch, setTemplateSearch] = useState('');
+  const [templateActionLoading, setTemplateActionLoading] = useState<string | null>(null);
+  const [chatActionLoading, setChatActionLoading] = useState<string | null>(null);
   const [viewingResource, setViewingResource] = useState<ForwardResource | null>(null);
   const [conversationSearch, setConversationSearch] = useState('');
   const [showCreateEnvModal, setShowCreateEnvModal] = useState(false);
@@ -1976,7 +2248,6 @@ export default function App() {
   const [createdChannelId, setCreatedChannelId] = useState<string | null>(null);
   const [chanAppKey, setChanAppKey] = useState('');
   const [chanAppSecret, setChanAppSecret] = useState('');
-  const [chanAgentId, setChanAgentId] = useState('');
   const [chanShowTools, setChanShowTools] = useState(false);
   const [chanShowThinking, setChanShowThinking] = useState(false);
   const [editingChannelItem, setEditingChannelItem] = useState<ForwardChannel | null>(null);
@@ -2266,31 +2537,26 @@ export default function App() {
     return { ...page, data: chronologicalData };
   }, [ctx]);
 
-  const loadResources = useCallback(async (nextType = resourceType, updateActiveList = true) => {
+  // Template binding pickers use the registry endpoint, matching the console tabs.
+  const loadRegisteredResources = useCallback(async (nextType = resourceType) => {
     if (!ctx) return;
     setError('');
     try {
       const page = await listResources(ctx, nextType);
-      let data = page.data;
-      // The Forward /resources endpoint may not echo a usable display name for skills,
-      // causing the UI to fall back to the raw skill_ id. Enrich with the authoritative
-      // name from the Cloud Skills API (best-effort) so the user-given name is shown.
-      if (nextType === 'skill') {
-        try {
-          const cloud = await listCloudSkills(ctx);
-          const nameMap = new Map(
-            cloud.data.map((s) => [s.id, s.display_title || s.name]),
-          );
-          data = data.map((r) => {
-            const cloudName = nameMap.get(r.id);
-            return cloudName ? { ...r, name: r.name || cloudName } : r;
-          });
-        } catch {
-          // Enrichment is best-effort; keep the raw Forward resource list on failure.
-        }
-      }
-      setResourceOptionsByType((prev) => ({ ...prev, [nextType]: data }));
-      if (updateActiveList || nextType === resourceType) setResources(data);
+      setResourceOptionsByType((prev) => ({ ...prev, [nextType]: page.data }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [ctx, resourceType]);
+
+  // Resource-management pages use the type-specific lifecycle endpoints
+  // (/skills, /files, /environments, /vaults), just like cloud-agents-web.
+  const loadManagedResources = useCallback(async (nextType = resourceType) => {
+    if (!ctx) return;
+    setError('');
+    try {
+      const page = await listResourceCatalog(ctx, nextType);
+      setResources(page.data);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -2299,9 +2565,9 @@ export default function App() {
   // Load skill resources when viewing a template
   useEffect(() => {
     if (viewingTemplate && ctx && resourceOptionsByType.skill.length === 0) {
-      void loadResources('skill', false);
+      void loadRegisteredResources('skill');
     }
-  }, [viewingTemplate, ctx, resourceOptionsByType.skill.length, loadResources]);
+  }, [viewingTemplate, ctx, resourceOptionsByType.skill.length, loadRegisteredResources]);
 
   const loadSchedules = useCallback(async () => {
     if (!ctx || !identity) return;
@@ -2542,6 +2808,10 @@ export default function App() {
   // Step 2 QR: create channel + generate QR code
   const handleCreateChannelAndQr = useCallback(async () => {
     if (!ctx || !identity || !chanName.trim()) return;
+    if (channels.filter((channel) => channel.channel_type === chanType).length >= CHANNEL_MAX_COUNTS[chanType]) {
+      setError(`${CHANNEL_TYPES.find((item) => item.value === chanType)?.label || chanType}渠道最多可创建 ${CHANNEL_MAX_COUNTS[chanType]} 个`);
+      return;
+    }
     const effectiveTemplateId = chanTemplateId || templates[0]?.id;
     if (!effectiveTemplateId) return;
     setLoading(true);
@@ -2568,11 +2838,15 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [ctx, identity, chanName, chanTemplateId, chanType, chanShowTools, chanShowThinking, templates, startQrSession]);
+  }, [channels, ctx, identity, chanName, chanTemplateId, chanType, chanShowTools, chanShowThinking, templates, startQrSession]);
 
   const handleSaveCredentials = useCallback(async () => {
     if (!ctx || !identity) return;
     if (!chanAppKey.trim() || !chanAppSecret.trim()) return;
+    if (channels.filter((channel) => channel.channel_type === chanType).length >= CHANNEL_MAX_COUNTS[chanType]) {
+      setError(`${CHANNEL_TYPES.find((item) => item.value === chanType)?.label || chanType}渠道最多可创建 ${CHANNEL_MAX_COUNTS[chanType]} 个`);
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -2596,13 +2870,12 @@ export default function App() {
       setChanName('');
       setChanAppKey('');
       setChanAppSecret('');
-      setChanAgentId('');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [ctx, identity, chanTemplateId, chanType, chanName, chanAppKey, chanAppSecret, chanAgentId, chanShowTools, chanShowThinking, loadChannels]);
+  }, [channels, ctx, identity, chanTemplateId, chanType, chanName, chanAppKey, chanAppSecret, chanShowTools, chanShowThinking, loadChannels]);
 
   const handleRebindChannel = useCallback(async (channel: ForwardChannel) => {
     if (!ctx) return;
@@ -2701,23 +2974,25 @@ export default function App() {
       setQrSession(null);
       setChanAppKey('');
       setChanAppSecret('');
-      setChanAgentId('');
       await loadChannels();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [ctx, editingChannelItem, chanMode, chanAppKey, chanAppSecret, chanAgentId, loadChannels, stopQrPolling]);
+  }, [ctx, editingChannelItem, chanMode, chanAppKey, chanAppSecret, loadChannels, stopQrPolling]);
 
   const loadTemplateResourceOptions = useCallback(async () => {
-    await Promise.all(TEMPLATE_RESOURCE_TYPES.map((type) => loadResources(type, false)));
-  }, [loadResources]);
+    await Promise.all(TEMPLATE_RESOURCE_TYPES.map((type) => loadRegisteredResources(type)));
+  }, [loadRegisteredResources]);
 
   const openTemplateModal = useCallback(() => {
     setEditingTemplateId(null);
     setTemplateName('');
     setTemplateDescription('');
+    setTemplateModel('ultimate');
+    setTemplateModelEffort('');
+    setTemplateContextWindow('');
     setTemplateSystem('');
     setEnvironmentId('');
     setSkillIdsText('');
@@ -2725,6 +3000,8 @@ export default function App() {
     setVaultIdsText('');
     setEnvVarsText('');
     setSelectedTools([...BUILTIN_TOOLS]);
+    setToolApproval({ defaultPolicy: 'always_allow', toolPolicies: {} });
+    setBrowserUseEnabled(false);
     setToolsJson('');
     setMcpServersJson('');
     setMultiagentEnabled(false);
@@ -2740,7 +3017,10 @@ export default function App() {
     setEditingTemplateId(template.id);
     setTemplateName(template.name || '');
     setTemplateDescription(template.description || '');
-    setTemplateModel(getTemplateModelId(template.model) || 'ultimate');
+    const modelConfig = parseTemplateModel(template.model);
+    setTemplateModel(modelConfig.id || 'ultimate');
+    setTemplateModelEffort(modelConfig.effort || '');
+    setTemplateContextWindow(modelConfig.contextWindow ? String(modelConfig.contextWindow) : '');
     setTemplateSystem(template.system || '');
     setEnvironmentId(template.environment_id || '');
     // Skills → skill IDs
@@ -2752,7 +3032,7 @@ export default function App() {
         : '',
     );
     // Vaults
-    setVaultIdsText((template.vault_ids ?? []).join('\n'));
+    setVaultIdsText(parseTemplateBindingIds(template.vaults ?? template.vault_ids).join('\n'));
     // Environment variables → KEY=value lines
     setEnvVarsText(
       template.environment_variables && typeof template.environment_variables === 'object'
@@ -2763,10 +3043,17 @@ export default function App() {
     );
     // Builtin tools → checkboxes; non-builtin tool entries preserved via toolsJson
     setSelectedTools(extractBuiltinToolNames(template.tools));
+    setToolApproval(extractToolApproval(template.tools));
+    setBrowserUseEnabled(
+      Array.isArray(template.tools)
+      && template.tools.some((tool) => !!tool && typeof tool === 'object' && (tool as Record<string, unknown>).type === 'browser_toolset_20260714'),
+    );
     const nonBuiltinTools = Array.isArray(template.tools)
       ? template.tools.filter((tool) => {
           if (!tool || typeof tool !== 'object') return false;
-          return (tool as Record<string, unknown>).type !== 'agent_toolset_20260401';
+          const type = (tool as Record<string, unknown>).type;
+          return !(typeof type === 'string' && type.startsWith('agent_toolset_'))
+            && type !== 'browser_toolset_20260714';
         })
       : [];
     setToolsJson(nonBuiltinTools.length > 0 ? JSON.stringify(nonBuiltinTools, null, 2) : '');
@@ -2822,7 +3109,7 @@ export default function App() {
       const nextTemplateId = templateExists ? lastTemplateId! : (templatePage.data[0]?.id ?? '');
 
       setTemplateId(nextTemplateId);
-      void loadResources(resourceType);
+      void loadManagedResources(resourceType);
       if (nextTemplateId) {
         const sessionPage = await listSessions(ctx, nextIdentity.id, nextTemplateId);
         setSessions(sessionPage.data);
@@ -2835,26 +3122,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [apiEnvironment, ctx, externalId, loadModels, loadResources, resourceType]);
-
-  const registerCurrentResource = useCallback(async () => {
-    if (!ctx || !resourceId.trim()) return;
-    setLoading(true);
-    setError('');
-    try {
-      const resource = await registerResource(ctx, resourceType, resourceId.trim());
-      setResources((prev) => [resource, ...prev.filter((item) => item.id !== resource.id)]);
-      setResourceOptionsByType((prev) => ({
-        ...prev,
-        [resource.type]: [resource, ...prev[resource.type].filter((item) => item.id !== resource.id)],
-      }));
-      setResourceId('');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [ctx, resourceId, resourceType]);
+  }, [apiEnvironment, ctx, externalId, loadManagedResources, loadModels, resourceType]);
 
   const handleCreateEnvironment = useCallback(async () => {
     if (!ctx || !newEnvName.trim()) return;
@@ -2866,8 +3134,7 @@ export default function App() {
         description: newEnvDescription.trim() || undefined,
         networking: newEnvNetworking,
       });
-      await registerResource(ctx, 'environment', env.id, env.name);
-      await loadResources('environment', true);
+      await loadRegisteredResources('environment');
       setEnvironmentId(env.id);
       setNewEnvName('');
       setNewEnvDescription('');
@@ -2878,7 +3145,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [ctx, newEnvName, newEnvDescription, newEnvNetworking, loadResources]);
+  }, [ctx, newEnvName, newEnvDescription, newEnvNetworking, loadRegisteredResources]);
 
   const activeResourceType = resourceTypeForPanel(activePanel) ?? 'skill';
   const activeResourceLabel = RESOURCE_TYPE_LABELS[activeResourceType];
@@ -2890,38 +3157,30 @@ export default function App() {
     try {
       const name = newResName.trim();
       const desc = newResDesc.trim();
-      let createdId = '';
-
       switch (activeResourceType) {
         case 'environment': {
-          const env = await createCloudEnvironment(ctx, { name, description: desc, networking: newResNetworking });
-          createdId = env.id;
+          await createCloudEnvironment(ctx, { name, description: desc, networking: newResNetworking });
           break;
         }
         case 'vault': {
-          const vault = await createCloudVault(ctx, { display_name: name });
-          createdId = vault.id;
+          await createCloudVault(ctx, { display_name: name });
           break;
         }
         case 'skill': {
           if (!newResFile) throw new Error('请选择技能文件（.zip 格式，包含 SKILL.md）');
-          const skill = await uploadCloudSkill(ctx, { name, description: desc || undefined, file: newResFile });
-          createdId = skill.id;
+          await uploadCloudSkill(ctx, { name, description: desc || undefined, file: newResFile });
           break;
         }
         case 'file': {
           if (!newResFile) throw new Error('请选择要上传的文件');
-          const file = await uploadCloudFile(ctx, { file: newResFile, name });
-          createdId = file.id;
+          await uploadCloudFile(ctx, { file: newResFile, name, purpose: 'user_upload' });
           break;
         }
         default:
           throw new Error('暂不支持创建此类型资源');
       }
 
-      // Auto-register with Forward
-      await registerResource(ctx, activeResourceType, createdId, name);
-      await loadResources(activeResourceType);
+      await loadManagedResources(activeResourceType);
       setShowCreateResourceModal(false);
       setNewResName('');
       setNewResDesc('');
@@ -2932,7 +3191,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [ctx, newResName, newResDesc, newResNetworking, newResFile, activeResourceType, loadResources]);
+  }, [ctx, newResName, newResDesc, newResNetworking, newResFile, activeResourceType, loadManagedResources]);
 
   const handleDeleteResource = useCallback(async () => {
     if (!ctx || !deleteConfirmResource) return;
@@ -2941,31 +3200,21 @@ export default function App() {
     setLoading(true);
     setError('');
     try {
-      // Try Forward API delete first (handles both CAS + registry)
-      try {
-        await deleteForwardResource(ctx, resource.id);
-      } catch (err) {
-        // Fallback: delete via Cloud API directly if Forward DELETE not available
-        if (err instanceof ForwardApiError && err.status === 404) {
-          switch (resource.type) {
-            case 'skill': await deleteCloudSkill(ctx, resource.id); break;
-            case 'file': await deleteCloudFile(ctx, resource.id); break;
-            case 'environment': await deleteCloudEnvironment(ctx, resource.id); break;
-            case 'vault': await deleteCloudVault(ctx, resource.id); break;
-            default: throw err;
-          }
-        } else {
-          throw err;
-        }
+      switch (resource.type) {
+        case 'skill': await deleteCloudSkill(ctx, resource.id); break;
+        case 'file': await deleteForwardFile(ctx, resource.id); break;
+        case 'environment': await deleteCloudEnvironment(ctx, resource.id); break;
+        case 'vault': await deleteCloudVault(ctx, resource.id); break;
+        default: throw new Error('暂不支持删除此类型资源');
       }
-      await loadResources(resource.type);
+      await loadManagedResources(resource.type);
       setViewingResource(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [ctx, deleteConfirmResource, loadResources]);
+  }, [ctx, deleteConfirmResource, loadManagedResources]);
 
   const openEditModal = useCallback((resource: ForwardResource) => {
     setEditingResource(resource);
@@ -3013,13 +3262,14 @@ export default function App() {
           });
           break;
         case 'vault':
-          // Vault display_name update not supported via Cloud API
-          // Credential management handled separately
+          await updateCloudVault(ctx, editingResource.id, {
+            ...(name ? { display_name: name } : {}),
+          });
           break;
         default:
           throw new Error('暂不支持编辑此类型资源');
       }
-      await loadResources(editingResource.type);
+      await loadManagedResources(editingResource.type);
       setEditingResource(null);
       setViewingResource(null);
     } catch (err) {
@@ -3027,23 +3277,30 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [ctx, editingResource, editName, editDesc, editNetworking, loadResources]);
+  }, [ctx, editingResource, editName, editDesc, editNetworking, loadManagedResources]);
 
   const buildTemplateInput = useCallback(() => {
     const explicitTools = parseJsonArray(toolsJson, '工具 JSON');
-    const tools = explicitTools.length > 0
-      ? explicitTools
-      : selectedTools.length > 0
-        ? [buildToolsetEntry(selectedTools)]
-        : [];
+    const mcpServers = parseJsonArray(mcpServersJson, 'MCP 服务 JSON');
+    const mcpNames = mcpServers
+      .map((server) => server && typeof server === 'object' ? (server as Record<string, unknown>).name : undefined)
+      .filter((name): name is string => typeof name === 'string' && !!name.trim());
+    if (new Set(mcpNames).size !== mcpNames.length) throw new Error('MCP 名称不能重复');
+    const tools = [
+      ...(selectedTools.length > 0 ? [buildToolsetEntry(selectedTools, toolApproval)] : []),
+      ...(browserUseEnabled ? [{ type: 'browser_toolset_20260714' }] : []),
+      ...explicitTools,
+    ];
     const fileIds = splitTokens(fileIdsText);
     // Toolset prerequisite: multiagent only takes effect when the tools array
     // contains an agent_toolset_20260401 entry. The UI also gates on this, but
     // buildTemplateInput double-checks so a saved template never has a
     // multiagent block without a toolset.
-    const hasToolset = tools.some(
-      (t) => t && typeof t === 'object' && (t as Record<string, unknown>).type === 'agent_toolset_20260401',
-    );
+    const hasToolset = tools.some((tool) => {
+      if (!tool || typeof tool !== 'object') return false;
+      const type = (tool as Record<string, unknown>).type;
+      return typeof type === 'string' && type.startsWith('agent_toolset_');
+    });
     const rosterAgents: MultiagentAgentEntry[] = multiagentSelectedAgentIds
       .map((id) => {
         const agent = managedAgents.find((a) => a.id === id);
@@ -3063,19 +3320,25 @@ export default function App() {
     return {
       name: templateName,
       description: templateDescription,
-      model: templateModel,
+      model: buildTemplateModel(
+        templateModel,
+        templateModelEffort || undefined,
+        templateContextWindow ? Number(templateContextWindow) : undefined,
+      ),
       system: templateSystem,
       environment_id: environmentId,
-      vault_ids: splitTokens(vaultIdsText),
+      vault_ids: buildTemplateBindings(splitTokens(vaultIdsText)),
       skills: splitTokens(skillIdsText).map((skillId) => ({ type: 'custom', skill_id: skillId })),
-      files: Object.fromEntries(fileIds.map((fileId) => [fileId, {}])),
+      files: buildTemplateBindings(fileIds),
       environment_variables: parseEnvironmentVariables(envVarsText),
       tools,
-      mcp_servers: parseJsonArray(mcpServersJson, 'MCP 服务 JSON'),
+      mcp_servers: mcpServers,
       multiagent,
     };
   }, [
     selectedTools,
+    toolApproval,
+    browserUseEnabled,
     environmentId,
     envVarsText,
     fileIdsText,
@@ -3087,6 +3350,8 @@ export default function App() {
     skillIdsText,
     templateDescription,
     templateModel,
+    templateModelEffort,
+    templateContextWindow,
     templateName,
     templateSystem,
     toolsJson,
@@ -3098,9 +3363,11 @@ export default function App() {
   const toolsetConfigured = useMemo(() => {
     if (selectedTools.length > 0) return true;
     try {
-      return parseJsonArray(toolsJson, '').some(
-        (t) => t && typeof t === 'object' && (t as Record<string, unknown>).type === 'agent_toolset_20260401',
-      );
+      return parseJsonArray(toolsJson, '').some((tool) => {
+        if (!tool || typeof tool !== 'object') return false;
+        const type = (tool as Record<string, unknown>).type;
+        return typeof type === 'string' && type.startsWith('agent_toolset_');
+      });
     } catch { return false; }
   }, [selectedTools, toolsJson]);
 
@@ -3115,6 +3382,7 @@ export default function App() {
       await refreshSessions(identity, template.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      throw err;
     } finally {
       setLoading(false);
     }
@@ -3134,6 +3402,43 @@ export default function App() {
       setLoading(false);
     }
   }, [buildTemplateInput, ctx, editingTemplateId]);
+
+  const handleCloneTemplate = useCallback(async (template: ForwardTemplate) => {
+    if (!ctx) return;
+    setTemplateActionLoading(template.id);
+    setError('');
+    try {
+      const cloned = await cloneTemplate(ctx, template.id);
+      setTemplates((prev) => [cloned, ...prev]);
+      setViewingTemplate(cloned);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTemplateActionLoading(null);
+    }
+  }, [ctx]);
+
+  const handleArchiveTemplate = useCallback(async (template: ForwardTemplate) => {
+    if (!ctx || !window.confirm(`确定归档模板「${template.name || template.id}」吗？`)) return;
+    setTemplateActionLoading(template.id);
+    setError('');
+    try {
+      await archiveTemplate(ctx, template.id);
+      const remaining = templates.filter((item) => item.id !== template.id);
+      setTemplates(remaining);
+      if (templateId === template.id) {
+        setTemplateId(remaining[0]?.id ?? '');
+        currentSessionIdRef.current = '';
+        setCurrentSessionId('');
+        setEvents([]);
+      }
+      setViewingTemplate(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTemplateActionLoading(null);
+    }
+  }, [ctx, templateId, templates]);
 
   const selectSession = useCallback(async (sessionId: string) => {
     setActivePanel('chat');
@@ -3186,7 +3491,6 @@ export default function App() {
     streamAbort.current?.abort();
     const controller = new AbortController();
     let pollTimer: number | undefined;
-    let reconnecting = false;
     // Track whether this session has spawned child threads (multiagent mode).
     // In multiagent mode, child thread_status_idle must NOT terminate the SSE
     // stream — only session.status_idle signals session-level completion.
@@ -3273,10 +3577,9 @@ export default function App() {
     controller.signal.addEventListener('abort', () => {
       cancelStreamFlush();
       stopPolling();
-      if (!reconnecting) setStreaming(false);
+      setStreaming(false);
     }, { once: true });
     pollTimer = window.setInterval(() => {
-      if (reconnecting) return; // Skip polling during reconnection
       void syncLatestEvents().catch((err) => {
         if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err));
       });
@@ -3389,39 +3692,11 @@ export default function App() {
           }
         }
 
-        // Auto-confirm tool calls when session enters requires_action
+        // A requires_action pause must be resolved explicitly by the user. Stop
+        // this SSE connection and let the approval/question panels drive the
+        // corresponding user event; their handlers reconnect the stream.
         if (event.type === 'session.status_idle') {
           const stopReason = (event as unknown as { stop_reason?: { type?: string; event_ids?: string[] } }).stop_reason;
-          if (stopReason?.type === 'requires_action' && stopReason.event_ids?.length && ctx) {
-            reconnecting = true; // Prevent .then() from interfering
-            // Automatically allow all pending tool confirmations, then reconnect stream
-            const confirmAndReconnect = async () => {
-              for (const toolEventId of stopReason.event_ids!) {
-                await fetch('/api/forward/request', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    pat: ctx.pat,
-                    environment: (ctx as unknown as { environment?: string }).environment || 'cn-prod',
-                    method: 'POST',
-                    path: `/sessions/${encodeURIComponent(sessionId)}/events`,
-                    body: { events: [{ type: 'user.tool_confirmation', tool_use_id: toolEventId, result: 'allow' }] },
-                    idempotencyKey: `fw-confirm-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-                  }),
-                }).catch(() => { /* ignore */ });
-              }
-              // Wait then reconnect stream to get new events
-              await new Promise((r) => setTimeout(r, 800));
-              // Reconnect using the last event id, preserving multiagent tracking
-              startStreamRef.current?.(sessionId, event.id, undefined, hasMultiagentThreads);
-            };
-            void confirmAndReconnect();
-            return; // Don't check isTerminal - we're handling reconnection
-          }
-          // requires_action but nothing actionable to confirm (empty event_ids or
-          // missing ctx): end the turn instead of hanging, because isTerminalSessionEvent
-          // treats requires_action as non-terminal and the upstream keeps the SSE alive
-          // with heartbeats until its ~10min timeout.
           if (stopReason?.type === 'requires_action') {
             finishStream();
             void mergeSessionEvents(sessionId);
@@ -3438,17 +3713,14 @@ export default function App() {
       controller.signal,
       lastEventId,
     ).then(() => {
-      // Don't interfere if we're reconnecting due to requires_action
-      if (reconnecting) return;
       if (!controller.signal.aborted) {
         void syncLatestEvents().catch((err) => {
           if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err));
         });
       }
     }).catch((err) => {
-      if (!controller.signal.aborted && !reconnecting) setError(err instanceof Error ? err.message : String(err));
+      if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err));
     }).finally(() => {
-      if (reconnecting) return;
       // Once the SSE stream ends (server closed it on a terminal event, or we aborted
       // locally), always clear the streaming flag for the current turn so the composer
       // is never left permanently disabled.
@@ -3462,6 +3734,95 @@ export default function App() {
   useEffect(() => {
     startStreamRef.current = startStream;
   }, [startStream]);
+
+  const pendingToolApprovals = useMemo(() => derivePendingToolApprovals(events), [events]);
+  const pendingQuestion = useMemo(() => derivePendingQuestion(events), [events]);
+
+  const resumeAfterInteractiveAction = useCallback((sessionId: string, responseEvents: ForwardEvent[]) => {
+    const startedAt = new Date().toISOString();
+    setEvents((prev) => mergeIncomingEvents(prev, responseEvents));
+    startStream(
+      sessionId,
+      lastRemoteEventId(responseEvents),
+      startedAt,
+      multiagentSessionsRef.current.has(sessionId),
+    );
+  }, [startStream]);
+
+  const resolveToolApproval = useCallback(async (
+    approval: PendingToolApproval,
+    result: 'allow' | 'deny',
+  ) => {
+    if (!ctx || !currentSessionId) return;
+    setChatActionLoading(approval.toolUseId);
+    setError('');
+    try {
+      const response = await sendToolConfirmation(ctx, currentSessionId, approval.toolUseId, result);
+      const responseEvents = response.data ?? [];
+      const hasConfirmation = responseEvents.some(
+        (event) => event.type === 'user.tool_confirmation' && event.tool_use_id === approval.toolUseId,
+      );
+      resumeAfterInteractiveAction(currentSessionId, hasConfirmation ? responseEvents : [
+        ...responseEvents,
+        {
+          id: `local-confirmation-${approval.toolUseId}-${Date.now()}`,
+          type: 'user.tool_confirmation',
+          session_id: currentSessionId,
+          tool_use_id: approval.toolUseId,
+          result,
+          created_at: new Date().toISOString(),
+        },
+      ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setChatActionLoading(null);
+    }
+  }, [ctx, currentSessionId, resumeAfterInteractiveAction]);
+
+  const answerPendingQuestion = useCallback(async (answers: string[][], dismissed = false) => {
+    if (!ctx || !currentSessionId || !pendingQuestion) return;
+    setChatActionLoading(pendingQuestion.questionUseId);
+    setError('');
+    try {
+      const response = pendingQuestion.viaCustomTool
+        ? await sendCustomToolResult(
+            ctx,
+            currentSessionId,
+            pendingQuestion.questionUseId,
+            encodeQuestionAnswers(pendingQuestion.questions, answers, dismissed),
+          )
+        : await sendQuestionAnswer(
+            ctx,
+            currentSessionId,
+            pendingQuestion.questionUseId,
+            answers,
+            dismissed,
+          );
+      const responseEvents = response.data ?? [];
+      const resolved = responseEvents.some((event) => (
+        pendingQuestion.viaCustomTool
+          ? event.type === 'user.custom_tool_result' && event.custom_tool_use_id === pendingQuestion.questionUseId
+          : event.type === 'user.question_answer' && event.question_use_id === pendingQuestion.questionUseId
+      ));
+      resumeAfterInteractiveAction(currentSessionId, resolved ? responseEvents : [
+        ...responseEvents,
+        {
+          id: `local-question-answer-${pendingQuestion.questionUseId}-${Date.now()}`,
+          type: pendingQuestion.viaCustomTool ? 'user.custom_tool_result' : 'user.question_answer',
+          session_id: currentSessionId,
+          ...(pendingQuestion.viaCustomTool
+            ? { custom_tool_use_id: pendingQuestion.questionUseId }
+            : { question_use_id: pendingQuestion.questionUseId, ...(dismissed ? { dismissed: true } : { answers }) }),
+          created_at: new Date().toISOString(),
+        },
+      ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setChatActionLoading(null);
+    }
+  }, [ctx, currentSessionId, pendingQuestion, resumeAfterInteractiveAction]);
 
   const send = useCallback(async () => {
     const text = input.trim();
@@ -3657,13 +4018,29 @@ export default function App() {
   );
   const attachmentsBusy = attachments.some((a) => a.status !== 'done');
   const canSendMessage = Boolean(
-    identity && templateId && !attachmentsBusy && (input.trim() || attachments.length > 0),
+    identity
+    && templateId
+    && !attachmentsBusy
+    && pendingToolApprovals.length === 0
+    && !pendingQuestion
+    && (input.trim() || attachments.length > 0),
   );
   const displayName = externalId || identity?.external_id || identity?.id || 'Forward 用户';
   const selectedSkillIds = splitTokens(skillIdsText);
   const selectedFileIds = splitTokens(fileIdsText);
   const selectedVaultIds = splitTokens(vaultIdsText);
   const environmentOptions = resourceOptionsByType.environment;
+  const filteredTemplates = useMemo(() => {
+    const query = templateSearch.trim().toLowerCase();
+    if (!query) return templates;
+    return templates.filter((template) => (
+      template.name?.toLowerCase().includes(query) || template.id.toLowerCase().includes(query)
+    ));
+  }, [templateSearch, templates]);
+  const availableChannelTypes = useMemo(() => {
+    const allowed = new Set(channelTypesForEnvironment(apiEnvironment));
+    return CHANNEL_TYPES.filter((type) => allowed.has(type.value));
+  }, [apiEnvironment]);
   const addSelection = (id: string, setter: Dispatch<SetStateAction<string>>) => {
     setter((prev) => splitTokens(`${prev}\n${id}`).join('\n'));
   };
@@ -3803,7 +4180,7 @@ export default function App() {
                       if (nextType && nextType !== 'memory_store') {
                         setResourceType(nextType);
                         setResources([]);
-                        void loadResources(nextType);
+                        void loadManagedResources(nextType);
                       }
                       if (id === 'memoryStores') {
                         // Default to the template used by the active chat session so the
@@ -3849,7 +4226,7 @@ export default function App() {
                       if (nextType && nextType !== 'memory_store') {
                         setResourceType(nextType);
                         setResources([]);
-                        void loadResources(nextType);
+                        void loadManagedResources(nextType);
                       }
                       if (id === 'memoryStores') {
                         // Default to the template used by the active chat session so the
@@ -3878,7 +4255,7 @@ export default function App() {
                       if (nextType) {
                         setResourceType(nextType);
                         setResources([]);
-                        void loadResources(nextType);
+                        void loadManagedResources(nextType);
                       }
                     }}
                     className={`flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-sm transition ${
@@ -4169,7 +4546,7 @@ export default function App() {
               </div>
               <div className="mt-4 flex items-center justify-end gap-2">
                 <button
-                  onClick={() => { stopQrPolling(); setQrSession(null); setChanAppKey(''); setChanAppSecret(''); setChanAgentId(''); setChanMode(chan.binding_status === 'bound' ? 'qr' : 'qr'); setEditingChannelItem({ ...chan }); }}
+                  onClick={() => { stopQrPolling(); setQrSession(null); setChanAppKey(''); setChanAppSecret(''); setChanMode(CHANNEL_TYPES.find((item) => item.value === chan.channel_type)?.qrSupport ? 'qr' : 'manual'); setEditingChannelItem({ ...chan }); }}
                   className="flex h-7 w-7 items-center justify-center rounded-lg text-black/30 transition hover:bg-[#F4F6FC] hover:text-[#3550FF]"
                   title="配置"
                 >
@@ -4192,7 +4569,7 @@ export default function App() {
             <div className="text-sm font-medium text-black/60">暂无 IM 渠道</div>
             <div className="mt-1 text-xs text-black/35">连接微信、钉钉、飞书等平台，让 AI 自动回复用户消息</div>
             <button
-              onClick={() => { stopQrPolling(); setChanName(''); setChanType('wechat'); setChanMode('qr'); setChanTemplateId(templateId || templates[0]?.id || ''); setQrSession(null); setCreatedChannelId(null); setChannelStep('config'); setChanAppKey(''); setChanAppSecret(''); setChanAgentId(''); setShowChannelModal(true); }}
+              onClick={() => { stopQrPolling(); setChanName(''); setChanType('wechat'); setChanMode('qr'); setChanTemplateId(templateId || templates[0]?.id || ''); setQrSession(null); setCreatedChannelId(null); setChannelStep('config'); setChanAppKey(''); setChanAppSecret(''); setShowChannelModal(true); }}
               disabled={templates.length === 0}
               className="mt-4 rounded-full bg-[#3550FF] px-4 py-2 text-xs font-medium text-white transition hover:bg-[#2a42e0] disabled:opacity-50"
             >
@@ -4225,6 +4602,12 @@ export default function App() {
                       </button>
                     </div>
                     <div className="flex items-center gap-3">
+                      <input
+                        value={templateSearch}
+                        onChange={(event) => setTemplateSearch(event.target.value)}
+                        placeholder="搜索模板名或 ID"
+                        className="h-9 w-52 rounded-full border border-[#DDE2F2] bg-white px-3.5 text-xs outline-none focus:border-[#3550FF]"
+                      />
                       <span className="text-sm text-black/40">{templates.length} 个模板</span>
                       {developerMode && (
                         <button
@@ -4240,7 +4623,7 @@ export default function App() {
                 </div>
 
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {templates.map((template) => {
+                {filteredTemplates.map((template) => {
                   const isActive = templateId === template.id;
                   const tools = extractToolNames(template.tools);
                   const mcpNames = extractMcpNames(template.mcp_servers);
@@ -4251,8 +4634,8 @@ export default function App() {
                       key={template.id}
                       onClick={() => {
                         setViewingTemplate(template);
-                        void loadResources('environment', false);
-                        void loadResources('skill', false);
+                        void loadRegisteredResources('environment');
+                        void loadRegisteredResources('skill');
                       }}
                       className={`group rounded-2xl border bg-white p-5 text-left transition hover:shadow-md ${
                         isActive ? 'border-[#3550FF] ring-1 ring-[#3550FF]/10' : 'border-[#DDE2F2] hover:border-[#B8C3FF]'
@@ -4425,7 +4808,7 @@ export default function App() {
                       {`${activeResourceLabel}列表`}
                     </span>
                     <button
-                      onClick={() => void loadResources(activeResourceType)}
+                      onClick={() => void loadManagedResources(activeResourceType)}
                       className="flex h-7 w-7 items-center justify-center rounded-full text-black/50 transition hover:bg-white hover:shadow-sm"
                       aria-label={`刷新${activeResourceLabel}列表`}
                       title={`刷新${activeResourceLabel}列表`}
@@ -4445,14 +4828,6 @@ export default function App() {
                       className="rounded-full bg-[#3550FF] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:opacity-50"
                     >
                       + 创建{activeResourceLabel}
-                    </button>
-                    <button
-                      onClick={() => setShowResourceModal(true)}
-                      disabled={!ctx || loading}
-                      className="rounded-full border border-[#DDE2F2] bg-white px-3 py-2 text-xs font-medium text-black/55 transition hover:bg-gray-50 disabled:opacity-50"
-                      title="注册一个已有的资源 ID"
-                    >
-                      注册已有
                     </button>
                   </div>
                 </div>
@@ -4505,18 +4880,12 @@ export default function App() {
                     </div>
                     <div className="text-sm font-medium text-black/60">暂无{activeResourceLabel}</div>
                     <div className="mt-1 text-xs text-black/35">创建一个新的{activeResourceLabel}开始使用</div>
-                    <div className="mt-4 flex justify-center gap-2">
+                    <div className="mt-4 flex justify-center">
                       <button
                         onClick={() => setShowCreateResourceModal(true)}
                         className="rounded-full bg-[#3550FF] px-4 py-2 text-xs font-medium text-white transition hover:bg-[#2a42e0]"
                       >
                         + 创建{activeResourceLabel}
-                      </button>
-                      <button
-                        onClick={() => setShowResourceModal(true)}
-                        className="rounded-full border border-[#DDE2F2] bg-white px-4 py-2 text-xs font-medium text-black/60 transition hover:bg-gray-50"
-                      >
-                        注册已有
                       </button>
                     </div>
                   </div>
@@ -4911,6 +5280,24 @@ export default function App() {
                 {events.length > 0 && (
                   <div className="shrink-0 px-8 pb-6 pt-2">
                     <div className="mx-auto max-w-[860px]">
+                      {(pendingToolApprovals.length > 0 || pendingQuestion) && (
+                        <div className="mb-3 space-y-3">
+                          <ToolApprovalPanel
+                            approvals={pendingToolApprovals}
+                            loadingId={chatActionLoading}
+                            onResolve={(approval, result) => void resolveToolApproval(approval, result)}
+                          />
+                          {pendingQuestion && (
+                            <QuestionPanel
+                              key={pendingQuestion.questionUseId}
+                              pending={pendingQuestion}
+                              loading={chatActionLoading === pendingQuestion.questionUseId}
+                              onSubmit={(answers) => void answerPendingQuestion(answers)}
+                              onDismiss={() => void answerPendingQuestion([], true)}
+                            />
+                          )}
+                        </div>
+                      )}
                       <div className="rounded-2xl border border-[#E5E7EB] bg-white px-4 py-3 shadow-[0_1px_3px_rgba(0,0,0,0.04)] transition focus-within:border-[#3550FF] focus-within:shadow-[0_0_0_3px_rgba(53,80,255,0.06)]">
                         <AttachmentChips attachments={attachments} onRemove={removeAttachment} onRetry={retryAttachment} />
                         <textarea
@@ -4924,7 +5311,9 @@ export default function App() {
                             }
                           }}
                           onPaste={handleComposerPaste}
-                          placeholder={canStopCurrentTurn ? 'Agent 正在回复中，请稍候...' : '继续对话... (Enter 发送)'}
+                          placeholder={pendingToolApprovals.length > 0 || pendingQuestion
+                            ? '请先处理上方待确认事项'
+                            : canStopCurrentTurn ? 'Agent 正在回复中，请稍候...' : '继续对话... (Enter 发送)'}
                           className="min-h-[24px] max-h-[140px] w-full resize-none bg-transparent text-[15px] leading-6 outline-none placeholder:text-black/30"
                           rows={1}
                         />
@@ -5052,16 +5441,16 @@ export default function App() {
                 <div className="space-y-4">
                   <div className="rounded-xl border border-[#EEF1F7] bg-[#FAFBFF] p-4">
                     <div className="text-sm">
-                      <div className="text-[11px] text-black/40">凭据库说明</div>
-                      <div className="mt-1 text-xs text-black/55">凭据库用于安全存储 API Token、密钥等敏感信息，可在模板中引用以自动注入 MCP 服务认证。</div>
+                      <div className="text-[11px] text-black/40">密钥库说明</div>
+                      <div className="mt-1 text-xs text-black/55">密钥库用于安全存储 API Token 等敏感信息，可在模板中引用以自动注入 MCP 服务认证。</div>
                     </div>
                   </div>
 
                   {/* Credentials section */}
                   <div>
                     <div className="mb-3 flex items-center justify-between">
-                      <span className="text-xs font-semibold text-black/50">凭据列表</span>
-                      <span className="text-[11px] text-black/35">{vaultCredentials.length} 个凭据</span>
+                      <span className="text-xs font-semibold text-black/50">密钥列表</span>
+                      <span className="text-[11px] text-black/35">{vaultCredentials.length} 个密钥</span>
                     </div>
 
                     {/* Existing credentials */}
@@ -5102,12 +5491,12 @@ export default function App() {
                       </div>
                     )}
                     {vaultCredentials.length === 0 && (
-                      <div className="rounded-xl bg-[#F8F9FF] px-4 py-4 text-center text-xs text-black/40">暂无凭据，请在下方添加</div>
+                      <div className="rounded-xl bg-[#F8F9FF] px-4 py-4 text-center text-xs text-black/40">暂无密钥，请在下方添加</div>
                     )}
 
                     {/* Add new credential */}
                     <div className="mt-3 rounded-xl border border-dashed border-[#DDE2F2] p-4">
-                      <div className="mb-3 text-xs font-medium text-black/50">添加新凭据</div>
+                      <div className="mb-3 text-xs font-medium text-black/50">添加新密钥</div>
 
                       {/* Credential type selector */}
                       <div className="mb-3 grid grid-cols-3 gap-1.5">
@@ -5228,7 +5617,7 @@ export default function App() {
                         }
                         className="flex h-9 w-full items-center justify-center rounded-xl bg-[#3550FF] text-xs font-medium text-white transition hover:bg-[#2a42e0] disabled:cursor-not-allowed disabled:opacity-40"
                       >
-                        添加凭据
+                        添加密钥
                       </button>
                     </div>
                   </div>
@@ -5247,7 +5636,7 @@ export default function App() {
 
             {/* Actions */}
             <div className="mt-6 flex items-center gap-3">
-              {(vr.type === 'environment' || vr.type === 'skill' || vr.type === 'file' || vr.type === 'vault') && (
+              {(vr.type === 'environment' || vr.type === 'skill' || vr.type === 'vault') && (
                 <button
                   onClick={() => openEditModal(vr)}
                   className="flex-1 rounded-full bg-[#3550FF] py-2.5 text-center text-sm font-medium text-white hover:bg-[#2a42e0]"
@@ -5288,7 +5677,7 @@ export default function App() {
       {/* Developer mode confirmation */}
       <Modal open={showDevModeConfirm} onClose={() => setShowDevModeConfirm(false)} title="开启开发者模式？">
         <div className="text-sm leading-relaxed text-black/70">
-          <p>开启后将解锁<strong className="text-black">模板</strong>与<strong className="text-black">模板资源（技能 / 文件 / 环境 / 凭据）</strong>的完整管理权限，你可以新建、修改和删除这些内容。</p>
+          <p>开启后将解锁<strong className="text-black">模板</strong>与<strong className="text-black">模板资源（技能 / 文件 / 环境 / 密钥）</strong>的完整管理权限，你可以新建、修改和删除这些内容。</p>
           <div className="mt-3 flex gap-2 rounded-xl border border-[#F5C6C6] bg-[#FEF2F2] px-3.5 py-3 text-[13px] leading-relaxed text-[#b42318]">
             <svg className="mt-0.5 h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" /></svg>
             <span>模板与资源由<strong>所有终端用户共享</strong>。你的任何新建、修改或删除都会<strong>立即对全体用户生效且不可撤销</strong>，请务必谨慎操作。</span>
@@ -5376,8 +5765,8 @@ export default function App() {
           {editingResource?.type === 'vault' && (
             <div className="space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-black/50">凭据管理</span>
-                <span className="text-[11px] text-black/35">{vaultCredentials.length} 个凭据</span>
+                <span className="text-xs font-semibold text-black/50">密钥管理</span>
+                <span className="text-[11px] text-black/35">{vaultCredentials.length} 个密钥</span>
               </div>
 
               {/* Existing credentials */}
@@ -5418,12 +5807,12 @@ export default function App() {
                 </div>
               )}
               {vaultCredentials.length === 0 && (
-                <div className="rounded-xl bg-[#F8F9FF] px-4 py-4 text-center text-xs text-black/40">暂无凭据，请在下方添加</div>
+                <div className="rounded-xl bg-[#F8F9FF] px-4 py-4 text-center text-xs text-black/40">暂无密钥，请在下方添加</div>
               )}
 
               {/* Add new credential */}
               <div className="rounded-xl border border-dashed border-[#DDE2F2] p-4">
-                <div className="mb-3 text-xs font-medium text-black/50">添加新凭据</div>
+                <div className="mb-3 text-xs font-medium text-black/50">添加新密钥</div>
 
                 {/* Credential type selector */}
                 <div className="mb-3 grid grid-cols-3 gap-1.5">
@@ -5544,7 +5933,7 @@ export default function App() {
                   }
                   className="flex h-9 w-full items-center justify-center rounded-xl bg-[#3550FF] text-xs font-medium text-white transition hover:bg-[#2a42e0] disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  添加凭据
+                  添加密钥
                 </button>
               </div>
             </div>
@@ -5586,12 +5975,12 @@ export default function App() {
           {/* Name field */}
           <label className="block">
             <span className="mb-1.5 block text-xs font-medium text-black/50">
-              {activeResourceType === 'vault' ? '凭据库名称' : activeResourceType === 'file' ? '文件名' : '名称'} <span className="text-red-400">*</span>
+              {activeResourceType === 'vault' ? '密钥库名称' : activeResourceType === 'file' ? '文件名' : '名称'} <span className="text-red-400">*</span>
             </span>
             <input
               value={newResName}
               onChange={(e) => setNewResName(e.target.value)}
-              placeholder={activeResourceType === 'skill' ? '例如：customer-reply-skill' : activeResourceType === 'file' ? '例如：config.yaml' : activeResourceType === 'vault' ? '例如：MCP 服务凭据' : '例如：开发环境'}
+              placeholder={activeResourceType === 'skill' ? '例如：customer-reply-skill' : activeResourceType === 'file' ? '例如：config.yaml' : activeResourceType === 'vault' ? '例如：MCP 服务密钥' : '例如：开发环境'}
               className="h-11 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none transition focus:border-[#3550FF] focus:shadow-[0_0_0_3px_rgba(53,80,255,0.08)]"
               autoFocus
             />
@@ -5665,7 +6054,7 @@ export default function App() {
           {/* Vault info */}
           {activeResourceType === 'vault' && (
             <div className="rounded-xl bg-[#FFFCF2] px-4 py-3 text-xs leading-relaxed text-amber-700">
-              💡 凭据库创建后，可在编辑页面添加 MCP 服务凭据（URL + Token）
+              💡 密钥库创建后，可在编辑页面添加 MCP 服务密钥（URL + Token）
             </div>
           )}
 
@@ -5701,6 +6090,7 @@ export default function App() {
           return { ...s, name: displayName };
         });
         const vtFiles = fileCount(vt.files);
+        const vtVaultIds = parseTemplateBindingIds(vt.vaults ?? vt.vault_ids);
         const vtEnvVars = vt.environment_variables && typeof vt.environment_variables === 'object'
           ? Object.entries(vt.environment_variables as Record<string, unknown>)
           : [];
@@ -5714,23 +6104,8 @@ export default function App() {
           for (const tool of vt.tools) {
             if (!tool || typeof tool !== 'object') continue;
             const r = tool as Record<string, unknown>;
-            if (r.type === 'agent_toolset_20260401') {
-              const names: string[] = [];
-              // From enabled_tools
-              if (Array.isArray(r.enabled_tools)) {
-                names.push(...r.enabled_tools.filter((t): t is string => typeof t === 'string'));
-              }
-              // From configs
-              if (Array.isArray(r.configs)) {
-                for (const config of r.configs) {
-                  if (config && typeof config === 'object') {
-                    const c = config as Record<string, unknown>;
-                    if (typeof c.name === 'string' && c.enabled !== false) {
-                      names.push(c.name);
-                    }
-                  }
-                }
-              }
+            if (typeof r.type === 'string' && r.type.startsWith('agent_toolset_')) {
+              const names = extractBuiltinToolNames([tool]);
               if (names.length > 0) builtinToolEntries.push({ type: '内置工具', names });
             } else if (r.type === 'mcp_toolset' && typeof r.mcp_server_name === 'string') {
               const names: string[] = [];
@@ -5896,7 +6271,7 @@ export default function App() {
               )}
 
               {/* Files + Vaults row */}
-              {(vtFiles > 0 || (vt.vault_ids && vt.vault_ids.length > 0)) && (
+              {(vtFiles > 0 || vtVaultIds.length > 0) && (
                 <div className="flex gap-4">
                   {vtFiles > 0 && (
                     <div className="flex-1 rounded-xl bg-[#FAFBFF] px-4 py-3">
@@ -5904,10 +6279,10 @@ export default function App() {
                       <div className="mt-1 text-sm font-medium">{vtFiles} 个</div>
                     </div>
                   )}
-                  {vt.vault_ids && vt.vault_ids.length > 0 && (
+                  {vtVaultIds.length > 0 && (
                     <div className="flex-1 rounded-xl bg-[#FAFBFF] px-4 py-3">
-                      <div className="text-[11px] text-black/40">凭据库</div>
-                      <div className="mt-1 text-sm font-medium">{vt.vault_ids.length} 个</div>
+                      <div className="text-[11px] text-black/40">密钥库</div>
+                      <div className="mt-1 text-sm font-medium">{vtVaultIds.length} 个</div>
                     </div>
                   )}
                 </div>
@@ -5942,12 +6317,28 @@ export default function App() {
                 {vtIsActive ? '当前使用中' : '使用此模板对话'}
               </button>
               {developerMode && (
-                <button
-                  onClick={() => openEditTemplateModal(vt)}
-                  className="rounded-full border border-[#DDE2F2] px-5 py-2.5 text-sm font-medium text-[#3550FF] transition hover:bg-[#F4F6FC]"
-                >
-                  编辑
-                </button>
+                <>
+                  <button
+                    onClick={() => openEditTemplateModal(vt)}
+                    className="rounded-full border border-[#DDE2F2] px-4 py-2.5 text-sm font-medium text-[#3550FF] transition hover:bg-[#F4F6FC]"
+                  >
+                    编辑
+                  </button>
+                  <button
+                    onClick={() => void handleCloneTemplate(vt)}
+                    disabled={templateActionLoading === vt.id}
+                    className="rounded-full border border-[#DDE2F2] px-4 py-2.5 text-sm font-medium text-black/60 transition hover:bg-[#F4F6FC] disabled:opacity-50"
+                  >
+                    复制
+                  </button>
+                  <button
+                    onClick={() => void handleArchiveTemplate(vt)}
+                    disabled={templateActionLoading === vt.id}
+                    className="rounded-full border border-red-100 px-4 py-2.5 text-sm font-medium text-red-500 transition hover:bg-red-50 disabled:opacity-50"
+                  >
+                    归档
+                  </button>
+                </>
               )}
               <button onClick={() => setViewingTemplate(null)} className="rounded-full border border-gray-200 px-5 py-2.5 text-sm text-black/60 hover:bg-gray-50">关闭</button>
             </div>
@@ -5991,7 +6382,13 @@ export default function App() {
                 ) : cloudModels.length > 0 ? (
                   <select
                     value={templateModel}
-                    onChange={(e) => setTemplateModel(e.target.value)}
+                    onChange={(e) => {
+                      const modelId = e.target.value;
+                      const model = cloudModels.find((item) => item.id === modelId);
+                      setTemplateModel(modelId);
+                      setTemplateModelEffort(model?.default_effort || '');
+                      setTemplateContextWindow(model?.default_context_window ? String(model.default_context_window) : '');
+                    }}
                     className="h-10 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none transition focus:border-[#3550FF]"
                   >
                     {cloudModels.map((m) => (
@@ -6021,6 +6418,43 @@ export default function App() {
                   <div className="mt-1 text-[11px] text-black/30">共 {cloudModels.length} 个可用模型</div>
                 )}
               </label>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-medium text-black/50">推理强度（可选）</span>
+                  {(() => {
+                    const selectedModel = cloudModels.find((model) => model.id === templateModel);
+                    return selectedModel?.efforts?.length ? (
+                      <select
+                        value={templateModelEffort}
+                        onChange={(event) => setTemplateModelEffort(event.target.value)}
+                        className="h-10 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none focus:border-[#3550FF]"
+                      >
+                        <option value="">使用模型默认值</option>
+                        {selectedModel.efforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+                      </select>
+                    ) : (
+                      <input
+                        value={templateModelEffort}
+                        onChange={(event) => setTemplateModelEffort(event.target.value)}
+                        placeholder="例如 high"
+                        className="h-10 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none focus:border-[#3550FF]"
+                      />
+                    );
+                  })()}
+                </label>
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-medium text-black/50">上下文窗口（可选）</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={templateContextWindow}
+                    onChange={(event) => setTemplateContextWindow(event.target.value)}
+                    placeholder="使用模型默认值"
+                    className="h-10 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none focus:border-[#3550FF]"
+                  />
+                </label>
+              </div>
               <label className="block">
                 <span className="mb-1.5 block text-xs font-medium text-black/50">系统提示词</span>
                 <textarea value={templateSystem} onChange={(e) => setTemplateSystem(e.target.value)} placeholder="设定 AI 的角色和行为规则..." className="min-h-[80px] w-full resize-none rounded-xl border border-[#E5E7EB] bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-[#3550FF] focus:shadow-[0_0_0_3px_rgba(53,80,255,0.08)]" />
@@ -6038,34 +6472,64 @@ export default function App() {
               resources={environmentOptions}
               selectedId={environmentId}
               onChange={setEnvironmentId}
-              onRefresh={() => void loadResources('environment', false)}
+              onRefresh={() => void loadRegisteredResources('environment')}
             />
             {!environmentId && <div className="mt-1.5 text-[11px] text-amber-600">模板必须关联一个运行环境</div>}
           </div>
           <details className="rounded-xl border border-[#E5E7EB] bg-white">
             <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-black/60 transition hover:text-black/80">高级配置（技能、文件、工具等）</summary>
             <div className="space-y-3 border-t border-[#E5E7EB] p-4">
-              <ResourceTokenSelect label="技能" placeholder="选择已注册技能" emptyText="暂无技能" resources={resourceOptionsByType.skill} selectedIds={selectedSkillIds} onAdd={(id) => addSelection(id, setSkillIdsText)} onRemove={(id) => removeSelection(id, setSkillIdsText)} onRefresh={() => void loadResources('skill', false)} />
-              <ResourceTokenSelect label="文件" placeholder="选择已注册文件" emptyText="暂无文件" resources={resourceOptionsByType.file} selectedIds={selectedFileIds} onAdd={(id) => addSelection(id, setFileIdsText)} onRemove={(id) => removeSelection(id, setFileIdsText)} onRefresh={() => void loadResources('file', false)} />
-              <ResourceTokenSelect label="凭据库" placeholder="选择已注册凭据库" emptyText="暂无凭据库" resources={resourceOptionsByType.vault} selectedIds={selectedVaultIds} onAdd={(id) => addSelection(id, setVaultIdsText)} onRemove={(id) => removeSelection(id, setVaultIdsText)} onRefresh={() => void loadResources('vault', false)} />
+              <ResourceTokenSelect label="技能" placeholder="选择已注册技能" emptyText="暂无技能" resources={resourceOptionsByType.skill} selectedIds={selectedSkillIds} onAdd={(id) => addSelection(id, setSkillIdsText)} onRemove={(id) => removeSelection(id, setSkillIdsText)} onRefresh={() => void loadRegisteredResources('skill')} />
+              <ResourceTokenSelect label="文件" placeholder="选择已注册文件" emptyText="暂无文件" resources={resourceOptionsByType.file} selectedIds={selectedFileIds} onAdd={(id) => addSelection(id, setFileIdsText)} onRemove={(id) => removeSelection(id, setFileIdsText)} onRefresh={() => void loadRegisteredResources('file')} />
+              <ResourceTokenSelect label="密钥库" placeholder="选择已注册密钥库" emptyText="暂无密钥库" resources={resourceOptionsByType.vault} selectedIds={selectedVaultIds} onAdd={(id) => addSelection(id, setVaultIdsText)} onRemove={(id) => removeSelection(id, setVaultIdsText)} onRefresh={() => void loadRegisteredResources('vault')} />
               <div className="block">
-                <span className="mb-1.5 block text-xs font-medium text-black/50">内置工具</span>
-                <div className="flex flex-wrap gap-1.5">
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <span className="text-xs font-medium text-black/50">内置工具与审批策略</span>
+                  <label className="flex items-center gap-2 text-[11px] text-black/45">
+                    默认策略
+                    <select
+                      value={toolApproval.defaultPolicy}
+                      onChange={(event) => setToolApproval({
+                        defaultPolicy: event.target.value as ToolPermissionPolicy,
+                        toolPolicies: {},
+                      })}
+                      className="h-7 rounded-lg border border-[#E5E7EB] bg-white px-2 text-[11px] outline-none focus:border-[#3550FF]"
+                    >
+                      <option value="always_allow">自动允许</option>
+                      <option value="always_ask">每次审批</option>
+                      <option value="always_deny">始终拒绝</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="space-y-1.5">
                   {BUILTIN_TOOLS.map((tool) => {
                     const isSelected = selectedTools.includes(tool);
+                    const policy = toolApproval.toolPolicies[tool] ?? toolApproval.defaultPolicy;
                     return (
-                      <button
-                        key={tool}
-                        type="button"
-                        onClick={() => setSelectedTools((prev) => isSelected ? prev.filter((t) => t !== tool) : [...prev, tool])}
-                        className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
-                          isSelected
-                            ? 'bg-[#3550FF] text-white shadow-sm'
-                            : 'bg-[#F4F6FC] text-black/55 hover:bg-[#E8EBF5]'
-                        }`}
-                      >
-                        {tool}
-                      </button>
+                      <div key={tool} className={`flex items-center gap-2 rounded-lg px-2.5 py-2 ${isSelected ? 'bg-[#F4F6FC]' : 'bg-[#FAFAFA] opacity-55'}`}>
+                        <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-xs font-medium text-black/65">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => setSelectedTools((prev) => isSelected ? prev.filter((name) => name !== tool) : [...prev, tool])}
+                            className="h-3.5 w-3.5 rounded border-[#D7DBEA] text-[#3550FF] focus:ring-[#3550FF]"
+                          />
+                          <span className="font-mono">{tool}</span>
+                        </label>
+                        <select
+                          value={policy}
+                          disabled={!isSelected}
+                          onChange={(event) => setToolApproval((prev) => ({
+                            ...prev,
+                            toolPolicies: { ...prev.toolPolicies, [tool]: event.target.value as ToolPermissionPolicy },
+                          }))}
+                          className="h-7 rounded-lg border border-[#E5E7EB] bg-white px-2 text-[11px] outline-none focus:border-[#3550FF] disabled:cursor-not-allowed"
+                        >
+                          <option value="always_allow">自动允许</option>
+                          <option value="always_ask">每次审批</option>
+                          <option value="always_deny">始终拒绝</option>
+                        </select>
+                      </div>
                     );
                   })}
                 </div>
@@ -6076,6 +6540,28 @@ export default function App() {
                   </div>
                 )}
               </div>
+              <label className="flex cursor-pointer items-center justify-between rounded-xl bg-[#F4F6FC] px-3 py-2.5">
+                <span>
+                  <span className="block text-xs font-medium text-black/60">BrowserUse（Beta）</span>
+                  <span className="mt-0.5 block text-[10px] text-black/35">让 Agent 操作云端浏览器；实际可用性取决于当前环境。</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={browserUseEnabled}
+                  onChange={(event) => setBrowserUseEnabled(event.target.checked)}
+                  className="h-4 w-4 rounded border-[#D7DBEA] text-[#3550FF] focus:ring-[#3550FF]"
+                />
+              </label>
+              <McpServerEditor value={mcpServersJson} onChange={setMcpServersJson} />
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-medium text-black/50">其他工具 JSON</span>
+                <textarea
+                  value={toolsJson}
+                  onChange={(event) => setToolsJson(event.target.value)}
+                  placeholder="自定义工具等非内置 Toolset 配置（JSON 数组）"
+                  className="min-h-[72px] w-full resize-y rounded-xl border border-[#E5E7EB] bg-white px-3.5 py-2.5 font-mono text-xs outline-none focus:border-[#3550FF]"
+                />
+              </label>
               <label className="block">
                 <span className="mb-1.5 block text-xs font-medium text-black/50">环境变量</span>
                 <textarea value={envVarsText} onChange={(e) => setEnvVarsText(e.target.value)} placeholder="每行 KEY=value" className="min-h-[60px] w-full resize-none rounded-xl border border-[#E5E7EB] bg-white px-3.5 py-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
@@ -6145,7 +6631,7 @@ export default function App() {
       </Modal>
 
       {/* Edit channel modal */}
-      <Modal open={!!editingChannelItem} onClose={() => { stopQrPolling(); setEditingChannelItem(null); setQrSession(null); setChanAppKey(''); setChanAppSecret(''); setChanAgentId(''); }} title="渠道配置">
+      <Modal open={!!editingChannelItem} onClose={() => { stopQrPolling(); setEditingChannelItem(null); setQrSession(null); setChanAppKey(''); setChanAppSecret(''); }} title="渠道配置">
         {editingChannelItem && (() => {
           const chanTypeInfo = CHANNEL_TYPES.find((c) => c.value === editingChannelItem.channel_type);
           const bindingStatusLabel = editingChannelItem.binding_status === 'bound' ? '已连接' : editingChannelItem.binding_status === 'expired' ? '已过期' : '未绑定';
@@ -6171,7 +6657,7 @@ export default function App() {
               </label>
 
               {/* Binding mode: QR or Manual */}
-              {chanTypeInfo?.qrSupport && (
+              {(chanTypeInfo?.qrSupport || chanTypeInfo?.manualSupport) && (
                 <div className="rounded-xl border border-[#E5E7EB] bg-[#FAFBFF] p-3">
                   <div className="mb-2 text-[11px] font-medium text-black/50">绑定方式</div>
                   <div className="grid grid-cols-2 gap-2">
@@ -6274,8 +6760,7 @@ export default function App() {
 
                   {/* Manual config sub-section */}
                   {chanMode === 'manual' && (() => {
-                    const keyLabel = editingChannelItem.channel_type === 'feishu' ? 'App ID' : editingChannelItem.channel_type === 'dingtalk' ? 'Client ID' : 'Bot ID';
-                    const secretLabel = editingChannelItem.channel_type === 'feishu' ? 'App Secret' : editingChannelItem.channel_type === 'dingtalk' ? 'Client Secret' : 'Secret';
+                    const { key: keyLabel, secret: secretLabel } = channelCredentialLabels(editingChannelItem.channel_type);
                     return (
                     <div className="mt-3 space-y-2">
                       <div className="grid grid-cols-2 gap-2">
@@ -6288,12 +6773,6 @@ export default function App() {
                           <input value={chanAppSecret} onChange={(e) => setChanAppSecret(e.target.value)} type="password" placeholder={secretLabel} className="h-8 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
                         </label>
                       </div>
-                      {(editingChannelItem.channel_type === 'wecom' || editingChannelItem.channel_type === 'dingtalk') && (
-                        <label className="block">
-                          <span className="mb-1 block text-[10px] font-medium text-black/50">{editingChannelItem.channel_type === 'wecom' ? 'Agent ID（可选）' : 'AgentId（可选）'}</span>
-                          <input value={chanAgentId} onChange={(e) => setChanAgentId(e.target.value)} placeholder={editingChannelItem.channel_type === 'wecom' ? '企微 AgentId' : '钉钉 AgentId'} className="h-8 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
-                        </label>
-                      )}
                     </div>
                     );
                   })()}
@@ -6340,22 +6819,6 @@ export default function App() {
             </button>
             <button onClick={() => setDeleteChannelId(null)} className="h-10 rounded-xl border border-[#E5E7EB] bg-white px-5 text-sm font-medium text-black/60 transition hover:bg-gray-50">取消</button>
           </div>
-        </div>
-      </Modal>
-
-      <Modal open={showResourceModal} onClose={() => setShowResourceModal(false)} title={`注册${activeResourceLabel}`}>
-        <div className="space-y-4">
-          <label className="block">
-            <span className="text-xs font-medium text-black/45">{activeResourceLabel} ID</span>
-            <input value={resourceId} onChange={(event) => setResourceId(event.target.value)} placeholder={`输入${activeResourceLabel} ID`} className="mt-1 h-11 w-full rounded-xl border border-[#2F3A8026] bg-white px-3 text-sm outline-none focus:border-[#3550FF]" />
-          </label>
-          <button
-            onClick={() => { void registerCurrentResource(); setShowResourceModal(false); }}
-            disabled={!ctx || loading || !resourceId.trim()}
-            className="h-11 w-full rounded-full bg-[#3550FF] text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:opacity-50"
-          >
-            {loading ? '注册中...' : '确认注册'}
-          </button>
         </div>
       </Modal>
 
@@ -6499,7 +6962,6 @@ export default function App() {
         setQrSession(null);
         setChanAppKey('');
         setChanAppSecret('');
-        setChanAgentId('');
         setCreatedChannelId(null);
         setChannelStep('config');
       }} title={channelStep === 'config' ? '添加 IM 渠道' : '绑定渠道'}>
@@ -6534,12 +6996,17 @@ export default function App() {
 
             {/* Platform selection */}
             <div className="grid grid-cols-4 gap-2">
-              {CHANNEL_TYPES.map((ct) => (
-                <button key={ct.value} type="button" onClick={() => { setChanType(ct.value); if (!ct.qrSupport) setChanMode('manual'); else setChanMode('qr'); }} className={`flex items-center justify-center gap-1 rounded-lg py-2 text-xs font-medium transition ${chanType === ct.value ? 'bg-[#3550FF] text-white shadow-sm' : 'bg-[#F4F6FC] text-black/55 hover:bg-[#E8EBF5]'}`}>
+              {availableChannelTypes.map((ct) => {
+                const count = channels.filter((channel) => channel.channel_type === ct.value).length;
+                const limit = CHANNEL_MAX_COUNTS[ct.value];
+                const atLimit = count >= limit && chanType !== ct.value;
+                return (
+                <button key={ct.value} type="button" disabled={atLimit} onClick={() => { setChanType(ct.value); if (!ct.qrSupport) setChanMode('manual'); else setChanMode('qr'); }} className={`flex items-center justify-center gap-1 rounded-lg py-2 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${chanType === ct.value ? 'bg-[#3550FF] text-white shadow-sm' : 'bg-[#F4F6FC] text-black/55 hover:bg-[#E8EBF5]'}`} title={`${count}/${limit}`}>
                   <span className="text-sm">{ct.icon}</span>
-                  {ct.label}
+                  {ct.label} <span className="text-[9px] opacity-60">{count}/{limit}</span>
                 </button>
-              ))}
+                );
+              })}
             </div>
 
             {/* Response options */}
@@ -6567,10 +7034,14 @@ export default function App() {
             {/* Next button */}
             <button
               onClick={() => setChannelStep(chanMode === 'qr' && CHANNEL_TYPES.find((c) => c.value === chanType)?.qrSupport ? 'binding' : 'credentials')}
-              disabled={!ctx || !chanName.trim()}
+              disabled={!ctx || !chanName.trim() || channels.filter((channel) => channel.channel_type === chanType).length >= CHANNEL_MAX_COUNTS[chanType]}
               className="flex h-11 w-full items-center justify-center rounded-xl bg-[#3550FF] text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {!chanName.trim() ? '请输入渠道名称' : '下一步 →'}
+              {!chanName.trim()
+                ? '请输入渠道名称'
+                : channels.filter((channel) => channel.channel_type === chanType).length >= CHANNEL_MAX_COUNTS[chanType]
+                  ? `已达到 ${CHANNEL_MAX_COUNTS[chanType]} 个上限`
+                  : '下一步 →'}
             </button>
           </div>
         ) : (
@@ -6674,20 +7145,14 @@ export default function App() {
               <div className="space-y-2">
                 <div className="grid grid-cols-2 gap-2">
                   <label className="block">
-                    <span className="mb-1 block text-[11px] font-medium text-black/50">{chanType === 'feishu' ? 'App ID' : chanType === 'dingtalk' ? 'Client ID' : 'Bot ID'} <span className="text-red-400">*</span></span>
-                    <input value={chanAppKey} onChange={(e) => setChanAppKey(e.target.value)} placeholder={chanType === 'feishu' ? 'App ID' : chanType === 'dingtalk' ? 'Client ID' : 'Bot ID'} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
+                    <span className="mb-1 block text-[11px] font-medium text-black/50">{channelCredentialLabels(chanType).key} <span className="text-red-400">*</span></span>
+                    <input value={chanAppKey} onChange={(e) => setChanAppKey(e.target.value)} placeholder={channelCredentialLabels(chanType).key} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
                   </label>
                   <label className="block">
-                    <span className="mb-1 block text-[11px] font-medium text-black/50">{chanType === 'feishu' ? 'App Secret' : chanType === 'dingtalk' ? 'Client Secret' : 'Secret'} <span className="text-red-400">*</span></span>
-                    <input value={chanAppSecret} onChange={(e) => setChanAppSecret(e.target.value)} type="password" placeholder={chanType === 'feishu' ? 'App Secret' : chanType === 'dingtalk' ? 'Client Secret' : 'Secret'} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
+                    <span className="mb-1 block text-[11px] font-medium text-black/50">{channelCredentialLabels(chanType).secret} <span className="text-red-400">*</span></span>
+                    <input value={chanAppSecret} onChange={(e) => setChanAppSecret(e.target.value)} type="password" placeholder={channelCredentialLabels(chanType).secret} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
                   </label>
                 </div>
-                {(chanType === 'wecom' || chanType === 'dingtalk') && (
-                  <label className="block">
-                    <span className="mb-1 block text-[11px] font-medium text-black/50">{chanType === 'wecom' ? 'Agent ID（可选）' : 'AgentId（可选）'}</span>
-                    <input value={chanAgentId} onChange={(e) => setChanAgentId(e.target.value)} placeholder={chanType === 'wecom' ? '企微 AgentId' : '钉钉 AgentId'} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
-                  </label>
-                )}
               </div>
             )}
 

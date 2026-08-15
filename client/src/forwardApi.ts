@@ -22,6 +22,8 @@ export type ForwardTemplateModel = string | {
   [key: string]: unknown;
 };
 
+export type TemplateResourceBindings = Record<string, { enabled: boolean }>;
+
 // A single entry in the multiagent roster. `type: 'self'` delegates to the
 // coordinator itself; `type: 'agent'` references another Managed Agent by id.
 export interface MultiagentAgentEntry {
@@ -48,7 +50,8 @@ export interface ForwardTemplate {
   skills?: unknown[];
   multiagent?: MultiagentConfig | null;
   environment_id?: string;
-  vault_ids?: string[];
+  vaults?: TemplateResourceBindings;
+  vault_ids?: TemplateResourceBindings | string[];
   files?: unknown;
   environment_variables?: unknown;
 }
@@ -60,6 +63,8 @@ export interface ForwardResource {
   type: ForwardResourceType;
   owner_type: string;
   owner_id: string;
+  icon_url?: string | null;
+  binding_info?: { agent_template_count?: number };
   name?: string;
   description?: string;
   status?: string;
@@ -70,15 +75,15 @@ export interface ForwardResource {
 export interface CreateTemplateInput {
   name?: string;
   description?: string;
-  model: string;
+  model: ForwardTemplateModel;
   system: string;
   tools: unknown[];
   mcp_servers: unknown[];
   skills: unknown[];
   multiagent?: MultiagentConfig | null;
   environment_id: string;
-  vault_ids: string[];
-  files: Record<string, unknown>;
+  vault_ids: TemplateResourceBindings;
+  files: TemplateResourceBindings;
   environment_variables: Record<string, unknown>;
 }
 
@@ -125,14 +130,19 @@ interface Page<T> {
 
 const LIST_EVENT_TYPES = [
   'user.message',
+  'user.tool_confirmation',
+  'user.question_answer',
+  'user.custom_tool_result',
   'agent.message',
   'agent.thinking',
+  'agent.ask_user_question',
   'agent.tool_use',
   'agent.custom_tool_use',
   'agent.mcp_tool_use',
   'agent.tool_result',
   'agent.custom_tool_result',
   'agent.mcp_tool_result',
+  'session.status_idle',
 ].join(',');
 
 export class ForwardApiError extends Error {
@@ -273,6 +283,8 @@ export interface CloudModel {
   price_factor?: number;
   efforts?: string[];
   default_effort?: string;
+  default_context_window?: number;
+  available_context_windows?: number[];
 }
 
 export async function listCloudModels(ctx: ForwardContext) {
@@ -350,6 +362,7 @@ export async function uploadCloudSkill(
   // Forward-layer multipart upload (server forwards to /api/v1/forward/skills).
   const uploadRes = await fetch('/api/forward/upload', {
     method: 'POST',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
     body: uploadForm,
   });
 
@@ -457,10 +470,15 @@ export async function downloadCloudFile(ctx: ForwardContext, fileId: string) {
   return cloudRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}/content`);
 }
 
-// Cloud layer so that deleting a registered file resource works whether the file
-// originated from our upload or from the agent.
+// Cloud-only cleanup for agent/system-generated artifacts. User-managed resource
+// deletion uses deleteForwardFile so its lifecycle matches the console.
 export async function deleteCloudFile(ctx: ForwardContext, fileId: string) {
   return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', `/files/${encodeURIComponent(fileId)}`);
+}
+
+/** Delete a user-managed Forward file. Agent-generated artifacts still use deleteCloudFile. */
+export async function deleteForwardFile(ctx: ForwardContext, fileId: string) {
+  return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/files/${encodeURIComponent(fileId)}`);
 }
 
 // ─── Vaults (Cloud API) ────────────────────────────────────────────
@@ -493,6 +511,14 @@ export async function createCloudVault(ctx: ForwardContext, input: { display_nam
     display_name: input.display_name,
     metadata: input.metadata || { created_by: 'forward-quickstart' },
   });
+}
+
+export async function updateCloudVault(
+  ctx: ForwardContext,
+  vaultId: string,
+  input: { display_name?: string; metadata?: Record<string, unknown> },
+) {
+  return forwardRequest<CloudVault>(ctx, 'POST', `/vaults/${encodeURIComponent(vaultId)}`, input);
 }
 
 export async function archiveCloudVault(ctx: ForwardContext, vaultId: string) {
@@ -623,17 +649,26 @@ export async function createTemplate(ctx: ForwardContext, input?: Partial<Create
     name: input?.name?.trim() || `Forward Quickstart ${new Date(createdAt).toLocaleString()}`,
     description: input?.description?.trim() || undefined,
     environment_id: environmentId,
-    model: input?.model?.trim() || 'ultimate',
+    model: normalizeTemplateModelInput(input?.model),
     system: input?.system?.trim() || '你是 Forward quickstart 测试助手，请用简洁、准确的方式回答用户。',
     tools: input?.tools ?? [],
     mcp_servers: input?.mcp_servers ?? [],
     skills: input?.skills ?? [],
     ...(input?.multiagent ? { multiagent: input.multiagent } : {}),
-    vault_ids: input?.vault_ids ?? [],
+    vault_ids: input?.vault_ids ?? {},
     files: input?.files ?? {},
     environment_variables: input?.environment_variables ?? {},
     metadata: { created_by: 'forward-quickstart' },
   });
+}
+
+function normalizeTemplateModelInput(model: ForwardTemplateModel | undefined): ForwardTemplateModel {
+  if (typeof model === 'string') return model.trim() || 'ultimate';
+  if (model && typeof model === 'object') {
+    const id = typeof model.id === 'string' ? model.id.trim() : '';
+    return { ...model, id: id || 'ultimate' };
+  }
+  return 'ultimate';
 }
 
 export async function updateTemplate(ctx: ForwardContext, templateId: string, input: Partial<CreateTemplateInput>) {
@@ -653,6 +688,23 @@ export async function updateTemplate(ctx: ForwardContext, templateId: string, in
   // multiagent uses replace semantics: send the field to replace it, or null to clear.
   if (input.multiagent !== undefined) body.multiagent = input.multiagent ?? null;
   return forwardRequest<ForwardTemplate>(ctx, 'POST', `/templates/${encodeURIComponent(templateId)}`, body);
+}
+
+export async function cloneTemplate(ctx: ForwardContext, templateId: string, name?: string) {
+  return forwardRequest<ForwardTemplate>(
+    ctx,
+    'POST',
+    `/templates/${encodeURIComponent(templateId)}/clone`,
+    name?.trim() ? { name: name.trim() } : {},
+  );
+}
+
+export async function archiveTemplate(ctx: ForwardContext, templateId: string) {
+  return forwardRequest<ForwardTemplate>(
+    ctx,
+    'POST',
+    `/templates/${encodeURIComponent(templateId)}/archive`,
+  );
 }
 
 // Managed-layer Agent, the unit referenced by a multiagent roster entry.
@@ -691,6 +743,46 @@ export async function listResources(ctx: ForwardContext, type: ForwardResourceTy
     type,
     limit: 50,
   });
+}
+
+function lifecycleResource(type: Exclude<ForwardResourceType, 'memory_store'>, value: unknown): ForwardResource | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const resource = value as Record<string, unknown>;
+  if (typeof resource.id !== 'string' || !resource.id) return null;
+  const displayName = [resource.display_title, resource.display_name, resource.filename, resource.name]
+    .find((item): item is string => typeof item === 'string' && !!item);
+  return {
+    id: resource.id,
+    type,
+    owner_type: typeof resource.owner_type === 'string' ? resource.owner_type : 'identity',
+    owner_id: typeof resource.owner_id === 'string'
+      ? resource.owner_id
+      : typeof resource.identity_id === 'string' ? resource.identity_id : '',
+    ...(typeof resource.icon_url === 'string' || resource.icon_url === null ? { icon_url: resource.icon_url } : {}),
+    ...(resource.binding_info && typeof resource.binding_info === 'object'
+      ? { binding_info: resource.binding_info as { agent_template_count?: number } }
+      : {}),
+    ...(displayName ? { name: displayName } : {}),
+    ...(typeof resource.description === 'string' ? { description: resource.description } : {}),
+    status: resource.archived_at ? 'archived' : typeof resource.status === 'string' ? resource.status : 'active',
+    resource_spec: resource,
+  };
+}
+
+/** Resource-management list. Mirrors the Forward console lifecycle endpoints. */
+export async function listResourceCatalog(ctx: ForwardContext, type: ForwardResourceType) {
+  if (type === 'memory_store') return listResources(ctx, type);
+  const response = type === 'skill'
+    ? await listCloudSkills(ctx)
+    : type === 'file'
+      ? await listCloudFiles(ctx)
+      : type === 'environment'
+        ? await listCloudEnvironments(ctx)
+        : await listCloudVaults(ctx);
+  const data = response.data
+    .map((item) => lifecycleResource(type, item))
+    .filter((item): item is ForwardResource => item !== null);
+  return { data, has_more: false } satisfies Page<ForwardResource>;
 }
 
 export interface EffectiveSpecResp {
@@ -898,6 +990,69 @@ export async function sendUserMessage(ctx: ForwardContext, sessionId: string, te
           content: [{ type: 'text', text }],
         },
       ],
+    },
+  );
+}
+
+export async function sendToolConfirmation(
+  ctx: ForwardContext,
+  sessionId: string,
+  toolUseId: string,
+  result: 'allow' | 'deny',
+  denyMessage?: string,
+) {
+  return forwardRequest<{ data: ForwardEvent[] }>(
+    ctx,
+    'POST',
+    `/sessions/${encodeURIComponent(sessionId)}/events`,
+    {
+      events: [{
+        type: 'user.tool_confirmation',
+        tool_use_id: toolUseId,
+        result,
+        ...(result === 'deny' && denyMessage?.trim() ? { deny_message: denyMessage.trim() } : {}),
+      }],
+    },
+  );
+}
+
+export async function sendQuestionAnswer(
+  ctx: ForwardContext,
+  sessionId: string,
+  questionUseId: string,
+  answers: string[][],
+  dismissed = false,
+) {
+  return forwardRequest<{ data: ForwardEvent[] }>(
+    ctx,
+    'POST',
+    `/sessions/${encodeURIComponent(sessionId)}/events`,
+    {
+      events: [{
+        type: 'user.question_answer',
+        question_use_id: questionUseId,
+        ...(dismissed ? { dismissed: true } : { answers }),
+      }],
+    },
+  );
+}
+
+export async function sendCustomToolResult(
+  ctx: ForwardContext,
+  sessionId: string,
+  customToolUseId: string,
+  content: string,
+) {
+  return forwardRequest<{ data: ForwardEvent[] }>(
+    ctx,
+    'POST',
+    `/sessions/${encodeURIComponent(sessionId)}/events`,
+    {
+      events: [{
+        type: 'user.custom_tool_result',
+        custom_tool_use_id: customToolUseId,
+        content: [{ type: 'text', text: content }],
+      }],
     },
   );
 }
@@ -1128,7 +1283,7 @@ export async function getMemoryEntry(ctx: ForwardContext, storeId: string, entry
 
 // ─── Channels (Forward API) ────────────────────────────────────────
 
-export type ChannelType = 'wechat' | 'wecom' | 'feishu' | 'dingtalk';
+export type ChannelType = 'wechat' | 'wecom' | 'feishu' | 'lark' | 'dingtalk' | 'slack';
 export type BindingStatus = 'unbound' | 'bound' | 'expired';
 export type IdentityResolutionMode = 'fixed' | 'pairing';
 
@@ -1231,15 +1386,33 @@ export function buildChannelCredentials(
 ): Record<string, string> {
   switch (channelType) {
     case 'feishu':
+    case 'lark':
       return { app_id: key, app_secret: secret };
+    case 'slack':
+      return { app_token: key, bot_token: secret };
     case 'dingtalk':
       return { client_id: key, client_secret: secret };
     case 'wecom':
       return { bot_id: key, secret };
     default:
-      // wechat 仅支持扫码绑定，不使用直连凭据
+      // wechat 仅支持扫码绑定，不使用直连密钥
       return {};
   }
+}
+
+export const CHANNEL_MAX_COUNTS: Record<ChannelType, number> = {
+  wechat: 3,
+  wecom: 5,
+  dingtalk: 5,
+  feishu: 5,
+  lark: 5,
+  slack: 5,
+};
+
+export function channelTypesForEnvironment(environment: ForwardApiEnvironment): ChannelType[] {
+  return environment === 'global-prod'
+    ? ['wechat', 'wecom', 'dingtalk', 'feishu', 'lark', 'slack']
+    : ['wechat', 'wecom', 'dingtalk', 'feishu'];
 }
 
 // QR 扫码 confirmed 只代表扫码动作完成；渠道真正可处理上行消息需要
