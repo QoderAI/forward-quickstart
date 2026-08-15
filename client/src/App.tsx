@@ -89,6 +89,7 @@ import {
   namePastedImage,
   splitAttachmentMarkers,
 } from './attachments';
+import { formatCredits, modelCallsForMessage, type ModelCall } from './credits';
 
 // Helpers for the multiagent roster form state.
 const AUTH_KEY = 'forward_quickstart_auth';
@@ -457,6 +458,9 @@ function eventViewKind(event: ForwardEvent): EventViewKind {
   ) {
     return 'multiagent_status';
   }
+  // span.* events (e.g. span.model_request_end) are data-only: they feed the
+  // per-reply credit breakdown but must never render as their own chat bubble.
+  if (event.type.startsWith('span.')) return 'hidden';
   return 'hidden';
 }
 
@@ -1470,7 +1474,7 @@ const SentImageAttachment = memo(function SentImageAttachment({
   return <ChatImage src={url} alt={name} />;
 });
 
-const ChatTextMessage = memo(function ChatTextMessage({ event, user, ctx }: { event: ForwardEvent; user?: boolean; ctx?: ForwardContext | null }) {
+const ChatTextMessage = memo(function ChatTextMessage({ event, user, ctx, credits }: { event: ForwardEvent; user?: boolean; ctx?: ForwardContext | null; credits?: { calls: ModelCall[]; total: number | null } }) {
   const item = eventDisplay(event);
 
   if (user) {
@@ -1508,18 +1512,63 @@ const ChatTextMessage = memo(function ChatTextMessage({ event, user, ctx }: { ev
   // Render markdown live during streaming too. Real-time cost stays bounded by the
   // throttled flush (<=10fps), React.memo (only this message re-renders per flush),
   // and truncateForDisplay (caps huge synchronous renders that could freeze the tab).
+  const showCredits = credits != null && credits.total != null;
 
   return (
     <div className="flex justify-start">
       <div className="max-w-[85%] text-[14px] leading-7 text-[#1a1a1a]">
         <div className="markdown-body break-words">{renderMarkdown(truncateForDisplay(item.message))}</div>
-        {responseTime && (
-          <div className="mt-1.5 text-[11px] text-black/25">
-            ⏱ {responseTime}
+        {(responseTime || showCredits) && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-black/25">
+            {responseTime && <span>⏱ {responseTime}</span>}
+            {showCredits && <MessageCreditBadge calls={credits!.calls} total={credits!.total!} />}
           </div>
         )}
       </div>
     </div>
+  );
+}, (prev, next) => {
+  // Preserve memoization during streaming: `event` is referentially stable for
+  // completed messages, but the `credits` object is recomputed each render. Compare
+  // it by a cheap signature (total + call count) so prior replies don't re-render
+  // — and re-run their markdown — on every ~10fps streaming flush.
+  if (prev.event !== next.event || prev.user !== next.user || prev.ctx !== next.ctx) return false;
+  const a = prev.credits;
+  const b = next.credits;
+  if (!a || !b) return !a && !b;
+  return a.total === b.total && a.calls.length === b.calls.length;
+});
+
+/**
+ * Per-reply credit spend: a chip on the message meta row showing the summed cost,
+ * expanding to the per-call breakdown. Only rendered when a reply actually had a
+ * model call with a usable credit number (never a bare "0").
+ */
+const MessageCreditBadge = memo(function MessageCreditBadge({ calls, total }: { calls: ModelCall[]; total: number }) {
+  return (
+    <details className="group inline-block">
+      <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-black/35 transition hover:text-black/60">
+        <span aria-hidden>⚡</span>
+        <span className="tabular-nums">{formatCredits(total)} Credit</span>
+        <span className="text-black/30 group-open:hidden">›</span>
+        <span className="hidden text-black/30 group-open:inline">⌄</span>
+      </summary>
+      <div className="mt-1.5 w-[220px] rounded-lg border border-black/[0.08] bg-white px-3 py-2 text-[11px] leading-5 text-black/55 shadow-[0_4px_16px_rgba(47,58,128,0.08)]">
+        {calls.map((call) => (
+          <div key={call.index} className="flex items-center justify-between py-0.5">
+            <span>
+              第 {call.index} 次调用
+              {call.isError && <span className="ml-1 rounded bg-red-50 px-1 text-red-500">失败</span>}
+            </span>
+            <span className="font-mono tabular-nums text-black/70">{formatCredits(call.credits)}</span>
+          </div>
+        ))}
+        <div className="mt-1 flex items-center justify-between border-t border-black/[0.08] pt-1 font-medium text-black/75">
+          <span>合计</span>
+          <span className="font-mono tabular-nums">{formatCredits(total)}</span>
+        </div>
+      </div>
+    </details>
   );
 });
 
@@ -3645,6 +3694,19 @@ export default function App() {
 
   const currentTemplate = templates.find((template) => template.id === templateId);
   const currentSession = sessions.find((session) => session.id === currentSessionId);
+  // Whole-session credit total, shown next to the composer's attachment button.
+  // Uses usage.total_credits (NOT usage.credits, which tracks model spend and
+  // reconciles with the per-call span.model_request_end events).
+  //
+  // Caveat from live cn-prod data (37 sessions): total_credits is present on only
+  // 12/37 — older sessions omit it entirely — and its relation to `credits` is not
+  // a clean superset (deltas observed: 0, +0.02, +0.48, +1.39, and once -26.29).
+  // So the badge is intentionally hidden rather than back-filled when the field is
+  // missing: null must never render as a misleading 0.
+  const rawSessionTotal = currentSession?.usage?.total_credits;
+  const currentSessionCredits = typeof rawSessionTotal === 'number' && Number.isFinite(rawSessionTotal)
+    ? rawSessionTotal
+    : null;
   const hasPendingLocalThinking = events.some((event) => isLocalThinkingEvent(event) && event.session_id === currentSessionId);
   const currentSessionStatus = currentSession?.status;
   const isCurrentTurnCanceling = stopping ||
@@ -4902,7 +4964,13 @@ export default function App() {
                           );
                         }
                         if (kind === 'user') return <ChatTextMessage key={event.id} event={event} user ctx={ctx} />;
-                        return <ChatTextMessage key={event.id} event={event} />;
+                        // Attribute model-call credits to this reply by position. Skip the
+                        // synthetic streaming message — its calls aren't finalized yet, and
+                        // getResponseTime() likewise suppresses meta on local-stream-* ids.
+                        const credits = event.id.startsWith('local-stream-')
+                          ? undefined
+                          : modelCallsForMessage(events, index);
+                        return <ChatTextMessage key={event.id} event={event} credits={credits} />;
                       })}
                     </div>
                     </div>
@@ -4937,6 +5005,20 @@ export default function App() {
                             <span>换行</span>
                           </div>
                           <div className="flex items-center gap-1.5">
+                            {currentSessionCredits != null && currentSessionCredits > 0 && (
+                              <>
+                                <span
+                                  title="本会话累计消耗 Credit"
+                                  className="inline-flex items-center gap-1 text-[11px] tabular-nums text-black/35"
+                                >
+                                  <svg className="h-3.5 w-3.5 text-black/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12l1-8.5Z" />
+                                  </svg>
+                                  {formatCredits(currentSessionCredits)}
+                                </span>
+                                <span className="mx-0.5 h-4 w-px bg-black/10" />
+                              </>
+                            )}
                             <button
                               type="button"
                               title="添加附件（图片 ≤10MB，文本类文件 ≤5MB）"

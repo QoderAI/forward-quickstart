@@ -253,3 +253,78 @@ export function dayLabel(date: string): string {
   const [, m, d] = date.split('-');
   return m && d ? `${Number(m)}-${Number(d)}` : date;
 }
+
+// ─── Per-reply model-call attribution ─────────────────────────────
+// Each `span.model_request_end` event carries one model call's credit spend in
+// `model_usage.credits`, but it has NO turn_id — so a call can't be mapped to a
+// reply by id. Attribution is positional instead: the model calls belonging to
+// an `agent.message` are those between the previous message boundary
+// (the prior agent.message / user.message) and this one. Rendering derives the
+// cost from the events array directly, so live and refreshed history share one
+// path with no extra per-message state.
+
+export interface ModelCall {
+  /** 1-based call index within the reply. */
+  index: number;
+  /** Credit spend, or null when the event carried no usable number. */
+  credits: number | null;
+  /** The API flagged this call as failed. The spend still counts. */
+  isError: boolean;
+  /** processed_at timestamp, when present. */
+  at?: string;
+}
+
+/** Minimal event shape needed for attribution — keeps this file free of the
+ *  full ForwardEvent type and trivially unit-testable. */
+interface CreditEvent {
+  type: string;
+  model_usage?: { credits?: number };
+  is_error?: boolean;
+  processed_at?: string;
+}
+
+/**
+ * Model calls attributed to the agent.message at `messageIndex`.
+ *
+ * Walks backwards from just before the message, collecting
+ * `span.model_request_end` events, and stops at the previous reply boundary
+ * (an earlier agent.message or a user.message) so turns never bleed into each
+ * other. Returns calls in chronological order, 1-indexed.
+ *
+ * `total` is null when the reply has no call with a usable credit number, which
+ * is the signal to render no icon at all (never a "0").
+ */
+export function modelCallsForMessage(
+  events: CreditEvent[],
+  messageIndex: number,
+): { calls: ModelCall[]; total: number | null } {
+  const collected: CreditEvent[] = [];
+  for (let i = messageIndex - 1; i >= 0; i -= 1) {
+    const type = events[i]?.type;
+    // Stop at the previous reply boundary.
+    if (type === 'agent.message' || type === 'user.message') break;
+    if (type === 'span.model_request_end') collected.push(events[i]);
+  }
+  // Collected newest-first while walking back; flip to chronological.
+  collected.reverse();
+
+  const calls: ModelCall[] = collected.map((event, i) => {
+    const raw = event.model_usage?.credits;
+    const credits = typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
+    return {
+      index: i + 1,
+      credits,
+      isError: event.is_error === true,
+      at: event.processed_at,
+    };
+  });
+
+  // Sum the calls that reported a number. Failed calls still count — the spend
+  // was incurred. Round once at the end to kill accumulated float noise.
+  let total: number | null = null;
+  for (const call of calls) {
+    if (call.credits == null) continue;
+    total = (total ?? 0) + call.credits;
+  }
+  return { calls, total: total == null ? null : roundCredits(total) };
+}

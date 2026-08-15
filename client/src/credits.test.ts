@@ -9,6 +9,7 @@ import {
   formatCount,
   formatCredits,
   formatDuration,
+  modelCallsForMessage,
   resolveWindow,
   roundCredits,
   sessionCredits,
@@ -285,3 +286,72 @@ describe('dayLabel', () => {
     expect(dayLabel('2026-08-01')).toBe('8-1');
   });
 });
+
+describe('modelCallsForMessage', () => {
+  const end = (credits?: number, over: Record<string, unknown> = {}) => ({
+    type: 'span.model_request_end',
+    model_usage: credits == null ? undefined : { credits },
+    ...over,
+  });
+  const userMsg = { type: 'user.message' };
+  const agentMsg = { type: 'agent.message' };
+  const toolUse = { type: 'agent.tool_use' };
+  const toolResult = { type: 'agent.tool_result' };
+
+  test('single call attributed to the reply', () => {
+    const events = [userMsg, end(79.24), agentMsg];
+    const { calls, total } = modelCallsForMessage(events, 2);
+    expect(total).toBe(79.24);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ index: 1, credits: 79.24, isError: false });
+  });
+
+  test('multiple calls across a tool round sum into one reply', () => {
+    // user → call → tool_use → tool_result → call → agent.message
+    const events = [userMsg, end(79.94), toolUse, toolResult, end(12.23), agentMsg];
+    const { calls, total } = modelCallsForMessage(events, 5);
+    expect(calls.map((c) => c.index)).toEqual([1, 2]);
+    expect(calls.map((c) => c.credits)).toEqual([79.94, 12.23]);
+    expect(total).toBe(92.17);
+  });
+
+  test('turns do not bleed: the second reply excludes the first turn calls', () => {
+    const events = [
+      userMsg, end(10), agentMsg,        // turn 1: index 0-2
+      userMsg, end(20), end(5), agentMsg, // turn 2: index 3-6
+    ];
+    const turn2 = modelCallsForMessage(events, 6);
+    expect(turn2.calls).toHaveLength(2);
+    expect(turn2.total).toBe(25);
+    const turn1 = modelCallsForMessage(events, 2);
+    expect(turn1.total).toBe(10);
+  });
+
+  test('failed calls are counted and flagged', () => {
+    const events = [userMsg, end(40), end(2.5, { is_error: true }), agentMsg];
+    const { calls, total } = modelCallsForMessage(events, 3);
+    expect(total).toBe(42.5);
+    expect(calls[1].isError).toBe(true);
+  });
+
+  test('no calls → total null (renders no icon)', () => {
+    const events = [userMsg, agentMsg];
+    expect(modelCallsForMessage(events, 1).total).toBeNull();
+  });
+
+  test('calls without a usable credit number → total null but calls kept', () => {
+    const events = [userMsg, end(undefined), agentMsg];
+    const { calls, total } = modelCallsForMessage(events, 2);
+    expect(total).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].credits).toBeNull();
+  });
+
+  test('float noise is rounded away in the total', () => {
+    const events = [userMsg, end(815.43), end(0.0000000001), agentMsg];
+    const { total } = modelCallsForMessage(events, 3);
+    expect(total).toBe(815.43);
+    expect(formatCredits(total)).toBe('815.43');
+  });
+});
+

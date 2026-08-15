@@ -113,6 +113,12 @@ export interface ForwardEvent {
   status?: string;
   reason?: string;
   error?: unknown;
+  // span.model_request_end carries the per-call credit spend. There is no
+  // turn_id on these events, so credit attribution is positional (see
+  // modelCallsForMessage in credits.ts).
+  model_usage?: { credits?: number };
+  is_error?: boolean;
+  model_request_start_id?: string;
   [key: string]: unknown;
 }
 
@@ -133,6 +139,9 @@ const LIST_EVENT_TYPES = [
   'agent.tool_result',
   'agent.custom_tool_result',
   'agent.mcp_tool_result',
+  // Per-call credit spend. Needed in listEvents so historical replies still show
+  // their cost after a page refresh (the streaming accumulator is gone by then).
+  'span.model_request_end',
 ].join(',');
 
 export class ForwardApiError extends Error {
