@@ -102,6 +102,7 @@ export interface ForwardSession {
   // only sporadically present and drifts, so treat it as a fallback. Both may be
   // absent when the billing module is off. See credits.ts for the details.
   usage?: { credits?: number | null; total_credits?: number | null };
+  metadata?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
   archived_at?: string | null;
@@ -157,12 +158,17 @@ export class ForwardApiError extends Error {
   }
 }
 
-async function forwardRequest<T>(
+export interface ForwardRequestOptions {
+  idempotencyKey?: string;
+}
+
+export async function forwardRequest<T>(
   ctx: ForwardContext,
   method: string,
   path: string,
   body?: unknown,
   query?: Record<string, unknown>,
+  options: ForwardRequestOptions = {},
 ): Promise<T> {
   const res = await fetch('/api/forward/request', {
     method: 'POST',
@@ -175,7 +181,7 @@ async function forwardRequest<T>(
       body,
       query,
       idempotencyKey: method.toUpperCase() === 'POST'
-        ? `fw-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        ? options.idempotencyKey || `fw-${Date.now()}-${Math.random().toString(36).slice(2)}`
         : undefined,
     }),
   });
