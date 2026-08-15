@@ -82,6 +82,10 @@ import { ChatImage } from './chatImage';
 import { isImageFile } from './imageUtils';
 import { BatchPanel } from './batchPanel';
 import { UsagePanel } from './usagePanel';
+import { VoiceEntryButton } from './voice/VoiceEntryButton';
+import { VoiceSessionView } from './voice/VoiceSessionView';
+import { useVoiceAvailability } from './voice/useVoiceAvailability';
+import { isVoiceSession } from './voice/voiceSession';
 import { LayerQuizButton } from './layerQuiz';
 import { PRODUCT_NAME } from './config/product';
 import {
@@ -2135,6 +2139,9 @@ export default function App() {
   const [resourceOptionsByType, setResourceOptionsByType] = useState<Record<ForwardResourceType, ForwardResource[]>>(emptyResourceOptions);
   const [sessions, setSessions] = useState<ForwardSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState('');
+  const [voiceViewOpen, setVoiceViewOpen] = useState(false);
+  const [currentVoiceConversationId, setCurrentVoiceConversationId] = useState<string | null>(null);
+  const [voiceLaunchKey, setVoiceLaunchKey] = useState(0);
   const [events, setEvents] = useState<ForwardEvent[]>([]);
   const [input, setInput] = useState('');
   const [showThinking, setShowThinking] = useState<boolean>(() => {
@@ -2325,6 +2332,8 @@ export default function App() {
     () => (pat.trim() ? { pat: pat.trim(), environment: apiEnvironment } : null),
     [apiEnvironment, pat],
   );
+  const voiceAvailability = useVoiceAvailability(ctx, templateId);
+  useEffect(() => { setVoiceViewOpen(false); setCurrentVoiceConversationId(null); }, [templateId]);
 
   // Attachments picked in the composer. They upload immediately on selection
   // (ChatGPT-style progress chips), then get mounted into the session
@@ -2495,12 +2504,13 @@ export default function App() {
   }, [currentSessionId]);
 
   const refreshSessions = useCallback(async (nextIdentity = identity, nextTemplateId?: string) => {
-    if (!ctx || !nextIdentity) return;
+    if (!ctx || !nextIdentity) return [];
     const tplId = nextTemplateId ?? templateIdRef.current;
     const page = await listSessions(ctx, nextIdentity.id, tplId || undefined);
     setSessions(page.data);
     // Never auto-select a session here: background polling calls this while the
     // user may be sitting on the new-conversation screen (currentSessionId === '').
+    return page.data;
   }, [ctx, identity]);
 
   const loadSessionEvents = useCallback(async (sessionId: string) => {
@@ -3449,6 +3459,16 @@ export default function App() {
     setError('');
     setSessionLoading(true);
     streamAbort.current?.abort();
+    const selected = sessions.find((session) => session.id === sessionId);
+    if (selected && isVoiceSession(selected)) {
+      setCurrentVoiceConversationId(selected.metadata.conversation_id);
+      setVoiceViewOpen(true);
+      setVoiceLaunchKey((value) => value + 1);
+      setSessionLoading(false);
+      return;
+    }
+    setVoiceViewOpen(false);
+    setCurrentVoiceConversationId(null);
     try {
       const page = await listEvents(ctx!, sessionId);
       // Events are returned in descending order (newest first), reverse to chronological order
@@ -4975,7 +4995,7 @@ export default function App() {
                     )}
                   </div>
                   <button
-                    onClick={() => { currentSessionIdRef.current = ''; setCurrentSessionId(''); setEvents([]); setSessionLoading(false); }}
+                    onClick={() => { currentSessionIdRef.current = ''; setCurrentSessionId(''); setEvents([]); setSessionLoading(false); setVoiceViewOpen(false); setCurrentVoiceConversationId(null); }}
                     className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/45 transition hover:bg-gray-100 hover:text-black"
                     title="新建对话"
                   >
@@ -5061,8 +5081,9 @@ export default function App() {
                                 </span>
                               )}
                               <div className="min-w-0 flex-1">
-                                <div className={`truncate text-[13px] ${currentSessionId === session.id ? 'font-medium text-black' : 'text-black/70'}`}>
-                                  {session.title || 'Forward 会话'}
+                                <div className={`flex items-center gap-1.5 text-[13px] ${currentSessionId === session.id ? 'font-medium text-black' : 'text-black/70'}`}>
+                                  <span className="truncate">{session.title || 'Forward 会话'}</span>
+                                  {isVoiceSession(session) && <span className="shrink-0 rounded-full bg-[#3550FF]/8 px-1.5 py-0.5 text-[10px] font-normal text-[#3550FF]">语音</span>}
                                 </div>
                                 <div className="mt-0.5 text-[11px] text-black/30">{relativeTime(session.created_at)}</div>
                               </div>
@@ -5104,7 +5125,29 @@ export default function App() {
                     e.target.value = '';
                   }}
                 />
-                {events.length === 0 && sessionLoading && (
+                {voiceViewOpen && ctx && identity && templateId && (
+                  <VoiceSessionView
+                    key={voiceLaunchKey}
+                    ctx={ctx}
+                    identityId={identity.id}
+                    templateId={templateId}
+                    templateName={currentTemplate?.name || 'Voice'}
+                    initialConversationId={currentVoiceConversationId}
+                    autoStart={currentVoiceConversationId === null}
+                    launchKey={voiceLaunchKey}
+                    onConversationCreated={(conversationId) => {
+                      setCurrentVoiceConversationId(conversationId);
+                      void refreshSessions().then((items) => {
+                        const matched = items.find((item) => isVoiceSession(item) && item.metadata.conversation_id === conversationId);
+                        if (matched) { currentSessionIdRef.current = matched.id; setCurrentSessionId(matched.id); }
+                      });
+                    }}
+                    onStartFailed={(message) => { setVoiceViewOpen(false); setCurrentVoiceConversationId(null); setError(message); }}
+                    onNewConversation={() => { setCurrentVoiceConversationId(null); setVoiceLaunchKey((value) => value + 1); }}
+                    onEnded={() => { void refreshSessions(); }}
+                  />
+                )}
+                {!voiceViewOpen && events.length === 0 && sessionLoading && (
                   <div className="flex min-h-0 flex-1 items-center justify-center">
                     <svg className="h-7 w-7 animate-spin text-[#3550FF]" fill="none" viewBox="0 0 24 24">
                       <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
@@ -5112,7 +5155,7 @@ export default function App() {
                     </svg>
                   </div>
                 )}
-                {events.length === 0 && !sessionLoading && (
+                {!voiceViewOpen && events.length === 0 && !sessionLoading && (
                   <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-8 pb-12 pt-4">
                     <div className="w-full max-w-[680px]">
                       <div className="mb-8 text-center">
@@ -5153,6 +5196,7 @@ export default function App() {
                             <span>换行</span>
                           </div>
                           <div className="flex items-center gap-1.5">
+                            <VoiceEntryButton availability={voiceAvailability} onStart={() => { streamAbort.current?.abort(); setEvents([]); setError(''); setCurrentVoiceConversationId(null); setVoiceViewOpen(true); setVoiceLaunchKey((value) => value + 1); }} />
                             <button
                               type="button"
                               title="添加附件（图片 ≤10MB，文本类文件 ≤5MB）"
@@ -5207,7 +5251,7 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                {events.length > 0 && (
+                {!voiceViewOpen && events.length > 0 && (
                   <div ref={chatScrollRef} onScroll={handleChatScroll} className="min-h-0 flex-1 overflow-y-auto px-8">
                     <div className="mx-auto flex max-w-[860px] flex-col py-6">
                     <div className="space-y-4 pb-8">
@@ -5277,7 +5321,7 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                {events.length > 0 && (
+                {!voiceViewOpen && events.length > 0 && (
                   <div className="shrink-0 px-8 pb-6 pt-2">
                     <div className="mx-auto max-w-[860px]">
                       {(pendingToolApprovals.length > 0 || pendingQuestion) && (
@@ -5326,6 +5370,7 @@ export default function App() {
                             <span>换行</span>
                           </div>
                           <div className="flex items-center gap-1.5">
+                            <VoiceEntryButton availability={voiceAvailability} onStart={() => { streamAbort.current?.abort(); setEvents([]); setError(''); setCurrentVoiceConversationId(null); setVoiceViewOpen(true); setVoiceLaunchKey((value) => value + 1); }} />
                             <button
                               type="button"
                               title="添加附件（图片 ≤10MB，文本类文件 ≤5MB）"
