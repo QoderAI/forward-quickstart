@@ -172,6 +172,12 @@ function parseApiEnvironment(value: unknown): ForwardApiEnvironment {
   return 'cn-prod';
 }
 
+function readBearerToken(req: import('express').Request, fallback?: unknown) {
+  const auth = req.get('authorization') || '';
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  return String(match?.[1] ?? fallback ?? '').trim();
+}
+
 function buildForwardUrl(apiEnvironment: ForwardApiEnvironment, path: string, query?: Record<string, unknown>) {
   if (!path.startsWith('/')) {
     throw new Error('path must start with /');
@@ -202,10 +208,10 @@ app.post('/api/forward/request', async (req, res) => {
   } = req.body ?? {};
 
   const apiEnvironment = parseApiEnvironment(environment);
-  const authToken = String(pat ?? userId ?? '').trim();
+  const authToken = readBearerToken(req, pat ?? userId);
   const targetPath = String(path ?? '').trim();
   if (!authToken || !targetPath) {
-    res.status(400).json({ error: { message: 'pat and path are required' } });
+    res.status(400).json({ error: { message: 'token and path are required' } });
     return;
   }
 
@@ -297,10 +303,10 @@ app.post('/api/cloud/request', async (req, res) => {
   } = req.body ?? {};
 
   const apiEnvironment = parseApiEnvironment(environment);
-  const authToken = String(pat ?? userId ?? '').trim();
+  const authToken = readBearerToken(req, pat ?? userId);
   const targetPath = String(path ?? '').trim();
   if (!authToken || !targetPath) {
-    res.status(400).json({ error: { message: 'pat and path are required' } });
+    res.status(400).json({ error: { message: 'token and path are required' } });
     return;
   }
 
@@ -364,11 +370,11 @@ app.post('/api/cloud/request', async (req, res) => {
 // matching Vercel function shim stays valid.
 function makePreviewHandler(baseUrls: Record<ForwardApiEnvironment, string>, label: string) {
   return async (req: import('express').Request, res: import('express').Response) => {
-    const authToken = String(req.query.pat ?? req.query.userId ?? '').trim();
+    const authToken = readBearerToken(req, req.query.pat ?? req.query.userId);
     const fileId = String(req.params.fileId ?? '').trim();
     const environment = parseApiEnvironment(req.query.environment);
     if (!authToken || !fileId) {
-      res.status(400).json({ error: { message: 'pat and fileId are required' } });
+      res.status(400).json({ error: { message: 'token and fileId are required' } });
       return;
     }
     try {
@@ -425,10 +431,10 @@ app.get('/api/cloud/files/:fileId/preview', makePreviewHandler(CLOUD_API_BASE_UR
 app.get('/api/forward/sessions/:sessionId/events/stream', async (req, res) => {
   const startedAt = nowMs();
   const apiEnvironment = parseApiEnvironment(req.query.environment);
-  const authToken = String(req.query.pat ?? req.query.userId ?? '').trim();
+  const authToken = readBearerToken(req, req.query.pat ?? req.query.userId);
   const sessionId = String(req.params.sessionId ?? '').trim();
   if (!authToken || !sessionId) {
-    res.status(400).json({ error: { message: 'pat and sessionId are required' } });
+    res.status(400).json({ error: { message: 'token and sessionId are required' } });
     return;
   }
 
@@ -578,11 +584,11 @@ function makeUploadHandler(baseUrls: Record<ForwardApiEnvironment, string>, labe
     const { pat, environment, path: targetPath } = req.body ?? {};
     const idempotencyKey = req.get('idempotency-key')?.trim();
     const apiEnvironment = parseApiEnvironment(environment);
-    const authToken = String(pat ?? '').trim();
+    const authToken = readBearerToken(req, pat);
     const target = String(targetPath ?? '').trim();
 
     if (!authToken || !target) {
-      res.status(400).json({ error: { message: 'pat and path are required' } });
+      res.status(400).json({ error: { message: 'token and path are required' } });
       return;
     }
 

@@ -3,6 +3,8 @@ export const DEFAULT_FORWARD_ENVIRONMENT_ID = 'env_019ef4d7c6c9742fa028eeed7ec23
 export type ForwardApiEnvironment = 'cn-prod' | 'global-prod';
 
 export interface ForwardContext {
+  // Active bearer token for the selected login mode. In PAT mode this is the
+  // PAT; in Service Account mode this is the exchanged Service Account Token.
   pat: string;
   environment: ForwardApiEnvironment;
 }
@@ -573,6 +575,32 @@ export async function deleteCloudCredential(ctx: ForwardContext, vaultId: string
   return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/vaults/${encodeURIComponent(vaultId)}/credentials/${encodeURIComponent(credentialId)}`);
 }
 
+export interface ForwardServiceAccountToken {
+  type: 'service_account_token';
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  expires_at: string;
+  auth_token_id: string;
+  service_account_id: string;
+  credential_id: string;
+  subject_type: 'admin' | 'identity';
+  identity_id?: string;
+}
+
+export async function createServiceAccountToken(
+  ctx: ForwardContext,
+  input: { identityId?: string; ttlSeconds?: number; metadata?: Record<string, unknown> } = {},
+) {
+  const path = input.identityId
+    ? `/identities/${encodeURIComponent(input.identityId)}/service_account_tokens`
+    : '/service_account_tokens';
+  return forwardRequest<ForwardServiceAccountToken>(ctx, 'POST', path, {
+    ...(input.ttlSeconds ? { ttl_seconds: input.ttlSeconds } : {}),
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+  });
+}
+
 export async function listIdentities(ctx: ForwardContext, externalId: string) {
   return forwardRequest<Page<ForwardIdentity>>(ctx, 'GET', '/identities', undefined, {
     external_id: externalId,
@@ -1098,13 +1126,15 @@ export async function streamEvents(
   lastEventId?: string,
 ) {
   const params = new URLSearchParams({
-    pat: ctx.pat,
     environment: ctx.environment,
   });
   // Connect directly to Express server (port 3001) for SSE to bypass Vite proxy buffering
   const sseBase = window.location.port === '5173' ? 'http://localhost:3001' : '';
   const url = `${sseBase}/api/forward/sessions/${encodeURIComponent(sessionId)}/events/stream?${params.toString()}`;
-  const headers: Record<string, string> = { Accept: 'text/event-stream' };
+  const headers: Record<string, string> = {
+    Accept: 'text/event-stream',
+    Authorization: `Bearer ${ctx.pat}`,
+  };
   if (lastEventId) headers['Last-Event-ID'] = lastEventId;
   const res = await fetch(url, { headers, signal });
   if (!res.ok || !res.body) {

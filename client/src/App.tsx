@@ -19,6 +19,7 @@ import {
   listCloudCredentials,
   createCloudCredential,
   deleteCloudCredential,
+  createServiceAccountToken,
   type CloudModel,
   listCloudModels,
   createTemplate,
@@ -74,6 +75,7 @@ import {
   type ForwardIdentity,
   type ForwardResource,
   type ForwardResourceType,
+  type ForwardServiceAccountToken,
   type ForwardSession,
   type ForwardTemplate,
 } from './forwardApi';
@@ -124,6 +126,7 @@ import {
 // Helpers for the multiagent roster form state.
 const AUTH_KEY = 'forward_quickstart_auth';
 const FORWARD_ICON = '/forward-icon.png';
+type LoginMode = 'pat' | 'service-account';
 
 // Accumulate thinking_delta from incremental streaming per session.
 // The Forward API's agent.thinking event has no content — thinking text
@@ -256,23 +259,41 @@ function isForwardApiEnvironment(value: unknown): value is ForwardApiEnvironment
   return value === 'cn-prod' || value === 'global-prod';
 }
 
+function isLoginMode(value: unknown): value is LoginMode {
+  return value === 'pat' || value === 'service-account';
+}
+
 function readSavedAuth() {
   try {
     const raw = localStorage.getItem(AUTH_KEY);
-    if (!raw) return { pat: '', externalId: '', apiEnvironment: 'cn-prod' as ForwardApiEnvironment };
+    if (!raw) return { authMode: 'pat' as LoginMode, pat: '', externalId: '', apiEnvironment: 'cn-prod' as ForwardApiEnvironment };
     const saved = JSON.parse(raw);
     return {
+      authMode: isLoginMode(saved.authMode) ? saved.authMode : 'pat',
       apiEnvironment: isForwardApiEnvironment(saved.apiEnvironment) ? saved.apiEnvironment : 'cn-prod',
       pat: typeof saved.pat === 'string'
         ? saved.pat
         : typeof saved.userId === 'string'
           ? saved.userId
-          : '',
+        : '',
       externalId: typeof saved.externalId === 'string' ? saved.externalId : '',
     };
   } catch {
-    return { pat: '', externalId: '', apiEnvironment: 'cn-prod' as ForwardApiEnvironment };
+    return { authMode: 'pat' as LoginMode, pat: '', externalId: '', apiEnvironment: 'cn-prod' as ForwardApiEnvironment };
   }
+}
+
+function localApiBase() {
+  return window.location.port === '5173' ? 'http://localhost:3001' : '';
+}
+
+async function fetchAuthorizedPreviewObjectUrl(ctx: ForwardContext, apiPath: string) {
+  const params = new URLSearchParams({ environment: ctx.environment });
+  const response = await fetch(`${localApiBase()}${apiPath}?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${ctx.pat}` },
+  });
+  if (!response.ok) throw new Error(`Preview failed: ${response.status}`);
+  return URL.createObjectURL(await response.blob());
 }
 
 const RESOURCE_TYPE_LABELS: Record<ForwardResourceType, string> = {
@@ -1113,6 +1134,7 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
   useEffect(() => {
     if (!ctx) return;
     let cancelled = false;
+    let objectUrl = '';
     void getCloudFile(ctx, fileId)
       .then((file) => {
         if (cancelled) return;
@@ -1122,13 +1144,23 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
         // 生产环境同源，用相对路径即可。
         // 用 cloud 代理：这里的 fileId 是 Agent 生成的产物，Forward 文件存储看不到它。
         if (isImageFile(file)) {
-          const base = import.meta.env.DEV ? 'http://localhost:3001' : '';
-          const previewUrl = `${base}/api/cloud/files/${encodeURIComponent(fileId)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`;
-          if (!cancelled) setImageUrl(previewUrl);
+          return fetchAuthorizedPreviewObjectUrl(ctx, `/api/cloud/files/${encodeURIComponent(fileId)}/preview`)
+            .then((previewUrl) => {
+              objectUrl = previewUrl;
+              if (cancelled) {
+                URL.revokeObjectURL(previewUrl);
+                return;
+              }
+              setImageUrl(previewUrl);
+            });
         }
+        return undefined;
       })
       .catch(() => { /* filename is best-effort; keep showing the id */ });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
   }, [ctx, fileId]);
 
   const filename = meta?.filename || fileId;
@@ -1479,6 +1511,7 @@ const SentImageAttachment = memo(function SentImageAttachment({
   useEffect(() => {
     if (!ctx || !sessionId) return;
     let cancelled = false;
+    let objectUrl = '';
     void listSessionResources(ctx, sessionId)
       .then(async (page) => {
         if (cancelled) return;
@@ -1488,13 +1521,21 @@ const SentImageAttachment = memo(function SentImageAttachment({
         // broken <img>, so keep the chip in that case.
         const meta = await getCloudFile(ctx, hit.file_id);
         if (cancelled || meta.downloadable === false) return;
-        const base = import.meta.env.DEV ? 'http://localhost:3001' : '';
         // cloud 代理：会话挂载的文件既可能是我们上传的，也可能是 Agent 生成的，
         // 只有 cloud 层能同时看到两者。
-        setUrl(`${base}/api/cloud/files/${encodeURIComponent(hit.file_id)}/preview?pat=${encodeURIComponent(ctx.pat)}&environment=${encodeURIComponent(ctx.environment)}`);
+        const previewUrl = await fetchAuthorizedPreviewObjectUrl(ctx, `/api/cloud/files/${encodeURIComponent(hit.file_id)}/preview`);
+        objectUrl = previewUrl;
+        if (cancelled) {
+          URL.revokeObjectURL(previewUrl);
+          return;
+        }
+        setUrl(previewUrl);
       })
       .catch(() => { /* preview is best-effort; the chip below still names the file */ });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
   }, [ctx, sessionId, path]);
 
   if (!url) {
@@ -2101,8 +2142,14 @@ function ApiEnvironmentSelect({
 export default function App() {
   const [savedAuth] = useState(readSavedAuth);
   const [activePanel, setActivePanel] = useState<SidebarPanel>('chat');
+  const [authMode, setAuthMode] = useState<LoginMode>(savedAuth.authMode);
   const [apiEnvironment, setApiEnvironment] = useState<ForwardApiEnvironment>(savedAuth.apiEnvironment);
   const [pat, setPat] = useState(savedAuth.pat);
+  const [serviceAccountKey, setServiceAccountKey] = useState('');
+  const [serviceAccountToken, setServiceAccountToken] = useState<ForwardServiceAccountToken | null>(null);
+  const [hasReusableServiceAccountToken, setHasReusableServiceAccountToken] = useState(
+    savedAuth.authMode === 'service-account' && !!savedAuth.pat,
+  );
   const [externalId, setExternalId] = useState(savedAuth.externalId);
   const [identity, setIdentity] = useState<ForwardIdentity | null>(null);
   const [templates, setTemplates] = useState<ForwardTemplate[]>([]);
@@ -3091,37 +3138,70 @@ export default function App() {
   }, [ctx, loadModels, loadManagedAgents, loadTemplateResourceOptions]);
 
   const connect = useCallback(async () => {
-    if (!ctx || !externalId.trim()) {
+    const nextExternalId = externalId.trim();
+    const savedToken = pat.trim();
+    const inputServiceAccountKey = serviceAccountKey.trim();
+    if (!nextExternalId) {
+      setError('请输入用户身份');
+      return;
+    }
+    if (authMode === 'pat' && !savedToken) {
       setError('请输入 PAT 和身份');
+      return;
+    }
+    if (authMode === 'service-account' && !inputServiceAccountKey && !(hasReusableServiceAccountToken && savedToken)) {
+      setError('请输入 SA Key 和身份');
       return;
     }
     setLoading(true);
     setError('');
     try {
+      let authToken = savedToken;
+      let issuedToken: ForwardServiceAccountToken | null = null;
+      if (authMode === 'service-account' && inputServiceAccountKey) {
+        const saKeyCtx: ForwardContext = { pat: inputServiceAccountKey, environment: apiEnvironment };
+        issuedToken = await createServiceAccountToken(saKeyCtx, {
+          metadata: { created_by: 'forward-quickstart', login_mode: 'service-account' },
+        });
+        authToken = issuedToken.access_token;
+        setPat(authToken);
+        setServiceAccountToken(issuedToken);
+        setHasReusableServiceAccountToken(true);
+        setServiceAccountKey('');
+      }
+      const loginCtx: ForwardContext = { pat: authToken, environment: apiEnvironment };
       localStorage.setItem(AUTH_KEY, JSON.stringify({
+        authMode,
         apiEnvironment,
-        pat: ctx.pat,
-        externalId: externalId.trim(),
+        pat: loginCtx.pat,
+        externalId: nextExternalId,
+        ...(issuedToken ? {
+          serviceAccountToken: {
+            expires_at: issuedToken.expires_at,
+            subject_type: issuedToken.subject_type,
+            service_account_id: issuedToken.service_account_id,
+          },
+        } : {}),
       }));
-      const nextIdentity = await ensureIdentity(ctx, externalId.trim());
+      const nextIdentity = await ensureIdentity(loginCtx, nextExternalId);
       setIdentity(nextIdentity);
 
-      const templatePage = await listTemplates(ctx);
+      const templatePage = await listTemplates(loginCtx);
       setTemplates(templatePage.data);
       setActivePanel('chat');
       // Preload models for template creation dropdown
-      void loadModels(ctx);
+      void loadModels(loginCtx);
 
       // Check localStorage for last used template ID
-      const lastTemplateKey = `last_template_${apiEnvironment}_${externalId.trim()}`;
+      const lastTemplateKey = `last_template_${apiEnvironment}_${nextExternalId}`;
       const lastTemplateId = localStorage.getItem(lastTemplateKey);
       const templateExists = lastTemplateId && templatePage.data.some((t) => t.id === lastTemplateId);
       const nextTemplateId = templateExists ? lastTemplateId! : (templatePage.data[0]?.id ?? '');
 
       setTemplateId(nextTemplateId);
-      void loadManagedResources(resourceType);
+      void listResourceCatalog(loginCtx, resourceType).then((page) => setResources(page.data)).catch(() => undefined);
       if (nextTemplateId) {
-        const sessionPage = await listSessions(ctx, nextIdentity.id, nextTemplateId);
+        const sessionPage = await listSessions(loginCtx, nextIdentity.id, nextTemplateId);
         setSessions(sessionPage.data);
         // Don't auto-select a session - show empty chat welcome screen
         currentSessionIdRef.current = '';
@@ -3132,7 +3212,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [apiEnvironment, ctx, externalId, loadManagedResources, loadModels, resourceType]);
+  }, [apiEnvironment, authMode, externalId, hasReusableServiceAccountToken, loadModels, pat, resourceType, serviceAccountKey]);
 
   const handleCreateEnvironment = useCallback(async () => {
     if (!ctx || !newEnvName.trim()) return;
@@ -4012,6 +4092,10 @@ export default function App() {
   const logout = useCallback(() => {
     streamAbort.current?.abort();
     localStorage.removeItem(AUTH_KEY);
+    setPat('');
+    setServiceAccountKey('');
+    setServiceAccountToken(null);
+    setHasReusableServiceAccountToken(false);
     setIdentity(null);
     setTemplates([]);
     setTemplateId('');
@@ -4067,6 +4151,10 @@ export default function App() {
   const removeSelection = (id: string, setter: Dispatch<SetStateAction<string>>) => {
     setter((prev) => splitTokens(prev).filter((item) => item !== id).join('\n'));
   };
+  const hasLoginCredential = authMode === 'pat'
+    ? pat.trim().length > 0
+    : serviceAccountKey.trim().length > 0 || (hasReusableServiceAccountToken && pat.trim().length > 0);
+  const canSubmitLogin = hasLoginCredential && externalId.trim().length > 0;
 
   if (!identity) {
     return (
@@ -4102,20 +4190,69 @@ export default function App() {
                     }}
                   />
                 </label>
-                <label className="block">
-                  <span className="mb-1.5 block text-xs font-medium text-black/50">
-                    访问令牌 (PAT)
-                  </span>
-                  <input
-                    value={pat}
-                    onChange={(event) => {
-                      setPat(event.target.value);
+                <div className="grid grid-cols-2 gap-2 rounded-xl bg-[#F4F6FC] p-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthMode('pat');
+                      setPat('');
+                      setServiceAccountKey('');
+                      setServiceAccountToken(null);
+                      setHasReusableServiceAccountToken(false);
                       setError('');
                     }}
-                    placeholder="粘贴你的 Personal Access Token"
+                    className={`h-9 rounded-lg text-sm font-medium transition ${
+                      authMode === 'pat' ? 'bg-white text-[#3550FF] shadow-sm' : 'text-black/50 hover:text-black/75'
+                    }`}
+                  >
+                    PAT
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (authMode !== 'service-account') {
+                        setPat('');
+                        setServiceAccountToken(null);
+                        setHasReusableServiceAccountToken(false);
+                      }
+                      setAuthMode('service-account');
+                      setError('');
+                    }}
+                    className={`h-9 rounded-lg text-sm font-medium transition ${
+                      authMode === 'service-account' ? 'bg-white text-[#3550FF] shadow-sm' : 'text-black/50 hover:text-black/75'
+                    }`}
+                  >
+                    Service Account
+                  </button>
+                </div>
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-medium text-black/50">
+                    {authMode === 'pat' ? '访问令牌 (PAT)' : 'SA Key'}
+                  </span>
+                  <input
+                    value={authMode === 'pat' ? pat : serviceAccountKey}
+                    onChange={(event) => {
+                      if (authMode === 'pat') {
+                        setPat(event.target.value);
+                        setHasReusableServiceAccountToken(false);
+                      }
+                      else setServiceAccountKey(event.target.value);
+                      setError('');
+                    }}
+                    placeholder={authMode === 'pat' ? '粘贴你的 Personal Access Token' : '粘贴你的 Service Account Key'}
                     className="h-11 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none transition placeholder:text-black/25 focus:border-[#3550FF] focus:shadow-[0_0_0_3px_rgba(53,80,255,0.08)]"
                     autoFocus
                   />
+                  {authMode === 'service-account' && hasReusableServiceAccountToken && pat.trim() && !serviceAccountKey.trim() && (
+                    <span className="mt-1.5 block text-[11px] text-black/35">
+                      已保存上次签发的 Service Account Token；留空将直接复用，填写 SA Key 会重新签发。
+                    </span>
+                  )}
+                  {authMode === 'service-account' && serviceAccountToken?.expires_at && (
+                    <span className="mt-1.5 block text-[11px] text-black/35">
+                      本次签发的 SAT 有效期至 {new Date(serviceAccountToken.expires_at).toLocaleString()}
+                    </span>
+                  )}
                 </label>
                 <label className="block">
                   <span className="mb-1.5 block text-xs font-medium text-black/50">用户身份</span>
@@ -4137,7 +4274,7 @@ export default function App() {
                 )}
                 <button
                   type="button"
-                  disabled={loading || !pat.trim() || !externalId.trim()}
+                  disabled={loading || !canSubmitLogin}
                   onClick={() => void connect()}
                   className="mt-2 flex h-11 w-full items-center justify-center rounded-xl bg-[#3550FF] text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:cursor-not-allowed disabled:opacity-40"
                 >
@@ -4151,7 +4288,7 @@ export default function App() {
               </form>
             </div>
             <p className="mt-5 text-center text-xs text-black/30">
-              需要 PAT？前往{' '}
+              {authMode === 'pat' ? '需要 PAT？前往' : '需要 SA Key？前往'}{' '}
               <a
                 href={apiEnvironment === 'cn-prod' ? 'https://qoder.com.cn/cloud/pat-keys' : 'https://qoder.com/cloud/pat-keys'}
                 target="_blank"
