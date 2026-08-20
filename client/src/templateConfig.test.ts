@@ -30,6 +30,7 @@ describe('template model config', () => {
     expect(isTemplateCreatableModel(models[1])).toBe(true);
     expect(isTemplateCreatableModel(models[2])).toBe(false);
     expect(pickTemplateCreatableModelId(models, 'auto')).toBe('qmodel_38max');
+    expect(pickTemplateCreatableModelId(models, 'ultimate')).toBe('qmodel_38max');
     expect(pickTemplateCreatableModelId(models, 'qmodel_38max')).toBe('qmodel_38max');
   });
 });

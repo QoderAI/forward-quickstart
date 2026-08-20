@@ -527,7 +527,7 @@ export async function getCloudVault(ctx: ForwardContext, vaultId: string) {
 export async function createCloudVault(ctx: ForwardContext, input: { display_name: string; metadata?: Record<string, unknown> }) {
   return forwardRequest<CloudVault>(ctx, 'POST', '/vaults', {
     display_name: input.display_name,
-    metadata: input.metadata || { created_by: 'forward-quickstart' },
+    ...(input.metadata ? { metadata: input.metadata } : {}),
   });
 }
 

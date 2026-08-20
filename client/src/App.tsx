@@ -2350,6 +2350,12 @@ export default function App() {
     }
   }, [templateModel]);
 
+  useEffect(() => {
+    if (!showTemplateModal || editingTemplateId || cloudModels.length === 0) return;
+    const nextModelId = pickTemplateCreatableModelId(cloudModels, templateModel);
+    if (nextModelId !== templateModel) setTemplateModel(nextModelId);
+  }, [cloudModels, editingTemplateId, showTemplateModal, templateModel]);
+
   // Load managed agents for the multiagent roster picker. Forward templates
   // don't expose their backing agent_id, so the editor lists agents by name
   // (each template compiles to a managed agent with a matching name).
@@ -3062,7 +3068,7 @@ export default function App() {
     setEditingTemplateId(null);
     setTemplateName('');
     setTemplateDescription('');
-    setTemplateModel('ultimate');
+    setTemplateModel(pickTemplateCreatableModelId(cloudModels, ''));
     setTemplateModelEffort('');
     setTemplateContextWindow('');
     setTemplateSystem('');
@@ -3083,7 +3089,7 @@ export default function App() {
     setShowTemplateModal(true);
     void loadTemplateResourceOptions();
     if (ctx) { void loadModels(ctx); void loadManagedAgents(ctx); }
-  }, [ctx, loadModels, loadManagedAgents, loadTemplateResourceOptions]);
+  }, [cloudModels, ctx, loadModels, loadManagedAgents, loadTemplateResourceOptions]);
 
   const openEditTemplateModal = useCallback((template: ForwardTemplate) => {
     setEditingTemplateId(template.id);
