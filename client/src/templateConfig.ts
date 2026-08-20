@@ -1,4 +1,4 @@
-import type { ForwardTemplateModel, TemplateResourceBindings } from './forwardApi';
+import type { CloudModel, ForwardTemplateModel, TemplateResourceBindings } from './forwardApi';
 
 export interface TemplateModelConfig {
   id: string;
@@ -41,6 +41,17 @@ export function buildTemplateModel(
         ...(cleanContext ? { context_window: cleanContext } : {}),
       }
     : cleanId;
+}
+
+export function isTemplateCreatableModel(model: CloudModel): boolean {
+  const id = model.id.trim().toLowerCase();
+  return !!id && id !== 'auto' && model.is_enabled !== false;
+}
+
+export function pickTemplateCreatableModelId(models: CloudModel[], currentId: string): string {
+  const creatableModels = models.filter(isTemplateCreatableModel);
+  if (creatableModels.some((model) => model.id === currentId)) return currentId;
+  return creatableModels[0]?.id ?? currentId;
 }
 
 /** Normalize current object bindings and legacy string-array responses to enabled IDs. */

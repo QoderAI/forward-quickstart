@@ -3,7 +3,6 @@ import {
   cancelSession,
   createCloudEnvironment,
   createCloudVault,
-  updateCloudVault,
   createSession,
   deleteForwardFile,
   getCloudFile,
@@ -103,8 +102,10 @@ import {
 import {
   buildTemplateBindings,
   buildTemplateModel,
+  isTemplateCreatableModel,
   parseTemplateBindingIds,
   parseTemplateModel,
+  pickTemplateCreatableModelId,
 } from './templateConfig';
 import {
   derivePendingQuestion,
@@ -294,6 +295,15 @@ async function fetchAuthorizedPreviewObjectUrl(ctx: ForwardContext, apiPath: str
   });
   if (!response.ok) throw new Error(`Preview failed: ${response.status}`);
   return URL.createObjectURL(await response.blob());
+}
+
+async function fetchFilePreviewObjectUrl(ctx: ForwardContext, fileId: string) {
+  const encoded = encodeURIComponent(fileId);
+  try {
+    return await fetchAuthorizedPreviewObjectUrl(ctx, `/api/forward/files/${encoded}/preview`);
+  } catch (err) {
+    return fetchAuthorizedPreviewObjectUrl(ctx, `/api/cloud/files/${encoded}/preview`);
+  }
 }
 
 const RESOURCE_TYPE_LABELS: Record<ForwardResourceType, string> = {
@@ -1142,9 +1152,8 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
         // 图片类型：通过服务端代理预览（绕过 OSS CORS 和 attachment 头）
         // dev 模式下直接请求 Express 端口（3001）避免 Vite proxy 覆盖 Content-Type；
         // 生产环境同源，用相对路径即可。
-        // 用 cloud 代理：这里的 fileId 是 Agent 生成的产物，Forward 文件存储看不到它。
         if (isImageFile(file)) {
-          return fetchAuthorizedPreviewObjectUrl(ctx, `/api/cloud/files/${encodeURIComponent(fileId)}/preview`)
+          return fetchFilePreviewObjectUrl(ctx, fileId)
             .then((previewUrl) => {
               objectUrl = previewUrl;
               if (cancelled) {
@@ -1500,11 +1509,13 @@ const SentImageAttachment = memo(function SentImageAttachment({
   sessionId,
   name,
   path,
+  fileId,
 }: {
   ctx: ForwardContext | null;
   sessionId?: string;
   name: string;
   path: string;
+  fileId?: string;
 }) {
   const [url, setUrl] = useState<string | null>(null);
 
@@ -1512,31 +1523,33 @@ const SentImageAttachment = memo(function SentImageAttachment({
     if (!ctx || !sessionId) return;
     let cancelled = false;
     let objectUrl = '';
-    void listSessionResources(ctx, sessionId)
-      .then(async (page) => {
+    const loadByFileId = async (resolvedFileId: string) => {
+      const meta = await getCloudFile(ctx, resolvedFileId);
+      if (cancelled || meta.downloadable === false) return;
+      const previewUrl = await fetchFilePreviewObjectUrl(ctx, resolvedFileId);
+      objectUrl = previewUrl;
+      if (cancelled) {
+        URL.revokeObjectURL(previewUrl);
+        return;
+      }
+      setUrl(previewUrl);
+    };
+
+    const load = fileId
+      ? loadByFileId(fileId)
+      : listSessionResources(ctx, sessionId)
+        .then(async (page) => {
         if (cancelled) return;
         const hit = (page.data || []).find((r) => r.type === 'file' && r.mount_path === path);
         if (!hit?.file_id) return;
-        // Ask the Files API first: a non-downloadable file would only produce a
-        // broken <img>, so keep the chip in that case.
-        const meta = await getCloudFile(ctx, hit.file_id);
-        if (cancelled || meta.downloadable === false) return;
-        // cloud 代理：会话挂载的文件既可能是我们上传的，也可能是 Agent 生成的，
-        // 只有 cloud 层能同时看到两者。
-        const previewUrl = await fetchAuthorizedPreviewObjectUrl(ctx, `/api/cloud/files/${encodeURIComponent(hit.file_id)}/preview`);
-        objectUrl = previewUrl;
-        if (cancelled) {
-          URL.revokeObjectURL(previewUrl);
-          return;
-        }
-        setUrl(previewUrl);
-      })
-      .catch(() => { /* preview is best-effort; the chip below still names the file */ });
+        await loadByFileId(hit.file_id);
+      });
+    void load.catch(() => { /* preview is best-effort; the chip below still names the file */ });
     return () => {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [ctx, sessionId, path]);
+  }, [ctx, sessionId, path, fileId]);
 
   if (!url) {
     return (
@@ -1568,6 +1581,7 @@ const ChatTextMessage = memo(function ChatTextMessage({ event, user, ctx }: { ev
                   sessionId={event.session_id}
                   name={a.name}
                   path={a.path}
+                  fileId={a.fileId}
                 />
               ) : (
                 <span key={a.path} title={a.path} className="inline-flex max-w-[220px] items-center gap-1 rounded-lg bg-white/80 px-2 py-0.5 text-[12px] leading-4 text-black/60">
@@ -2325,8 +2339,9 @@ export default function App() {
       const res = await listCloudModels(context);
       const models = res.data ?? [];
       setCloudModels(models);
-      if (models.length > 0 && !models.find((m) => m.id === templateModel)) {
-        setTemplateModel(models[0].id);
+      const nextModelId = pickTemplateCreatableModelId(models, templateModel);
+      if (nextModelId !== templateModel) {
+        setTemplateModel(nextModelId);
       }
     } catch (err) {
       setModelsError(err instanceof Error ? err.message : String(err));
@@ -3351,11 +3366,6 @@ export default function App() {
             description: desc,
           });
           break;
-        case 'vault':
-          await updateCloudVault(ctx, editingResource.id, {
-            ...(name ? { display_name: name } : {}),
-          });
-          break;
         default:
           throw new Error('暂不支持编辑此类型资源');
       }
@@ -3946,7 +3956,10 @@ export default function App() {
       return name;
     });
     const displayText = text || '请查看我上传的附件。';
-    const finalText = composeMessageWithAttachments(displayText, mountNames);
+    const finalText = composeMessageWithAttachments(displayText, readyAttachments.map((attachment, index) => ({
+      name: mountNames[index],
+      fileId: attachment.fileId,
+    })));
     const turnStartedAt = new Date().toISOString();
     let localThinkingId = '';
     setInput('');
@@ -5895,15 +5908,17 @@ export default function App() {
           )}
 
           {/* Name field */}
-          <label className="block">
-            <span className="mb-1.5 block text-xs font-medium text-black/50">名称</span>
-            <input
-              value={editName}
-              onChange={(e) => setEditName(e.target.value)}
-              className="h-11 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none transition focus:border-[#3550FF] focus:shadow-[0_0_0_3px_rgba(53,80,255,0.08)]"
-              autoFocus
-            />
-          </label>
+          {editingResource?.type !== 'vault' && (
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-medium text-black/50">名称</span>
+              <input
+                value={editName}
+                onChange={(e) => setEditName(e.target.value)}
+                className="h-11 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none transition focus:border-[#3550FF] focus:shadow-[0_0_0_3px_rgba(53,80,255,0.08)]"
+                autoFocus
+              />
+            </label>
+          )}
 
           {/* Description */}
           {editingResource?.type !== 'file' && editingResource?.type !== 'vault' && (
@@ -6122,18 +6137,20 @@ export default function App() {
           )}
 
           {/* Submit */}
-          <button
-            onClick={() => void handleSaveEdit()}
-            disabled={!ctx || loading || !editName.trim()}
-            className="flex h-12 w-full items-center justify-center rounded-xl bg-[#3550FF] text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {loading ? (
-              <span className="flex items-center gap-2">
-                <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-                保存中...
-              </span>
-            ) : '保存修改'}
-          </button>
+          {editingResource?.type !== 'vault' && (
+            <button
+              onClick={() => void handleSaveEdit()}
+              disabled={!ctx || loading || !editName.trim()}
+              className="flex h-12 w-full items-center justify-center rounded-xl bg-[#3550FF] text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {loading ? (
+                <span className="flex items-center gap-2">
+                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                  保存中...
+                </span>
+              ) : '保存修改'}
+            </button>
+          )}
         </div>
       </Modal>
 
@@ -6573,7 +6590,7 @@ export default function App() {
                     }}
                     className="h-10 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none transition focus:border-[#3550FF]"
                   >
-                    {cloudModels.map((m) => (
+                    {cloudModels.filter(isTemplateCreatableModel).map((m) => (
                       <option key={m.id} value={m.id}>
                         {m.display_name}{m.is_new ? ' 🆕' : ''}{m.source === 'user' ? ' (自定义)' : ''}
                       </option>

@@ -404,20 +404,12 @@ export async function deleteCloudSkill(ctx: ForwardContext, skillId: string) {
   return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/skills/${encodeURIComponent(skillId)}`);
 }
 
-// ─── Files (mixed layer — read the note) ───────────────────────────
+// ─── Files (Forward-first, Cloud fallback) ─────────────────────────
 //
-// Files are the one family where the two layers are NOT interchangeable:
-//
-//   - Files uploaded by us land in the Forward store and are visible on BOTH
-//     layers, so uploading via Forward is safe.
-//   - Files produced by the AGENT during a session (ImageGen output, generated
-//     documents, batch error files) exist ONLY on the cloud layer. Verified
-//     live: GET /forward/files/{artifact_id} → 404 "resource not found", while
-//     GET /cloud/files/{artifact_id} → 200.
-//
-// So the cloud layer is a strict superset for reads. Any operation that takes a
-// file id we did not just create (metadata, download, preview, delete) must go
-// through cloud, or it 404s on agent-generated artifacts.
+// Service Account Tokens cannot read the Cloud file layer, so user-uploaded
+// files must go through Forward. Some older agent-generated artifacts may still
+// be Cloud-only for PAT users, so arbitrary read paths fall back to Cloud on a
+// Forward 404.
 
 export interface CloudFile {
   id: string;
@@ -434,10 +426,16 @@ export async function listCloudFiles(ctx: ForwardContext) {
   return forwardRequest<{ data: CloudFile[] }>(ctx, 'GET', '/files', undefined, { limit: 50 });
 }
 
-// Metadata for an arbitrary file id (chat artifacts, session-mounted files).
-// Cloud layer: see the note above — Forward cannot see agent-generated files.
 export async function getCloudFile(ctx: ForwardContext, fileId: string) {
-  return cloudRequest<CloudFile>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}`);
+  const path = `/files/${encodeURIComponent(fileId)}`;
+  try {
+    return await forwardRequest<CloudFile>(ctx, 'GET', path);
+  } catch (err) {
+    if (err instanceof ForwardApiError && err.status === 404) {
+      return cloudRequest<CloudFile>(ctx, 'GET', path);
+    }
+    throw err;
+  }
 }
 
 export async function uploadCloudFile(
@@ -471,17 +469,29 @@ export async function uploadCloudFile(
   return data as CloudFile;
 }
 
-// Signed download URL for an arbitrary file id. Cloud layer: this is what the
-// chat artifact download button and the batch error-file download both use, and
-// those ids are agent/system-generated, hence invisible to Forward.
+// Signed download URL for an arbitrary file id.
 export async function downloadCloudFile(ctx: ForwardContext, fileId: string) {
-  return cloudRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}/content`);
+  const path = `/files/${encodeURIComponent(fileId)}/content`;
+  try {
+    return await forwardRequest<{ url: string; expires_at?: string }>(ctx, 'GET', path);
+  } catch (err) {
+    if (err instanceof ForwardApiError && err.status === 404) {
+      return cloudRequest<{ url: string; expires_at?: string }>(ctx, 'GET', path);
+    }
+    throw err;
+  }
 }
 
-// Cloud-only cleanup for agent/system-generated artifacts. User-managed resource
-// deletion uses deleteForwardFile so its lifecycle matches the console.
 export async function deleteCloudFile(ctx: ForwardContext, fileId: string) {
-  return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', `/files/${encodeURIComponent(fileId)}`);
+  const path = `/files/${encodeURIComponent(fileId)}`;
+  try {
+    return await forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', path);
+  } catch (err) {
+    if (err instanceof ForwardApiError && err.status === 404) {
+      return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', path);
+    }
+    throw err;
+  }
 }
 
 /** Delete a user-managed Forward file. Agent-generated artifacts still use deleteCloudFile. */
@@ -1292,14 +1302,16 @@ export async function getScheduleRun(ctx: ForwardContext, runId: string) {
   return forwardRequest<ForwardScheduleRun>(ctx, 'GET', `/schedule_runs/${encodeURIComponent(runId)}`);
 }
 
-// ─── Memory Stores (Cloud API) ─────────────────────────────────────
+// ─── Memory Stores (Forward API) ───────────────────────────────────
 
 export interface MemoryEntry {
   id: string;
   type: 'memory';
-  store_id: string;
+  memory_store_id: string;
+  store_id?: string;
   path: string;
   size: number;
+  content_size_bytes?: number;
   content_sha256: string;
   version: number;
   metadata?: Record<string, unknown>;
@@ -1308,13 +1320,23 @@ export interface MemoryEntry {
 }
 
 export async function listMemoryEntries(ctx: ForwardContext, storeId: string) {
-  return cloudRequest<Page<MemoryEntry>>(ctx, 'GET', `/memory_stores/${encodeURIComponent(storeId)}/memories`, undefined, {
+  const page = await forwardRequest<Page<MemoryEntry>>(ctx, 'GET', `/memory_stores/${encodeURIComponent(storeId)}/memories`, undefined, {
     limit: 100,
   });
+  return { ...page, data: page.data.map(normalizeMemoryEntry) };
 }
 
 export async function getMemoryEntry(ctx: ForwardContext, storeId: string, entryId: string) {
-  return cloudRequest<MemoryEntry & { content?: string }>(ctx, 'GET', `/memory_stores/${encodeURIComponent(storeId)}/memories/${encodeURIComponent(entryId)}`);
+  const entry = await forwardRequest<MemoryEntry & { content?: string }>(ctx, 'GET', `/memory_stores/${encodeURIComponent(storeId)}/memories/${encodeURIComponent(entryId)}`);
+  return normalizeMemoryEntry(entry);
+}
+
+function normalizeMemoryEntry<T extends MemoryEntry>(entry: T): T {
+  return {
+    ...entry,
+    size: entry.size ?? entry.content_size_bytes ?? 0,
+    store_id: entry.store_id ?? entry.memory_store_id,
+  };
 }
 
 // ─── Channels (Forward API) ────────────────────────────────────────

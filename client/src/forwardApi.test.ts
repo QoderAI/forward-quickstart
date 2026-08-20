@@ -5,8 +5,12 @@ import {
   deleteCloudSkill,
   deleteCloudVault,
   deleteForwardFile,
+  downloadCloudFile,
+  getCloudFile,
+  getMemoryEntry,
   listResourceCatalog,
   listEvents,
+  listMemoryEntries,
   updateCloudEnvironment,
   updateCloudSkill,
   updateCloudVault,
@@ -55,6 +59,83 @@ describe('listEvents', () => {
       ].join(','),
     });
     expect(requestBody.query).not.toHaveProperty('types[]');
+  });
+});
+
+describe('memory store endpoints', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  test('lists memories through the Forward API and normalizes size fields', async () => {
+    let requestUrl = '';
+    let requestBody: { path?: string; method?: string } = {};
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input);
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        data: [{
+          id: 'mem_1',
+          type: 'memory',
+          memory_store_id: 'memstore_1',
+          path: 'notes.md',
+          content_size_bytes: 42,
+          content_sha256: 'sha',
+          version: 1,
+        }],
+        has_more: false,
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    const ctx: ForwardContext = { pat: 'sat_test', environment: 'cn-prod' };
+    const page = await listMemoryEntries(ctx, 'memstore_1');
+
+    expect(requestUrl).toBe('/api/forward/request');
+    expect(requestBody).toMatchObject({
+      method: 'GET',
+      path: '/memory_stores/memstore_1/memories',
+    });
+    expect(page.data[0]).toMatchObject({
+      memory_store_id: 'memstore_1',
+      store_id: 'memstore_1',
+      size: 42,
+    });
+  });
+
+  test('gets memory content through the Forward API', async () => {
+    let requestUrl = '';
+    let requestBody: { path?: string; method?: string } = {};
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input);
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        id: 'mem_1',
+        type: 'memory',
+        memory_store_id: 'memstore_1',
+        path: 'notes.md',
+        content: 'hello',
+        content_size_bytes: 5,
+        content_sha256: 'sha',
+        version: 1,
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    const ctx: ForwardContext = { pat: 'sat_test', environment: 'cn-prod' };
+    const entry = await getMemoryEntry(ctx, 'memstore_1', 'mem_1');
+
+    expect(requestUrl).toBe('/api/forward/request');
+    expect(requestBody).toMatchObject({
+      method: 'GET',
+      path: '/memory_stores/memstore_1/memories/mem_1',
+    });
+    expect(entry.content).toBe('hello');
+    expect(entry.size).toBe(5);
   });
 });
 
@@ -147,6 +228,81 @@ describe('resource lifecycle endpoints', () => {
 
     expect(requestBody).toMatchObject({ path, body: input });
     expect(requestBody.method).toBe(type === 'skill' ? 'PUT' : 'POST');
+  });
+});
+
+describe('file endpoints', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  test('reads file metadata through Forward first', async () => {
+    let requestUrl = '';
+    let requestBody: { path?: string; method?: string } = {};
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requestUrl = String(input);
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        id: 'file_1',
+        type: 'file',
+        filename: 'demo.png',
+        size_bytes: 12,
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    const ctx: ForwardContext = { pat: 'sat_test', environment: 'cn-prod' };
+    await getCloudFile(ctx, 'file_1');
+
+    expect(requestUrl).toBe('/api/forward/request');
+    expect(requestBody).toMatchObject({ method: 'GET', path: '/files/file_1' });
+  });
+
+  test('falls back to Cloud for Cloud-only file artifacts after a Forward 404', async () => {
+    const requests: Array<{ url: string; body: { path?: string; method?: string } }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      requests.push({ url: String(input), body });
+      if (requests.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'not found' } }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({
+        id: 'file_1',
+        type: 'file',
+        filename: 'artifact.png',
+        size_bytes: 12,
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    const ctx: ForwardContext = { pat: 'pat_test', environment: 'cn-prod' };
+    await getCloudFile(ctx, 'file_1');
+
+    expect(requests.map((request) => request.url)).toEqual(['/api/forward/request', '/api/cloud/request']);
+    expect(requests.map((request) => request.body.path)).toEqual(['/files/file_1', '/files/file_1']);
+  });
+
+  test('downloads files through Forward first', async () => {
+    let requestBody: { path?: string; method?: string } = {};
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ url: 'https://example.test/file' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    const ctx: ForwardContext = { pat: 'sat_test', environment: 'cn-prod' };
+    await downloadCloudFile(ctx, 'file_1');
+
+    expect(requestBody).toMatchObject({ method: 'GET', path: '/files/file_1/content' });
   });
 });
 
