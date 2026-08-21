@@ -2397,8 +2397,8 @@ export default function App() {
   const currentSessionIdRef = useRef('');
 
   const ctx = useMemo<ForwardContext | null>(
-    () => (pat.trim() ? { pat: pat.trim(), environment: apiEnvironment } : null),
-    [apiEnvironment, pat],
+    () => (pat.trim() ? { pat: pat.trim(), environment: apiEnvironment, authMode } : null),
+    [apiEnvironment, authMode, pat],
   );
   const voiceAvailability = useVoiceAvailability(ctx, templateId);
   useEffect(() => { setVoiceViewOpen(false); setCurrentVoiceConversationId(null); }, [templateId]);
@@ -3180,7 +3180,7 @@ export default function App() {
       let authToken = savedToken;
       let issuedToken: ForwardServiceAccountToken | null = null;
       if (authMode === 'service-account' && inputServiceAccountKey) {
-        const saKeyCtx: ForwardContext = { pat: inputServiceAccountKey, environment: apiEnvironment };
+        const saKeyCtx: ForwardContext = { pat: inputServiceAccountKey, environment: apiEnvironment, authMode };
         issuedToken = await createServiceAccountToken(saKeyCtx, {
           metadata: { created_by: 'forward-quickstart', login_mode: 'service-account' },
         });
@@ -3190,7 +3190,7 @@ export default function App() {
         setHasReusableServiceAccountToken(true);
         setServiceAccountKey('');
       }
-      const loginCtx: ForwardContext = { pat: authToken, environment: apiEnvironment };
+      const loginCtx: ForwardContext = { pat: authToken, environment: apiEnvironment, authMode };
       localStorage.setItem(AUTH_KEY, JSON.stringify({
         authMode,
         apiEnvironment,

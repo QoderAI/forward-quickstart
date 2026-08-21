@@ -7,6 +7,7 @@ export interface ForwardContext {
   // PAT; in Service Account mode this is the exchanged Service Account Token.
   pat: string;
   environment: ForwardApiEnvironment;
+  authMode?: 'pat' | 'service-account';
 }
 
 export interface ForwardIdentity {
@@ -255,6 +256,10 @@ async function cloudRequest<T>(
   return data as T;
 }
 
+function canUseCloudFileFallback(ctx: ForwardContext) {
+  return ctx.authMode !== 'service-account';
+}
+
 export interface CloudEnvironment {
   id: string;
   type: string;
@@ -431,7 +436,7 @@ export async function getCloudFile(ctx: ForwardContext, fileId: string) {
   try {
     return await forwardRequest<CloudFile>(ctx, 'GET', path);
   } catch (err) {
-    if (err instanceof ForwardApiError && err.status === 404) {
+    if (canUseCloudFileFallback(ctx) && err instanceof ForwardApiError && err.status === 404) {
       return cloudRequest<CloudFile>(ctx, 'GET', path);
     }
     throw err;
@@ -475,7 +480,7 @@ export async function downloadCloudFile(ctx: ForwardContext, fileId: string) {
   try {
     return await forwardRequest<{ url: string; expires_at?: string }>(ctx, 'GET', path);
   } catch (err) {
-    if (err instanceof ForwardApiError && err.status === 404) {
+    if (canUseCloudFileFallback(ctx) && err instanceof ForwardApiError && err.status === 404) {
       return cloudRequest<{ url: string; expires_at?: string }>(ctx, 'GET', path);
     }
     throw err;
@@ -487,7 +492,7 @@ export async function deleteCloudFile(ctx: ForwardContext, fileId: string) {
   try {
     return await forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', path);
   } catch (err) {
-    if (err instanceof ForwardApiError && err.status === 404) {
+    if (canUseCloudFileFallback(ctx) && err instanceof ForwardApiError && err.status === 404) {
       return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', path);
     }
     throw err;

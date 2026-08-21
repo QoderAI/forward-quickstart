@@ -6,6 +6,7 @@ import {
   deleteCloudVault,
   deleteForwardFile,
   downloadCloudFile,
+  ForwardApiError,
   getCloudFile,
   getMemoryEntry,
   listResourceCatalog,
@@ -303,6 +304,52 @@ describe('file endpoints', () => {
     await downloadCloudFile(ctx, 'file_1');
 
     expect(requestBody).toMatchObject({ method: 'GET', path: '/files/file_1/content' });
+  });
+
+  test('falls back to Cloud for PAT file downloads after a Forward 404', async () => {
+    const requests: Array<{ url: string; body: { path?: string; method?: string } }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      requests.push({ url: String(input), body });
+      if (requests.length === 1) {
+        return new Response(JSON.stringify({ error: { message: 'resource not found' } }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ url: 'https://example.test/file' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    const ctx: ForwardContext = { pat: 'pat_test', environment: 'cn-prod', authMode: 'pat' };
+    const resp = await downloadCloudFile(ctx, 'file_1');
+
+    expect(resp.url).toBe('https://example.test/file');
+    expect(requests.map((request) => request.url)).toEqual(['/api/forward/request', '/api/cloud/request']);
+    expect(requests.map((request) => request.body.path)).toEqual(['/files/file_1/content', '/files/file_1/content']);
+  });
+
+  test('does not fall back to Cloud for service account file downloads', async () => {
+    const requests: Array<{ url: string; body: { path?: string; method?: string } }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      requests.push({ url: String(input), body });
+      return new Response(JSON.stringify({ error: { message: 'resource not found' } }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    const ctx: ForwardContext = { pat: 'sat_test', environment: 'cn-prod', authMode: 'service-account' };
+    await expect(downloadCloudFile(ctx, 'file_1')).rejects.toMatchObject({
+      status: 404,
+      message: 'resource not found',
+    } satisfies Partial<ForwardApiError>);
+
+    expect(requests.map((request) => request.url)).toEqual(['/api/forward/request']);
+    expect(requests[0].body).toMatchObject({ method: 'GET', path: '/files/file_1/content' });
   });
 });
 
