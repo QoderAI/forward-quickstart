@@ -57,6 +57,7 @@ import {
   deleteChannel,
   buildChannelCredentials,
   channelTypesForEnvironment,
+  getTeamsCallbackUrl,
   CHANNEL_MAX_COUNTS,
   waitForChannelBinding,
   listManagedAgents,
@@ -84,6 +85,7 @@ import { isImageFile } from './imageUtils';
 import { BatchPanel } from './batchPanel';
 import { UsagePanel } from './usagePanel';
 import { VoiceEntryButton } from './voice/VoiceEntryButton';
+import { channelBindingModes } from './channelBinding';
 import { VoiceSessionView } from './voice/VoiceSessionView';
 import { useVoiceAvailability } from './voice/useVoiceAvailability';
 import { isVoiceSession } from './voice/voiceSession';
@@ -163,13 +165,27 @@ const CHANNEL_TYPES: Array<{ value: ChannelType; label: string; icon: string; qr
   { value: 'feishu', label: '飞书', icon: '🐦', qrSupport: true, manualSupport: true },
   { value: 'lark', label: 'Lark', icon: '🪽', qrSupport: false, manualSupport: true },
   { value: 'slack', label: 'Slack', icon: '💠', qrSupport: false, manualSupport: true },
+  { value: 'teams', label: 'Teams', icon: '🟦', qrSupport: false, manualSupport: true },
 ];
 
 function channelCredentialLabels(channelType: ChannelType): { key: string; secret: string } {
   if (channelType === 'feishu' || channelType === 'lark') return { key: 'App ID', secret: 'App Secret' };
   if (channelType === 'dingtalk') return { key: 'Client ID', secret: 'Client Secret' };
   if (channelType === 'slack') return { key: 'App Token', secret: 'Bot Token' };
+  if (channelType === 'teams') return { key: 'App ID', secret: 'Client Secret' };
   return { key: 'Bot ID', secret: 'Secret' };
+}
+
+function TeamsCallbackGuidance() {
+  return (
+    <div className="rounded-lg border border-blue-100 bg-blue-50 px-3 py-2.5 text-[11px] leading-4 text-blue-700">
+      <div className="flex items-start justify-between gap-3">
+        <span>请先在 Microsoft Teams Developer Portal 中配置 Messaging Endpoint：</span>
+        <a href="https://dev.teams.microsoft.com/tools/bots" target="_blank" rel="noopener noreferrer" className="shrink-0 font-medium text-[#3550FF] hover:underline">前往配置 →</a>
+      </div>
+      <code className="mt-2 block break-all rounded-md bg-white px-2.5 py-2 font-mono text-[10px] text-black/65">{getTeamsCallbackUrl()}</code>
+    </div>
+  );
 }
 
 const MODEL_DISPLAY_NAMES: Record<string, string> = {
@@ -2316,6 +2332,7 @@ export default function App() {
   const [createdChannelId, setCreatedChannelId] = useState<string | null>(null);
   const [chanAppKey, setChanAppKey] = useState('');
   const [chanAppSecret, setChanAppSecret] = useState('');
+  const [chanTenantId, setChanTenantId] = useState('');
   const [chanShowTools, setChanShowTools] = useState(false);
   const [chanShowThinking, setChanShowThinking] = useState(false);
   const [editingChannelItem, setEditingChannelItem] = useState<ForwardChannel | null>(null);
@@ -2920,7 +2937,7 @@ export default function App() {
 
   const handleSaveCredentials = useCallback(async () => {
     if (!ctx || !identity) return;
-    if (!chanAppKey.trim() || !chanAppSecret.trim()) return;
+    if (!chanAppKey.trim() || !chanAppSecret.trim() || (chanType === 'teams' && !chanTenantId.trim())) return;
     if (channels.filter((channel) => channel.channel_type === chanType).length >= CHANNEL_MAX_COUNTS[chanType]) {
       setError(`${CHANNEL_TYPES.find((item) => item.value === chanType)?.label || chanType}渠道最多可创建 ${CHANNEL_MAX_COUNTS[chanType]} 个`);
       return;
@@ -2928,7 +2945,7 @@ export default function App() {
     setLoading(true);
     setError('');
     try {
-      const credentials = buildChannelCredentials(chanType, chanAppKey.trim(), chanAppSecret.trim());
+      const credentials = buildChannelCredentials(chanType, chanAppKey.trim(), chanAppSecret.trim(), chanTenantId.trim());
       // Create channel with credentials in one call (channel doesn't exist yet for manual mode)
       await createChannel(ctx, {
         identity_id: identity.id,
@@ -2948,12 +2965,13 @@ export default function App() {
       setChanName('');
       setChanAppKey('');
       setChanAppSecret('');
+      setChanTenantId('');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [channels, ctx, identity, chanTemplateId, chanType, chanName, chanAppKey, chanAppSecret, chanShowTools, chanShowThinking, loadChannels]);
+  }, [channels, ctx, identity, chanTemplateId, chanType, chanName, chanAppKey, chanAppSecret, chanTenantId, chanShowTools, chanShowThinking, loadChannels]);
 
   const handleRebindChannel = useCallback(async (channel: ForwardChannel) => {
     if (!ctx) return;
@@ -3040,7 +3058,7 @@ export default function App() {
       };
       // If manual mode and credentials provided, include them
       if (chanMode === 'manual' && chanAppKey.trim()) {
-        const credentials = buildChannelCredentials(editingChannelItem.channel_type, chanAppKey.trim(), chanAppSecret.trim());
+        const credentials = buildChannelCredentials(editingChannelItem.channel_type, chanAppKey.trim(), chanAppSecret.trim(), chanTenantId.trim());
         updatePayload.channel_config = {
           ...editingChannelItem.channel_config,
           credentials,
@@ -3052,13 +3070,14 @@ export default function App() {
       setQrSession(null);
       setChanAppKey('');
       setChanAppSecret('');
+      setChanTenantId('');
       await loadChannels();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [ctx, editingChannelItem, chanMode, chanAppKey, chanAppSecret, loadChannels, stopQrPolling]);
+  }, [ctx, editingChannelItem, chanMode, chanAppKey, chanAppSecret, chanTenantId, loadChannels, stopQrPolling]);
 
   const loadTemplateResourceOptions = useCallback(async () => {
     await Promise.all(TEMPLATE_RESOURCE_TYPES.map((type) => loadRegisteredResources(type)));
@@ -4722,7 +4741,7 @@ export default function App() {
               </div>
               <div className="mt-4 flex items-center justify-end gap-2">
                 <button
-                  onClick={() => { stopQrPolling(); setQrSession(null); setChanAppKey(''); setChanAppSecret(''); setChanMode(CHANNEL_TYPES.find((item) => item.value === chan.channel_type)?.qrSupport ? 'qr' : 'manual'); setEditingChannelItem({ ...chan }); }}
+                  onClick={() => { stopQrPolling(); setQrSession(null); setChanAppKey(''); setChanAppSecret(''); setChanTenantId(''); setChanMode(CHANNEL_TYPES.find((item) => item.value === chan.channel_type)?.qrSupport ? 'qr' : 'manual'); setEditingChannelItem({ ...chan }); }}
                   className="flex h-7 w-7 items-center justify-center rounded-lg text-black/30 transition hover:bg-[#F4F6FC] hover:text-[#3550FF]"
                   title="配置"
                 >
@@ -4745,7 +4764,7 @@ export default function App() {
             <div className="text-sm font-medium text-black/60">暂无 IM 渠道</div>
             <div className="mt-1 text-xs text-black/35">连接微信、钉钉、飞书等平台，让 AI 自动回复用户消息</div>
             <button
-              onClick={() => { stopQrPolling(); setChanName(''); setChanType('wechat'); setChanMode('qr'); setChanTemplateId(templateId || templates[0]?.id || ''); setQrSession(null); setCreatedChannelId(null); setChannelStep('config'); setChanAppKey(''); setChanAppSecret(''); setShowChannelModal(true); }}
+              onClick={() => { stopQrPolling(); setChanName(''); setChanType('wechat'); setChanMode('qr'); setChanTemplateId(templateId || templates[0]?.id || ''); setQrSession(null); setCreatedChannelId(null); setChannelStep('config'); setChanAppKey(''); setChanAppSecret(''); setChanTenantId(''); setShowChannelModal(true); }}
               disabled={templates.length === 0}
               className="mt-4 rounded-full bg-[#3550FF] px-4 py-2 text-xs font-medium text-white transition hover:bg-[#2a42e0] disabled:opacity-50"
             >
@@ -6836,7 +6855,7 @@ export default function App() {
       </Modal>
 
       {/* Edit channel modal */}
-      <Modal open={!!editingChannelItem} onClose={() => { stopQrPolling(); setEditingChannelItem(null); setQrSession(null); setChanAppKey(''); setChanAppSecret(''); }} title="渠道配置">
+      <Modal open={!!editingChannelItem} onClose={() => { stopQrPolling(); setEditingChannelItem(null); setQrSession(null); setChanAppKey(''); setChanAppSecret(''); setChanTenantId(''); }} title="渠道配置">
         {editingChannelItem && (() => {
           const chanTypeInfo = CHANNEL_TYPES.find((c) => c.value === editingChannelItem.channel_type);
           const bindingStatusLabel = editingChannelItem.binding_status === 'bound' ? '已连接' : editingChannelItem.binding_status === 'expired' ? '已过期' : '未绑定';
@@ -6865,9 +6884,12 @@ export default function App() {
               {(chanTypeInfo?.qrSupport || chanTypeInfo?.manualSupport) && (
                 <div className="rounded-xl border border-[#E5E7EB] bg-[#FAFBFF] p-3">
                   <div className="mb-2 text-[11px] font-medium text-black/50">绑定方式</div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button type="button" onClick={() => { setChanMode('qr'); stopQrPolling(); setQrSession(null); }} className={`rounded-lg py-2 text-xs font-medium transition ${chanMode === 'qr' ? 'bg-[#3550FF] text-white' : 'bg-white text-black/55 hover:bg-[#E8EBF5]'}`}>📱 扫码授权</button>
-                    <button type="button" onClick={() => { setChanMode('manual'); stopQrPolling(); setQrSession(null); }} className={`rounded-lg py-2 text-xs font-medium transition ${chanMode === 'manual' ? 'bg-[#3550FF] text-white' : 'bg-white text-black/55 hover:bg-[#E8EBF5]'}`}>⚙️ 手动配置</button>
+                  <div className={`grid gap-2 ${chanTypeInfo && channelBindingModes(chanTypeInfo).length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                    {chanTypeInfo && channelBindingModes(chanTypeInfo).map((mode) => mode === 'qr' ? (
+                      <button key={mode} type="button" onClick={() => { setChanMode('qr'); stopQrPolling(); setQrSession(null); }} className={`rounded-lg py-2 text-xs font-medium transition ${chanMode === 'qr' ? 'bg-[#3550FF] text-white' : 'bg-white text-black/55 hover:bg-[#E8EBF5]'}`}>📱 扫码授权</button>
+                    ) : (
+                      <button key={mode} type="button" onClick={() => { setChanMode('manual'); stopQrPolling(); setQrSession(null); }} className={`rounded-lg py-2 text-xs font-medium transition ${chanMode === 'manual' ? 'bg-[#3550FF] text-white' : 'bg-white text-black/55 hover:bg-[#E8EBF5]'}`}>⚙️ 手动配置</button>
+                    ))}
                   </div>
 
                   {/* QR scan sub-section */}
@@ -6968,6 +6990,7 @@ export default function App() {
                     const { key: keyLabel, secret: secretLabel } = channelCredentialLabels(editingChannelItem.channel_type);
                     return (
                     <div className="mt-3 space-y-2">
+                      {editingChannelItem.channel_type === 'teams' && <TeamsCallbackGuidance />}
                       <div className="grid grid-cols-2 gap-2">
                         <label className="block">
                           <span className="mb-1 block text-[10px] font-medium text-black/50">{keyLabel}</span>
@@ -6978,6 +7001,12 @@ export default function App() {
                           <input value={chanAppSecret} onChange={(e) => setChanAppSecret(e.target.value)} type="password" placeholder={secretLabel} className="h-8 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
                         </label>
                       </div>
+                      {editingChannelItem.channel_type === 'teams' && (
+                        <label className="block">
+                          <span className="mb-1 block text-[10px] font-medium text-black/50">Tenant ID</span>
+                          <input value={chanTenantId} onChange={(e) => setChanTenantId(e.target.value)} placeholder="Tenant ID" className="h-8 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 font-mono text-xs outline-none focus:border-[#3550FF]" />
+                        </label>
+                      )}
                     </div>
                     );
                   })()}
@@ -7167,6 +7196,7 @@ export default function App() {
         setQrSession(null);
         setChanAppKey('');
         setChanAppSecret('');
+        setChanTenantId('');
         setCreatedChannelId(null);
         setChannelStep('config');
       }} title={channelStep === 'config' ? '添加 IM 渠道' : '绑定渠道'}>
@@ -7348,6 +7378,7 @@ export default function App() {
             {/* Manual credentials section */}
             {chanMode === 'manual' && (
               <div className="space-y-2">
+                {chanType === 'teams' && <TeamsCallbackGuidance />}
                 <div className="grid grid-cols-2 gap-2">
                   <label className="block">
                     <span className="mb-1 block text-[11px] font-medium text-black/50">{channelCredentialLabels(chanType).key} <span className="text-red-400">*</span></span>
@@ -7358,6 +7389,12 @@ export default function App() {
                     <input value={chanAppSecret} onChange={(e) => setChanAppSecret(e.target.value)} type="password" placeholder={channelCredentialLabels(chanType).secret} className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
                   </label>
                 </div>
+                {chanType === 'teams' && (
+                  <label className="block">
+                    <span className="mb-1 block text-[11px] font-medium text-black/50">Tenant ID <span className="text-red-400">*</span></span>
+                    <input value={chanTenantId} onChange={(e) => setChanTenantId(e.target.value)} placeholder="Tenant ID" className="h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 font-mono text-xs outline-none transition focus:border-[#3550FF]" />
+                  </label>
+                )}
               </div>
             )}
 
@@ -7381,7 +7418,7 @@ export default function App() {
               {(() => {
                 const isQr = chanMode === 'qr' && CHANNEL_TYPES.find((c) => c.value === chanType)?.qrSupport;
                 const qrConfirmed = isQr && qrSession?.status === 'confirmed' && !qrBindingIssue && !qrVerifying;
-                const manualReady = chanMode === 'manual' && chanAppKey.trim() && chanAppSecret.trim();
+                const manualReady = chanMode === 'manual' && chanAppKey.trim() && chanAppSecret.trim() && (chanType !== 'teams' || chanTenantId.trim());
                 const isDisabled = isQr ? !qrConfirmed : (!manualReady || loading);
                 const btnText = loading ? '保存中...' : isQr
                   ? (qrVerifying ? '确认绑定状态中...' : qrBindingIssue ? '绑定未完成' : qrConfirmed ? '保存' : '等待扫码确认...')

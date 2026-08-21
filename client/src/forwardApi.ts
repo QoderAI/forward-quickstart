@@ -1341,7 +1341,7 @@ function normalizeMemoryEntry<T extends MemoryEntry>(entry: T): T {
 
 // ─── Channels (Forward API) ────────────────────────────────────────
 
-export type ChannelType = 'wechat' | 'wecom' | 'feishu' | 'lark' | 'dingtalk' | 'slack';
+export type ChannelType = 'wechat' | 'wecom' | 'feishu' | 'lark' | 'dingtalk' | 'slack' | 'teams';
 export type BindingStatus = 'unbound' | 'bound' | 'expired';
 export type IdentityResolutionMode = 'fixed' | 'pairing';
 
@@ -1441,6 +1441,7 @@ export function buildChannelCredentials(
   channelType: ChannelType,
   key: string,
   secret: string,
+  tenantId?: string,
 ): Record<string, string> {
   switch (channelType) {
     case 'feishu':
@@ -1450,6 +1451,8 @@ export function buildChannelCredentials(
       return { app_token: key, bot_token: secret };
     case 'dingtalk':
       return { client_id: key, client_secret: secret };
+    case 'teams':
+      return { app_id: key, tenant_id: tenantId ?? '', client_secret: secret };
     case 'wecom':
       return { bot_id: key, secret };
     default:
@@ -1465,11 +1468,18 @@ export const CHANNEL_MAX_COUNTS: Record<ChannelType, number> = {
   feishu: 5,
   lark: 5,
   slack: 5,
+  teams: 5,
 };
+
+const DEFAULT_TEAMS_CALLBACK_URL = 'https://api.qoder.com/channels/teams/messages';
+
+export function getTeamsCallbackUrl(): string {
+  return import.meta.env.VITE_TEAMS_CALLBACK_URL?.trim() || DEFAULT_TEAMS_CALLBACK_URL;
+}
 
 export function channelTypesForEnvironment(environment: ForwardApiEnvironment): ChannelType[] {
   return environment === 'global-prod'
-    ? ['wechat', 'wecom', 'dingtalk', 'feishu', 'lark', 'slack']
+    ? ['wechat', 'wecom', 'dingtalk', 'feishu', 'lark', 'slack', 'teams']
     : ['wechat', 'wecom', 'dingtalk', 'feishu'];
 }
 

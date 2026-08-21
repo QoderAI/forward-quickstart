@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import {
   buildChannelCredentials,
+  channelTypesForEnvironment,
   deleteCloudEnvironment,
   deleteCloudSkill,
   deleteCloudVault,
@@ -8,6 +9,7 @@ import {
   downloadCloudFile,
   getCloudFile,
   getMemoryEntry,
+  getTeamsCallbackUrl,
   listResourceCatalog,
   listEvents,
   listMemoryEntries,
@@ -316,6 +318,14 @@ describe('buildChannelCredentials', () => {
     expect(buildChannelCredentials('slack', 'xapp-token', 'xoxb-token')).toEqual({ app_token: 'xapp-token', bot_token: 'xoxb-token' });
   });
 
+  test('maps Teams app, tenant, and secret credentials', () => {
+    expect(buildChannelCredentials('teams', 'app-id', 'client-secret', 'tenant-id')).toEqual({
+      app_id: 'app-id',
+      tenant_id: 'tenant-id',
+      client_secret: 'client-secret',
+    });
+  });
+
   test('maps fields for dingtalk', () => {
     expect(buildChannelCredentials('dingtalk', 'ding-key', 'ding-secret')).toEqual({ client_id: 'ding-key', client_secret: 'ding-secret' });
   });
@@ -326,6 +336,29 @@ describe('buildChannelCredentials', () => {
 
   test('returns no credentials for wechat (QR-only channel)', () => {
     expect(buildChannelCredentials('wechat', 'ignored', 'ignored')).toEqual({});
+  });
+});
+
+describe('channelTypesForEnvironment', () => {
+  test('offers Teams only in the global environment', () => {
+    expect(channelTypesForEnvironment('global-prod')).toContain('teams');
+    expect(channelTypesForEnvironment('cn-prod')).not.toContain('teams');
+  });
+});
+
+describe('getTeamsCallbackUrl', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  test('uses the Global production endpoint by default', () => {
+    vi.stubEnv('VITE_TEAMS_CALLBACK_URL', '');
+    expect(getTeamsCallbackUrl()).toBe('https://api.qoder.com/channels/teams/messages');
+  });
+
+  test('uses the configured endpoint override', () => {
+    vi.stubEnv('VITE_TEAMS_CALLBACK_URL', 'https://gateway.example.com/channels/teams/messages');
+    expect(getTeamsCallbackUrl()).toBe('https://gateway.example.com/channels/teams/messages');
   });
 });
 
