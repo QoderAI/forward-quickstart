@@ -26,7 +26,9 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 - **会话历史与用量**：查看历史 Session、事件历史、执行状态和会话时长统计。
 - **定时任务**：创建、编辑、暂停、恢复、归档和手动执行 Schedule。
 - **批量任务**（仅开发者模式）：基于 JSONL 输入文件创建异步批量任务，平台闲时时段自动调度执行。支持表单构建（选模板逐行输入，自动生成 JSONL）和文件上传两种创建方式，前端预校验（JSON 解析/必填字段/custom_id 唯一/≤10000 行）并自动补全缺失的 identity_id；创建时可选添加「自定义标签」（逐项键值对输入，对应 API metadata 字段，仅用于标识查找不影响执行），绑定模板下拉展示模板当前使用的模型；列表页展示状态徽章与分段进度条，支持状态筛选与游标分页，已完成/已取消的任务支持「再次执行」（复用原输入文件与参数新建任务）；详情弹窗展示状态时间线、7 维任务计数与标签芯片，非终态自动轮询（5s 起步退避至 30s）；支持取消（二次确认）与终态后下载 output.jsonl / error.jsonl。
-- **IM 渠道**：按环境展示并创建微信、企业微信、钉钉、飞书、Lark 和 Slack 渠道，支持扫码绑定或手动密钥配置，并对齐各渠道数量上限；创建渠道时显式传入 `identity_resolution` 以确保渠道授权后消息路由正确生效。
+- **IM 渠道**：按环境展示并创建微信、企业微信、钉钉、飞书、Lark、Slack 和 Microsoft Teams 渠道，支持扫码绑定或手动密钥配置，并对齐各渠道数量上限；Teams 使用 App ID、Tenant ID 和 Client Secret 配置；创建渠道时显式传入 `identity_resolution` 以确保渠道授权后消息路由正确生效。
+
+  Teams 需在 Microsoft Teams Developer Portal 将 Messaging Endpoint 配置为 `https://api.qoder.com/channels/teams/messages`。如部署使用独立 Channel Gateway，可在前端构建时通过 `VITE_TEAMS_CALLBACK_URL` 覆盖该地址。
 - **个人记忆查看**：基于 Template 生效配置读取关联 Memory Store，并查看记忆条目内容。
 
 本 Quickstart 聚焦客户可直接复用的 Forward 主流程，不包含控制台的身份管理、会话诊断和会话范围能力。

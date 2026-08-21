@@ -78,7 +78,7 @@ Forward Quickstart 覆盖了 Forward Mode 的主链路，也包含部分配套 C
 | Sessions | 创建 Session，发送用户消息，查询历史 Session，查询事件历史，归档 Session，取消当前 Turn。 |
 | SSE Events | 实时接收 Agent 消息、状态变化、思考内容、工具调用、工具结果和增量流式文本。 |
 | Schedules | 查询、创建、编辑、暂停、恢复、归档和手动执行 Schedule，并查询 Schedule Run。 |
-| Channels | 创建、查询、更新和删除 IM 渠道，支持微信、企业微信、钉钉、飞书；支持扫码绑定和手动凭据配置。 |
+| Channels | 创建、查询、更新和删除 IM 渠道，支持微信、企业微信、钉钉、飞书，以及 Global 环境的 Lark、Slack 和 Microsoft Teams；支持扫码绑定和手动凭据配置。 |
 | Memory | 基于 Template 生效配置读取 Memory Store，查询记忆条目并展示内容。 |
 | Usage | 基于 Session 列表展示会话数量、执行状态和时长统计。 |
 
