@@ -1,10 +1,13 @@
 import { describe, expect, test } from 'vitest';
 import {
   BUILTIN_TOOLS,
+  BROWSER_TOOLSET_TYPE,
+  buildBrowserToolsetEntry,
   buildToolsetEntry,
   extractToolApproval,
   extractBuiltinToolNames,
   extractToolNames,
+  hasBrowserToolset,
 } from './templateTools';
 
 describe('BUILTIN_TOOLS', () => {
@@ -128,5 +131,26 @@ describe('extractToolApproval', () => {
       type: 'agent_toolset_20260401',
       default_config: { permission_policy: { type: 'ask_user' } },
     }]).defaultPolicy).toBe('always_ask');
+  });
+});
+
+describe('browser toolset (Browser Use Beta)', () => {
+  test('hasBrowserToolset detects browser_toolset_20260714', () => {
+    expect(hasBrowserToolset([{ type: 'browser_toolset_20260714' }])).toBe(true);
+    expect(hasBrowserToolset([{ type: 'agent_toolset_20260401' }])).toBe(false);
+    expect(hasBrowserToolset(undefined)).toBe(false);
+    expect(hasBrowserToolset([])).toBe(false);
+  });
+
+  test('buildBrowserToolsetEntry produces the correct entry', () => {
+    expect(buildBrowserToolsetEntry()).toEqual({ type: BROWSER_TOOLSET_TYPE });
+  });
+
+  test('extractToolNames includes Browser Use for browser toolset entries', () => {
+    const tools = [
+      { type: 'browser_toolset_20260714' },
+      { type: 'custom', name: 'my_tool' },
+    ];
+    expect(extractToolNames(tools)).toEqual(['Browser Use', 'my_tool']);
   });
 });

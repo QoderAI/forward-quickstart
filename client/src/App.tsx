@@ -94,10 +94,12 @@ import { PRODUCT_NAME } from './config/product';
 import {
   BUILTIN_TOOLS,
   DEFAULT_TOOL_APPROVAL,
+  buildBrowserToolsetEntry,
   buildToolsetEntry,
   extractBuiltinToolNames,
   extractToolApproval,
   extractToolNames,
+  hasBrowserToolset,
   type ToolApprovalConfig,
   type ToolPermissionPolicy,
 } from './templateTools';
@@ -3187,13 +3189,10 @@ export default function App() {
             .join('\n')
         : '',
     );
-    // Builtin tools → checkboxes; non-builtin tool entries preserved via toolsJson
+    // Builtin tools → checkboxes; browser toolset → toggle; remaining non-builtin entries → toolsJson
     setSelectedTools(extractBuiltinToolNames(template.tools));
     setToolApproval(extractToolApproval(template.tools));
-    setBrowserUseEnabled(
-      Array.isArray(template.tools)
-      && template.tools.some((tool) => !!tool && typeof tool === 'object' && (tool as Record<string, unknown>).type === 'browser_toolset_20260714'),
-    );
+    setBrowserUseEnabled(hasBrowserToolset(template.tools));
     const nonBuiltinTools = Array.isArray(template.tools)
       ? template.tools.filter((tool) => {
           if (!tool || typeof tool !== 'object') return false;
@@ -3462,7 +3461,7 @@ export default function App() {
     if (new Set(mcpNames).size !== mcpNames.length) throw new Error('MCP 名称不能重复');
     const tools = [
       ...(selectedTools.length > 0 ? [buildToolsetEntry(selectedTools, toolApproval)] : []),
-      ...(browserUseEnabled ? [{ type: 'browser_toolset_20260714' }] : []),
+      ...(browserUseEnabled ? [buildBrowserToolsetEntry()] : []),
       ...explicitTools,
     ];
     const fileIds = splitTokens(fileIdsText);
@@ -6425,6 +6424,8 @@ export default function App() {
                 }
               }
               mcpToolEntries.push({ server: r.mcp_server_name, names });
+            } else if (r.type === 'browser_toolset_20260714') {
+              builtinToolEntries.push({ type: '浏览器能力 (Beta)', names: ['Browser Use'] });
             } else if (r.type === 'custom' && typeof r.name === 'string') {
               customToolEntries.push({ name: r.name, desc: typeof r.description === 'string' ? r.description : undefined });
             }

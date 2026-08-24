@@ -15,7 +15,7 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 ## 展示能力
 
 - **身份接入**：基于应用侧的 `external_id` 查找或创建运行会话所需的 Forward Identity；Quickstart 不提供身份管理页面。
-- **模板配置**：创建、编辑、克隆和归档可复用的 Agent Template，支持模型推理强度与上下文窗口、内置工具及逐工具审批策略、MCP Server、Browser Use、技能、文件、环境和密钥库等配置。支持多 Agent 协作（Coordinator）配置：在已选择内置工具（Toolset）的前提下，可通过表单方式选择可委派的 Agent（对应 Managed Agent），启用后运行时自动注入编排工具（Agent / create_agent / send_to_agent / list_agents），允许 Agent 将子任务委派给其他 Agent 协同完成。
+- **模板配置**：创建、编辑、克隆和归档可复用的 Agent Template，支持模型推理强度与上下文窗口、内置工具及逐工具审批策略、MCP Server、Browser Use、技能、文件、环境和密钥库等配置。支持 Browser Use（Beta）工具集：在高级配置中启用后，模板 `tools` 数组自动添加 `browser_toolset_20260714` 条目，代理服务器自动注入 `x-qoder-beta: browser-use-2026-07-14` 请求头，无需手动设置。支持多 Agent 协作（Coordinator）配置：在已选择内置工具（Toolset）的前提下，可通过表单方式选择可委派的 Agent（对应 Managed Agent），启用后运行时自动注入编排工具（Agent / create_agent / send_to_agent / list_agents），允许 Agent 将子任务委派给其他 Agent 协同完成。
 - **资源管理**：通过 Forward 生命周期接口创建、查询、更新和删除 Skill、File、Environment、Vault；创建接口会自动完成资源注册，模板绑定时通过 Forward Resource Registry 选择资源。
 - **密钥管理**：在 Vault 中创建和删除密钥，支持 Bearer Token、OAuth Token 和环境变量类型。
 - **会话执行**：基于 Identity 和 Template 创建 Session，发送 `user.message`，并支持取消当前 Turn；遇到需要确认的工具调用或 `AskUserQuestion` 时，由用户显式允许、拒绝、作答或跳过后继续执行。已有任务执行时仍可点击「新建对话」另起新会话，后台任务继续执行且不会干扰当前视图。提问时可点击发送按钮旁的回形针图标添加本地文本类文件（单个 ≤5MB）作为对话附件——文件上传后挂载到 Agent 工作目录（新会话随创建挂载，进行中的会话动态追加挂载），消息中自动标注挂载路径，Agent 可直接读取附件内容作答；附件在消息气泡中以文件卡片展示，刷新后依然可见。

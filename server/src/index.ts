@@ -167,6 +167,19 @@ function isTerminalSseFrame(frame: string): boolean {
   return false;
 }
 
+// Detect whether the request body carries a browser_toolset_20260714 entry in
+// its `tools` array. When it does, the upstream API requires the beta header
+// `x-qoder-beta: browser-use-2026-07-14` — without it the request is rejected
+// with a 400. See issue #10 and the CreateTemplate / UpdateTemplate API docs.
+function bodyHasBrowserToolset(body: unknown): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const tools = (body as Record<string, unknown>).tools;
+  if (!Array.isArray(tools)) return false;
+  return tools.some(
+    (t) => t && typeof t === 'object' && (t as Record<string, unknown>).type === 'browser_toolset_20260714',
+  );
+}
+
 function parseApiEnvironment(value: unknown): ForwardApiEnvironment {
   if (value === 'cn-prod' || value === 'global-prod') return value;
   return 'cn-prod';
@@ -228,6 +241,11 @@ app.post('/api/forward/request', async (req, res) => {
       payload = JSON.stringify(body ?? {});
     }
     if (idempotencyKey) headers['Idempotency-Key'] = String(idempotencyKey);
+    // Auto-inject the Browser Use beta header when the request body carries a
+    // browser_toolset_20260714 tool entry (issue #10).
+    if (bodyHasBrowserToolset(body)) {
+      headers['x-qoder-beta'] = 'browser-use-2026-07-14';
+    }
 
     const upstream = await fetch(url, {
       method: forwardMethod,
@@ -329,6 +347,11 @@ app.post('/api/cloud/request', async (req, res) => {
     if (!['GET', 'HEAD'].includes(forwardMethod)) {
       headers['Content-Type'] = 'application/json';
       payload = JSON.stringify(body ?? {});
+    }
+    // Auto-inject the Browser Use beta header when the request body carries a
+    // browser_toolset_20260714 tool entry (issue #10).
+    if (bodyHasBrowserToolset(body)) {
+      headers['x-qoder-beta'] = 'browser-use-2026-07-14';
     }
 
     const upstream = await fetch(url, {

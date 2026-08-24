@@ -1,3 +1,18 @@
+export const BROWSER_TOOLSET_TYPE = 'browser_toolset_20260714';
+
+/** Detect whether the tools array includes a browser_toolset_20260714 entry */
+export function hasBrowserToolset(tools: unknown[] | undefined): boolean {
+  if (!Array.isArray(tools)) return false;
+  return tools.some(
+    (t) => t && typeof t === 'object' && (t as Record<string, unknown>).type === BROWSER_TOOLSET_TYPE,
+  );
+}
+
+/** Build a browser_toolset_20260714 tool entry for the template tools array */
+export function buildBrowserToolsetEntry(): Record<string, unknown> {
+  return { type: BROWSER_TOOLSET_TYPE };
+}
+
 export const BUILTIN_TOOLS = [
   'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'ImageSearch', 'ImageGen',
   'DeliverArtifacts',
@@ -42,6 +57,7 @@ export function extractToolNames(tools: unknown[] | undefined): string[] {
   const names = [...extractBuiltinToolNames(tools)];
   for (const tool of tools ?? []) {
     const record = asRecord(tool);
+    if (record?.type === BROWSER_TOOLSET_TYPE) names.push('Browser Use');
     if (record?.type === 'custom' && typeof record.name === 'string') names.push(record.name);
   }
   return Array.from(new Set(names));
