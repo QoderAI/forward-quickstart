@@ -76,21 +76,31 @@ export function attachmentMountPath(storedName: string): string {
   return `/data/workspace/${storedName}`;
 }
 
-// The marker format is intentionally identical for images and documents —
-// verified that the agent resolves a mounted image from this plain marker and
-// opens it with Read, so there is no need to add a type hint or file id.
-export function composeMessageWithAttachments(text: string, storedNames: string[]): string {
-  if (storedNames.length === 0) return text;
-  const markers = storedNames.map((name) => `[附件] ${name} → ${attachmentMountPath(name)}`);
+export interface AttachmentMarkerInput {
+  name: string;
+  fileId?: string;
+}
+
+// Keep the path in plain text so the agent can read the mounted file, and include
+// file_id when known so the UI can preview images without Cloud session-resource
+// lookups in Service Account mode. Old markers without file_id still parse.
+export function composeMessageWithAttachments(text: string, attachments: string[] | AttachmentMarkerInput[]): string {
+  if (attachments.length === 0) return text;
+  const markers = attachments.map((item) => {
+    const name = typeof item === 'string' ? item : item.name;
+    const fileId = typeof item === 'string' ? '' : item.fileId;
+    return `[附件] ${name} → ${attachmentMountPath(name)}${fileId ? ` · file_id=${fileId}` : ''}`;
+  });
   return `${text}\n\n${markers.join('\n')}`;
 }
 
-const ATTACHMENT_MARKER_RE = /^\[附件\] (.+?) → (\/\S+)$/;
+const ATTACHMENT_MARKER_RE = /^\[附件\] (.+?) → (\/\S+?)(?: · file_id=(file_[A-Za-z0-9_-]+))?$/;
 
 export interface ParsedAttachmentMarker {
   name: string;
   path: string;
   isImage: boolean;
+  fileId?: string;
 }
 
 export function splitAttachmentMarkers(text: string): { body: string; attachments: ParsedAttachmentMarker[] } {
@@ -104,6 +114,7 @@ export function splitAttachmentMarkers(text: string): { body: string; attachment
       name: match[1],
       path: match[2],
       isImage: isImageAttachmentName(match[1]),
+      ...(match[3] ? { fileId: match[3] } : {}),
     });
     i -= 1;
   }

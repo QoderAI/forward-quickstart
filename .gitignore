@@ -7,3 +7,4 @@ worktrees/
 server/logs/
 .vercel
 .env*
+.superpowers/

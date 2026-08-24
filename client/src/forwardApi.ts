@@ -3,8 +3,11 @@ export const DEFAULT_FORWARD_ENVIRONMENT_ID = 'env_019ef4d7c6c9742fa028eeed7ec23
 export type ForwardApiEnvironment = 'cn-prod' | 'global-prod';
 
 export interface ForwardContext {
+  // Active bearer token for the selected login mode. In PAT mode this is the
+  // PAT; in Service Account mode this is the exchanged Service Account Token.
   pat: string;
   environment: ForwardApiEnvironment;
+  authMode?: 'pat' | 'service-account';
 }
 
 export interface ForwardIdentity {
@@ -21,6 +24,8 @@ export type ForwardTemplateModel = string | {
   context_window?: number;
   [key: string]: unknown;
 };
+
+export type TemplateResourceBindings = Record<string, { enabled: boolean }>;
 
 // A single entry in the multiagent roster. `type: 'self'` delegates to the
 // coordinator itself; `type: 'agent'` references another Managed Agent by id.
@@ -48,7 +53,8 @@ export interface ForwardTemplate {
   skills?: unknown[];
   multiagent?: MultiagentConfig | null;
   environment_id?: string;
-  vault_ids?: string[];
+  vaults?: TemplateResourceBindings;
+  vault_ids?: TemplateResourceBindings | string[];
   files?: unknown;
   environment_variables?: unknown;
 }
@@ -60,6 +66,8 @@ export interface ForwardResource {
   type: ForwardResourceType;
   owner_type: string;
   owner_id: string;
+  icon_url?: string | null;
+  binding_info?: { agent_template_count?: number };
   name?: string;
   description?: string;
   status?: string;
@@ -70,15 +78,15 @@ export interface ForwardResource {
 export interface CreateTemplateInput {
   name?: string;
   description?: string;
-  model: string;
+  model: ForwardTemplateModel;
   system: string;
   tools: unknown[];
   mcp_servers: unknown[];
   skills: unknown[];
   multiagent?: MultiagentConfig | null;
   environment_id: string;
-  vault_ids: string[];
-  files: Record<string, unknown>;
+  vault_ids: TemplateResourceBindings;
+  files: TemplateResourceBindings;
   environment_variables: Record<string, unknown>;
 }
 
@@ -97,6 +105,7 @@ export interface ForwardSession {
   // only sporadically present and drifts, so treat it as a fallback. Both may be
   // absent when the billing module is off. See credits.ts for the details.
   usage?: { credits?: number | null; total_credits?: number | null };
+  metadata?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
   archived_at?: string | null;
@@ -131,8 +140,12 @@ interface Page<T> {
 
 const LIST_EVENT_TYPES = [
   'user.message',
+  'user.tool_confirmation',
+  'user.question_answer',
+  'user.custom_tool_result',
   'agent.message',
   'agent.thinking',
+  'agent.ask_user_question',
   'agent.tool_use',
   'agent.custom_tool_use',
   'agent.mcp_tool_use',
@@ -142,6 +155,7 @@ const LIST_EVENT_TYPES = [
   // Per-call credit spend. Needed in listEvents so historical replies still show
   // their cost after a page refresh (the streaming accumulator is gone by then).
   'span.model_request_end',
+  'session.status_idle',
 ].join(',');
 
 export class ForwardApiError extends Error {
@@ -156,12 +170,17 @@ export class ForwardApiError extends Error {
   }
 }
 
-async function forwardRequest<T>(
+export interface ForwardRequestOptions {
+  idempotencyKey?: string;
+}
+
+export async function forwardRequest<T>(
   ctx: ForwardContext,
   method: string,
   path: string,
   body?: unknown,
   query?: Record<string, unknown>,
+  options: ForwardRequestOptions = {},
 ): Promise<T> {
   const res = await fetch('/api/forward/request', {
     method: 'POST',
@@ -174,7 +193,7 @@ async function forwardRequest<T>(
       body,
       query,
       idempotencyKey: method.toUpperCase() === 'POST'
-        ? `fw-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        ? options.idempotencyKey || `fw-${Date.now()}-${Math.random().toString(36).slice(2)}`
         : undefined,
     }),
   });
@@ -246,6 +265,10 @@ async function cloudRequest<T>(
   return data as T;
 }
 
+function canUseCloudFileFallback(ctx: ForwardContext) {
+  return ctx.authMode !== 'service-account';
+}
+
 export interface CloudEnvironment {
   id: string;
   type: string;
@@ -282,6 +305,8 @@ export interface CloudModel {
   price_factor?: number;
   efforts?: string[];
   default_effort?: string;
+  default_context_window?: number;
+  available_context_windows?: number[];
 }
 
 export async function listCloudModels(ctx: ForwardContext) {
@@ -359,6 +384,7 @@ export async function uploadCloudSkill(
   // Forward-layer multipart upload (server forwards to /api/v1/forward/skills).
   const uploadRes = await fetch('/api/forward/upload', {
     method: 'POST',
+    headers: { 'Idempotency-Key': crypto.randomUUID() },
     body: uploadForm,
   });
 
@@ -392,20 +418,12 @@ export async function deleteCloudSkill(ctx: ForwardContext, skillId: string) {
   return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/skills/${encodeURIComponent(skillId)}`);
 }
 
-// ─── Files (mixed layer — read the note) ───────────────────────────
+// ─── Files (Forward-first, Cloud fallback) ─────────────────────────
 //
-// Files are the one family where the two layers are NOT interchangeable:
-//
-//   - Files uploaded by us land in the Forward store and are visible on BOTH
-//     layers, so uploading via Forward is safe.
-//   - Files produced by the AGENT during a session (ImageGen output, generated
-//     documents, batch error files) exist ONLY on the cloud layer. Verified
-//     live: GET /forward/files/{artifact_id} → 404 "resource not found", while
-//     GET /cloud/files/{artifact_id} → 200.
-//
-// So the cloud layer is a strict superset for reads. Any operation that takes a
-// file id we did not just create (metadata, download, preview, delete) must go
-// through cloud, or it 404s on agent-generated artifacts.
+// Service Account Tokens cannot read the Cloud file layer, so user-uploaded
+// files must go through Forward. Some older agent-generated artifacts may still
+// be Cloud-only for PAT users, so arbitrary read paths fall back to Cloud on a
+// Forward 404.
 
 export interface CloudFile {
   id: string;
@@ -422,10 +440,16 @@ export async function listCloudFiles(ctx: ForwardContext) {
   return forwardRequest<{ data: CloudFile[] }>(ctx, 'GET', '/files', undefined, { limit: 50 });
 }
 
-// Metadata for an arbitrary file id (chat artifacts, session-mounted files).
-// Cloud layer: see the note above — Forward cannot see agent-generated files.
 export async function getCloudFile(ctx: ForwardContext, fileId: string) {
-  return cloudRequest<CloudFile>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}`);
+  const path = `/files/${encodeURIComponent(fileId)}`;
+  try {
+    return await forwardRequest<CloudFile>(ctx, 'GET', path);
+  } catch (err) {
+    if (canUseCloudFileFallback(ctx) && err instanceof ForwardApiError && err.status === 404) {
+      return cloudRequest<CloudFile>(ctx, 'GET', path);
+    }
+    throw err;
+  }
 }
 
 export async function uploadCloudFile(
@@ -459,17 +483,34 @@ export async function uploadCloudFile(
   return data as CloudFile;
 }
 
-// Signed download URL for an arbitrary file id. Cloud layer: this is what the
-// chat artifact download button and the batch error-file download both use, and
-// those ids are agent/system-generated, hence invisible to Forward.
+// Signed download URL for an arbitrary file id.
 export async function downloadCloudFile(ctx: ForwardContext, fileId: string) {
-  return cloudRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/files/${encodeURIComponent(fileId)}/content`);
+  const path = `/files/${encodeURIComponent(fileId)}/content`;
+  try {
+    return await forwardRequest<{ url: string; expires_at?: string }>(ctx, 'GET', path);
+  } catch (err) {
+    if (canUseCloudFileFallback(ctx) && err instanceof ForwardApiError && err.status === 404) {
+      return cloudRequest<{ url: string; expires_at?: string }>(ctx, 'GET', path);
+    }
+    throw err;
+  }
 }
 
-// Cloud layer so that deleting a registered file resource works whether the file
-// originated from our upload or from the agent.
 export async function deleteCloudFile(ctx: ForwardContext, fileId: string) {
-  return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', `/files/${encodeURIComponent(fileId)}`);
+  const path = `/files/${encodeURIComponent(fileId)}`;
+  try {
+    return await forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', path);
+  } catch (err) {
+    if (canUseCloudFileFallback(ctx) && err instanceof ForwardApiError && err.status === 404) {
+      return cloudRequest<{ id: string; type: string }>(ctx, 'DELETE', path);
+    }
+    throw err;
+  }
+}
+
+/** Delete a user-managed Forward file. Agent-generated artifacts still use deleteCloudFile. */
+export async function deleteForwardFile(ctx: ForwardContext, fileId: string) {
+  return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/files/${encodeURIComponent(fileId)}`);
 }
 
 // ─── Vaults (Cloud API) ────────────────────────────────────────────
@@ -500,8 +541,16 @@ export async function getCloudVault(ctx: ForwardContext, vaultId: string) {
 export async function createCloudVault(ctx: ForwardContext, input: { display_name: string; metadata?: Record<string, unknown> }) {
   return forwardRequest<CloudVault>(ctx, 'POST', '/vaults', {
     display_name: input.display_name,
-    metadata: input.metadata || { created_by: 'forward-quickstart' },
+    ...(input.metadata ? { metadata: input.metadata } : {}),
   });
+}
+
+export async function updateCloudVault(
+  ctx: ForwardContext,
+  vaultId: string,
+  input: { display_name?: string; metadata?: Record<string, unknown> },
+) {
+  return forwardRequest<CloudVault>(ctx, 'POST', `/vaults/${encodeURIComponent(vaultId)}`, input);
 }
 
 export async function archiveCloudVault(ctx: ForwardContext, vaultId: string) {
@@ -548,6 +597,32 @@ export async function createCloudCredential(
 
 export async function deleteCloudCredential(ctx: ForwardContext, vaultId: string, credentialId: string) {
   return forwardRequest<{ id: string; type: string }>(ctx, 'DELETE', `/vaults/${encodeURIComponent(vaultId)}/credentials/${encodeURIComponent(credentialId)}`);
+}
+
+export interface ForwardServiceAccountToken {
+  type: 'service_account_token';
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  expires_at: string;
+  auth_token_id: string;
+  service_account_id: string;
+  credential_id: string;
+  subject_type: 'admin' | 'identity';
+  identity_id?: string;
+}
+
+export async function createServiceAccountToken(
+  ctx: ForwardContext,
+  input: { identityId?: string; ttlSeconds?: number; metadata?: Record<string, unknown> } = {},
+) {
+  const path = input.identityId
+    ? `/identities/${encodeURIComponent(input.identityId)}/service_account_tokens`
+    : '/service_account_tokens';
+  return forwardRequest<ForwardServiceAccountToken>(ctx, 'POST', path, {
+    ...(input.ttlSeconds ? { ttl_seconds: input.ttlSeconds } : {}),
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+  });
 }
 
 export async function listIdentities(ctx: ForwardContext, externalId: string) {
@@ -632,17 +707,26 @@ export async function createTemplate(ctx: ForwardContext, input?: Partial<Create
     name: input?.name?.trim() || `Forward Quickstart ${new Date(createdAt).toLocaleString()}`,
     description: input?.description?.trim() || undefined,
     environment_id: environmentId,
-    model: input?.model?.trim() || 'ultimate',
+    model: normalizeTemplateModelInput(input?.model),
     system: input?.system?.trim() || '你是 Forward quickstart 测试助手，请用简洁、准确的方式回答用户。',
     tools: input?.tools ?? [],
     mcp_servers: input?.mcp_servers ?? [],
     skills: input?.skills ?? [],
     ...(input?.multiagent ? { multiagent: input.multiagent } : {}),
-    vault_ids: input?.vault_ids ?? [],
+    vault_ids: input?.vault_ids ?? {},
     files: input?.files ?? {},
     environment_variables: input?.environment_variables ?? {},
     metadata: { created_by: 'forward-quickstart' },
   });
+}
+
+function normalizeTemplateModelInput(model: ForwardTemplateModel | undefined): ForwardTemplateModel {
+  if (typeof model === 'string') return model.trim() || 'ultimate';
+  if (model && typeof model === 'object') {
+    const id = typeof model.id === 'string' ? model.id.trim() : '';
+    return { ...model, id: id || 'ultimate' };
+  }
+  return 'ultimate';
 }
 
 export async function updateTemplate(ctx: ForwardContext, templateId: string, input: Partial<CreateTemplateInput>) {
@@ -662,6 +746,23 @@ export async function updateTemplate(ctx: ForwardContext, templateId: string, in
   // multiagent uses replace semantics: send the field to replace it, or null to clear.
   if (input.multiagent !== undefined) body.multiagent = input.multiagent ?? null;
   return forwardRequest<ForwardTemplate>(ctx, 'POST', `/templates/${encodeURIComponent(templateId)}`, body);
+}
+
+export async function cloneTemplate(ctx: ForwardContext, templateId: string, name?: string) {
+  return forwardRequest<ForwardTemplate>(
+    ctx,
+    'POST',
+    `/templates/${encodeURIComponent(templateId)}/clone`,
+    name?.trim() ? { name: name.trim() } : {},
+  );
+}
+
+export async function archiveTemplate(ctx: ForwardContext, templateId: string) {
+  return forwardRequest<ForwardTemplate>(
+    ctx,
+    'POST',
+    `/templates/${encodeURIComponent(templateId)}/archive`,
+  );
 }
 
 // Managed-layer Agent, the unit referenced by a multiagent roster entry.
@@ -700,6 +801,46 @@ export async function listResources(ctx: ForwardContext, type: ForwardResourceTy
     type,
     limit: 50,
   });
+}
+
+function lifecycleResource(type: Exclude<ForwardResourceType, 'memory_store'>, value: unknown): ForwardResource | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const resource = value as Record<string, unknown>;
+  if (typeof resource.id !== 'string' || !resource.id) return null;
+  const displayName = [resource.display_title, resource.display_name, resource.filename, resource.name]
+    .find((item): item is string => typeof item === 'string' && !!item);
+  return {
+    id: resource.id,
+    type,
+    owner_type: typeof resource.owner_type === 'string' ? resource.owner_type : 'identity',
+    owner_id: typeof resource.owner_id === 'string'
+      ? resource.owner_id
+      : typeof resource.identity_id === 'string' ? resource.identity_id : '',
+    ...(typeof resource.icon_url === 'string' || resource.icon_url === null ? { icon_url: resource.icon_url } : {}),
+    ...(resource.binding_info && typeof resource.binding_info === 'object'
+      ? { binding_info: resource.binding_info as { agent_template_count?: number } }
+      : {}),
+    ...(displayName ? { name: displayName } : {}),
+    ...(typeof resource.description === 'string' ? { description: resource.description } : {}),
+    status: resource.archived_at ? 'archived' : typeof resource.status === 'string' ? resource.status : 'active',
+    resource_spec: resource,
+  };
+}
+
+/** Resource-management list. Mirrors the Forward console lifecycle endpoints. */
+export async function listResourceCatalog(ctx: ForwardContext, type: ForwardResourceType) {
+  if (type === 'memory_store') return listResources(ctx, type);
+  const response = type === 'skill'
+    ? await listCloudSkills(ctx)
+    : type === 'file'
+      ? await listCloudFiles(ctx)
+      : type === 'environment'
+        ? await listCloudEnvironments(ctx)
+        : await listCloudVaults(ctx);
+  const data = response.data
+    .map((item) => lifecycleResource(type, item))
+    .filter((item): item is ForwardResource => item !== null);
+  return { data, has_more: false } satisfies Page<ForwardResource>;
 }
 
 export interface EffectiveSpecResp {
@@ -911,6 +1052,69 @@ export async function sendUserMessage(ctx: ForwardContext, sessionId: string, te
   );
 }
 
+export async function sendToolConfirmation(
+  ctx: ForwardContext,
+  sessionId: string,
+  toolUseId: string,
+  result: 'allow' | 'deny',
+  denyMessage?: string,
+) {
+  return forwardRequest<{ data: ForwardEvent[] }>(
+    ctx,
+    'POST',
+    `/sessions/${encodeURIComponent(sessionId)}/events`,
+    {
+      events: [{
+        type: 'user.tool_confirmation',
+        tool_use_id: toolUseId,
+        result,
+        ...(result === 'deny' && denyMessage?.trim() ? { deny_message: denyMessage.trim() } : {}),
+      }],
+    },
+  );
+}
+
+export async function sendQuestionAnswer(
+  ctx: ForwardContext,
+  sessionId: string,
+  questionUseId: string,
+  answers: string[][],
+  dismissed = false,
+) {
+  return forwardRequest<{ data: ForwardEvent[] }>(
+    ctx,
+    'POST',
+    `/sessions/${encodeURIComponent(sessionId)}/events`,
+    {
+      events: [{
+        type: 'user.question_answer',
+        question_use_id: questionUseId,
+        ...(dismissed ? { dismissed: true } : { answers }),
+      }],
+    },
+  );
+}
+
+export async function sendCustomToolResult(
+  ctx: ForwardContext,
+  sessionId: string,
+  customToolUseId: string,
+  content: string,
+) {
+  return forwardRequest<{ data: ForwardEvent[] }>(
+    ctx,
+    'POST',
+    `/sessions/${encodeURIComponent(sessionId)}/events`,
+    {
+      events: [{
+        type: 'user.custom_tool_result',
+        custom_tool_use_id: customToolUseId,
+        content: [{ type: 'text', text: content }],
+      }],
+    },
+  );
+}
+
 export async function listEvents(ctx: ForwardContext, sessionId: string) {
   return forwardRequest<Page<ForwardEvent>>(
     ctx,
@@ -946,13 +1150,15 @@ export async function streamEvents(
   lastEventId?: string,
 ) {
   const params = new URLSearchParams({
-    pat: ctx.pat,
     environment: ctx.environment,
   });
   // Connect directly to Express server (port 3001) for SSE to bypass Vite proxy buffering
   const sseBase = window.location.port === '5173' ? 'http://localhost:3001' : '';
   const url = `${sseBase}/api/forward/sessions/${encodeURIComponent(sessionId)}/events/stream?${params.toString()}`;
-  const headers: Record<string, string> = { Accept: 'text/event-stream' };
+  const headers: Record<string, string> = {
+    Accept: 'text/event-stream',
+    Authorization: `Bearer ${ctx.pat}`,
+  };
   if (lastEventId) headers['Last-Event-ID'] = lastEventId;
   const res = await fetch(url, { headers, signal });
   if (!res.ok || !res.body) {
@@ -1110,14 +1316,16 @@ export async function getScheduleRun(ctx: ForwardContext, runId: string) {
   return forwardRequest<ForwardScheduleRun>(ctx, 'GET', `/schedule_runs/${encodeURIComponent(runId)}`);
 }
 
-// ─── Memory Stores (Cloud API) ─────────────────────────────────────
+// ─── Memory Stores (Forward API) ───────────────────────────────────
 
 export interface MemoryEntry {
   id: string;
   type: 'memory';
-  store_id: string;
+  memory_store_id: string;
+  store_id?: string;
   path: string;
   size: number;
+  content_size_bytes?: number;
   content_sha256: string;
   version: number;
   metadata?: Record<string, unknown>;
@@ -1126,18 +1334,28 @@ export interface MemoryEntry {
 }
 
 export async function listMemoryEntries(ctx: ForwardContext, storeId: string) {
-  return cloudRequest<Page<MemoryEntry>>(ctx, 'GET', `/memory_stores/${encodeURIComponent(storeId)}/memories`, undefined, {
+  const page = await forwardRequest<Page<MemoryEntry>>(ctx, 'GET', `/memory_stores/${encodeURIComponent(storeId)}/memories`, undefined, {
     limit: 100,
   });
+  return { ...page, data: page.data.map(normalizeMemoryEntry) };
 }
 
 export async function getMemoryEntry(ctx: ForwardContext, storeId: string, entryId: string) {
-  return cloudRequest<MemoryEntry & { content?: string }>(ctx, 'GET', `/memory_stores/${encodeURIComponent(storeId)}/memories/${encodeURIComponent(entryId)}`);
+  const entry = await forwardRequest<MemoryEntry & { content?: string }>(ctx, 'GET', `/memory_stores/${encodeURIComponent(storeId)}/memories/${encodeURIComponent(entryId)}`);
+  return normalizeMemoryEntry(entry);
+}
+
+function normalizeMemoryEntry<T extends MemoryEntry>(entry: T): T {
+  return {
+    ...entry,
+    size: entry.size ?? entry.content_size_bytes ?? 0,
+    store_id: entry.store_id ?? entry.memory_store_id,
+  };
 }
 
 // ─── Channels (Forward API) ────────────────────────────────────────
 
-export type ChannelType = 'wechat' | 'wecom' | 'feishu' | 'dingtalk';
+export type ChannelType = 'wechat' | 'wecom' | 'feishu' | 'lark' | 'dingtalk' | 'slack' | 'teams';
 export type BindingStatus = 'unbound' | 'bound' | 'expired';
 export type IdentityResolutionMode = 'fixed' | 'pairing';
 
@@ -1237,18 +1455,46 @@ export function buildChannelCredentials(
   channelType: ChannelType,
   key: string,
   secret: string,
+  tenantId?: string,
 ): Record<string, string> {
   switch (channelType) {
     case 'feishu':
+    case 'lark':
       return { app_id: key, app_secret: secret };
+    case 'slack':
+      return { app_token: key, bot_token: secret };
     case 'dingtalk':
       return { client_id: key, client_secret: secret };
+    case 'teams':
+      return { app_id: key, tenant_id: tenantId ?? '', client_secret: secret };
     case 'wecom':
       return { bot_id: key, secret };
     default:
-      // wechat 仅支持扫码绑定，不使用直连凭据
+      // wechat 仅支持扫码绑定，不使用直连密钥
       return {};
   }
+}
+
+export const CHANNEL_MAX_COUNTS: Record<ChannelType, number> = {
+  wechat: 3,
+  wecom: 5,
+  dingtalk: 5,
+  feishu: 5,
+  lark: 5,
+  slack: 5,
+  teams: 5,
+};
+
+const DEFAULT_TEAMS_CALLBACK_URL = 'https://api.qoder.com/channels/teams/messages';
+
+export function getTeamsCallbackUrl(): string {
+  return import.meta.env.VITE_TEAMS_CALLBACK_URL?.trim() || DEFAULT_TEAMS_CALLBACK_URL;
+}
+
+export function channelTypesForEnvironment(environment: ForwardApiEnvironment): ChannelType[] {
+  return environment === 'global-prod'
+    ? ['wechat', 'wecom', 'dingtalk', 'feishu', 'lark', 'slack', 'teams']
+    : ['wechat', 'wecom', 'dingtalk', 'feishu'];
 }
 
 // QR 扫码 confirmed 只代表扫码动作完成；渠道真正可处理上行消息需要

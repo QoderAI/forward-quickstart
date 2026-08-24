@@ -112,6 +112,17 @@ describe('attachment markers', () => {
     expect(composed).toBe('这张图里写的是什么？\n\n[附件] chart.png → /data/workspace/chart.png');
   });
 
+  test('can include a file id while preserving the mounted path for the agent', () => {
+    const composed = composeMessageWithAttachments('看看这张图', [{ name: 'photo.png', fileId: 'file_abc123' }]);
+    expect(composed).toBe('看看这张图\n\n[附件] photo.png → /data/workspace/photo.png · file_id=file_abc123');
+    expect(splitAttachmentMarkers(composed).attachments[0]).toMatchObject({
+      name: 'photo.png',
+      path: '/data/workspace/photo.png',
+      fileId: 'file_abc123',
+      isImage: true,
+    });
+  });
+
   test('round-trips an image attachment and flags it as an image', () => {
     const composed = composeMessageWithAttachments('看看这张图', ['photo.JPG']);
     const { body, attachments } = splitAttachmentMarkers(composed);

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 import {
   BUILTIN_TOOLS,
   buildToolsetEntry,
+  extractToolApproval,
   extractBuiltinToolNames,
   extractToolNames,
 } from './templateTools';
@@ -28,7 +29,7 @@ describe('BUILTIN_TOOLS', () => {
 });
 
 describe('extractToolNames', () => {
-  test('reads names from enabled_tools and enabled configs', () => {
+  test('treats enabled_tools as the canonical allowlist when configs carry policy overrides', () => {
     const tools = [
       {
         type: 'agent_toolset_20260401',
@@ -40,7 +41,7 @@ describe('extractToolNames', () => {
         ],
       },
     ];
-    expect(extractToolNames(tools)).toEqual(['Bash', 'WebSearch', 'ImageSearch', 'ImageGen']);
+    expect(extractToolNames(tools)).toEqual(['Bash', 'WebSearch']);
   });
 
   test('ignores malformed entries and non-toolset types', () => {
@@ -80,14 +81,23 @@ describe('extractBuiltinToolNames (template edit flow)', () => {
 });
 
 describe('buildToolsetEntry (template save flow)', () => {
-  test('serializes the selection into a single agent_toolset entry with enabled configs', () => {
+  test('serializes the selection using the console toolset wire format', () => {
     expect(buildToolsetEntry(['Bash', 'ImageSearch', 'ImageGen'])).toEqual({
       type: 'agent_toolset_20260401',
-      configs: [
-        { name: 'Bash', enabled: true },
-        { name: 'ImageSearch', enabled: true },
-        { name: 'ImageGen', enabled: true },
-      ],
+      enabled_tools: ['Bash', 'ImageSearch', 'ImageGen'],
+      default_config: { permission_policy: { type: 'always_allow' } },
+    });
+  });
+
+  test('persists only per-tool policies that differ from the default', () => {
+    expect(buildToolsetEntry(['Bash', 'Read'], {
+      defaultPolicy: 'always_ask',
+      toolPolicies: { Bash: 'always_deny', Read: 'always_ask' },
+    })).toEqual({
+      type: 'agent_toolset_20260401',
+      enabled_tools: ['Bash', 'Read'],
+      default_config: { permission_policy: { type: 'always_ask' } },
+      configs: [{ name: 'Bash', permission_policy: { type: 'always_deny' } }],
     });
   });
 
@@ -98,5 +108,25 @@ describe('buildToolsetEntry (template save flow)', () => {
     expect(restored).toContain('ImageSearch');
     expect(restored).toContain('ImageGen');
     expect(restored).not.toContain('Bash');
+  });
+});
+
+describe('extractToolApproval', () => {
+  test('restores the default and per-tool policies', () => {
+    expect(extractToolApproval([{
+      type: 'agent_toolset_20260401',
+      default_config: { permission_policy: { type: 'always_ask' } },
+      configs: [{ name: 'Read', permission_policy: { type: 'always_allow' } }],
+    }])).toEqual({
+      defaultPolicy: 'always_ask',
+      toolPolicies: { Read: 'always_allow' },
+    });
+  });
+
+  test('normalizes the legacy ask_user alias', () => {
+    expect(extractToolApproval([{
+      type: 'agent_toolset_20260401',
+      default_config: { permission_policy: { type: 'ask_user' } },
+    }]).defaultPolicy).toBe('always_ask');
   });
 });

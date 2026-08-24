@@ -14,19 +14,24 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 
 ## 展示能力
 
-- **身份管理**：基于应用侧的 `external_id` 查找或创建 Forward Identity。
-- **模板配置**：创建和查看可复用的 Agent Template，包括模型、工具、技能、文件、环境和凭据库等配置。支持多 Agent 协作（Coordinator）配置：在已选择内置工具（Toolset）的前提下，可通过表单方式选择可委派的 Agent（对应 Managed Agent），启用后运行时自动注入编排工具（Agent / create_agent / send_to_agent / list_agents），允许 Agent 将子任务委派给其他 Agent 协同完成。
-- **资源管理**：上传或创建 Skill、File、Environment、Vault 等 Cloud 资源，并注册为 Forward Resource。
-- **凭据管理**：在 Vault 中创建和删除凭据，支持 Bearer Token、OAuth Token 和环境变量类型。
-- **会话执行**：基于 Identity 和 Template 创建 Session，发送 `user.message`，并支持取消当前 Turn；已有任务执行时仍可点击「新建对话」另起新会话，后台任务继续执行且不会干扰当前视图。提问时可点击发送按钮旁的回形针图标添加本地文本类文件（单个 ≤5MB）作为对话附件——文件上传后挂载到 Agent 工作目录（新会话随创建挂载，进行中的会话动态追加挂载），消息中自动标注挂载路径，Agent 可直接读取附件内容作答；附件在消息气泡中以文件卡片展示，刷新后依然可见。
+- **身份接入**：基于应用侧的 `external_id` 查找或创建运行会话所需的 Forward Identity；Quickstart 不提供身份管理页面。
+- **模板配置**：创建、编辑、克隆和归档可复用的 Agent Template，支持模型推理强度与上下文窗口、内置工具及逐工具审批策略、MCP Server、Browser Use、技能、文件、环境和密钥库等配置。支持多 Agent 协作（Coordinator）配置：在已选择内置工具（Toolset）的前提下，可通过表单方式选择可委派的 Agent（对应 Managed Agent），启用后运行时自动注入编排工具（Agent / create_agent / send_to_agent / list_agents），允许 Agent 将子任务委派给其他 Agent 协同完成。
+- **资源管理**：通过 Forward 生命周期接口创建、查询、更新和删除 Skill、File、Environment、Vault；创建接口会自动完成资源注册，模板绑定时通过 Forward Resource Registry 选择资源。
+- **密钥管理**：在 Vault 中创建和删除密钥，支持 Bearer Token、OAuth Token 和环境变量类型。
+- **会话执行**：基于 Identity 和 Template 创建 Session，发送 `user.message`，并支持取消当前 Turn；遇到需要确认的工具调用或 `AskUserQuestion` 时，由用户显式允许、拒绝、作答或跳过后继续执行。已有任务执行时仍可点击「新建对话」另起新会话，后台任务继续执行且不会干扰当前视图。提问时可点击发送按钮旁的回形针图标添加本地文本类文件（单个 ≤5MB）作为对话附件——文件上传后挂载到 Agent 工作目录（新会话随创建挂载，进行中的会话动态追加挂载），消息中自动标注挂载路径，Agent 可直接读取附件内容作答；附件在消息气泡中以文件卡片展示，刷新后依然可见。
 - **实时事件**：通过 SSE 接收 Agent 状态、消息、思考过程、工具调用和工具结果，支持打字机流式输出并实时渲染 Markdown；Agent 通过 DeliverArtifacts 交付的图片文件在对话中内联预览，支持点击放大和下载原图；流式过程中不完整的表格/标题片段也能安全渲染，Session 运行失败（如模型过载）会在对话中显示错误提示；消息按服务端时间戳排序展示，多轮追问时新提问始终显示在对话最底部。多 Agent 协作场景下，子线程的创建、委派、运行和完成等状态事件以轻量标签形式在对话中展示，子线程完成不会提前终止 SSE 流，确保协调者能正确接收子线程结果；单 Agent 会话中自动过滤从其他会话 SSE 流泄漏的多 Agent 状态事件（如「子线程已完成」），避免显示无关标签；协调者（Coordinator）输出的重复回复（如先输出草稿再输出验收版）会通过字符二元组 Jaccard 相似度自动去重，仅保留最终版本。发送按钮旁的设置图标可开关「显示思考过程 / 显示工具调用过程」（选择持久化到本地）；点击历史会话加载事件时显示加载动画，不会闪现欢迎页；历史会话列表支持置顶——悬浮某条记录时显示图钉图标，点击后该会话固定到列表顶部的「置顶」分组（再次点击取消置顶，置顶状态持久化到本地）。
+- **实时语音（本地）**：Template 开启 Realtime 后，可从聊天输入框单击麦克风直接启动独立 Voice Session；页面展示实时字幕、Agent 音频、Work 任务进度、文字混输、静音与结束控制。语音 Session 在历史列表带有“语音”标签，并通过后端 metadata 中的 `conversation_id` 恢复时间线。CN 与 Global 使用相同交互；WebSocket URL 只携带短时单次 connection key，本地 Node 代理负责携带用户在页面中输入的 PAT 连接上游 WebSocket。
 - **模板快速切换**：在对话列表顶部直接切换当前会话使用的 Template，无需离开对话界面。
-- **权限模式**：内置「开发者模式 / 用户模式」开关（默认用户模式，选择持久化到本地）。开发者模式解锁模板及模板资源（技能、文件、环境、凭据）的新建、编辑和删除权限，并显示对应的「模板资源」菜单；用户模式仅能查看和使用模板。切换到开发者模式时会弹出风险确认提示。
+- **权限模式**：内置「开发者模式 / 用户模式」开关（默认用户模式，选择持久化到本地）。开发者模式解锁模板及模板资源（技能、文件、环境、密钥）的新建、编辑和删除权限，并显示对应的「模板资源」菜单；用户模式仅能查看和使用模板。切换到开发者模式时会弹出风险确认提示。
 - **会话历史与用量**：查看历史 Session、事件历史、执行状态和会话时长统计。
 - **定时任务**：创建、编辑、暂停、恢复、归档和手动执行 Schedule。
 - **批量任务**（仅开发者模式）：基于 JSONL 输入文件创建异步批量任务，平台闲时时段自动调度执行。支持表单构建（选模板逐行输入，自动生成 JSONL）和文件上传两种创建方式，前端预校验（JSON 解析/必填字段/custom_id 唯一/≤10000 行）并自动补全缺失的 identity_id；创建时可选添加「自定义标签」（逐项键值对输入，对应 API metadata 字段，仅用于标识查找不影响执行），绑定模板下拉展示模板当前使用的模型；列表页展示状态徽章与分段进度条，支持状态筛选与游标分页，已完成/已取消的任务支持「再次执行」（复用原输入文件与参数新建任务）；详情弹窗展示状态时间线、7 维任务计数与标签芯片，非终态自动轮询（5s 起步退避至 30s）；支持取消（二次确认）与终态后下载 output.jsonl / error.jsonl。
-- **IM 渠道**：创建和管理微信、企业微信、钉钉、飞书渠道，支持扫码绑定或手动凭据配置；创建渠道时显式传入 `identity_resolution` 以确保渠道授权后消息路由正确生效。
+- **IM 渠道**：按环境展示并创建微信、企业微信、钉钉、飞书、Lark、Slack 和 Microsoft Teams 渠道，支持扫码绑定或手动密钥配置，并对齐各渠道数量上限；Teams 使用 App ID、Tenant ID 和 Client Secret 配置；创建渠道时显式传入 `identity_resolution` 以确保渠道授权后消息路由正确生效。
+
+  Teams 需在 Microsoft Teams Developer Portal 将 Messaging Endpoint 配置为 `https://api.qoder.com/channels/teams/messages`。如部署使用独立 Channel Gateway，可在前端构建时通过 `VITE_TEAMS_CALLBACK_URL` 覆盖该地址。
 - **个人记忆查看**：基于 Template 生效配置读取关联 Memory Store，并查看记忆条目内容。
+
+本 Quickstart 聚焦客户可直接复用的 Forward 主流程，不包含控制台的身份管理、会话诊断和会话范围能力。
 
 ## 文档
 
@@ -111,6 +116,9 @@ npm run dev
 
 启动成功后，终端会同时显示前端 Vite 服务和 Express 本地代理的日志。打开前端地址后，在登录页面选择 API 环境并输入对应的 Forward PAT 即可开始体验。
 
+Voice 仅在本地开发模式可用。首次启动会请求麦克风权限；若麦克风不可用，仍可在 Voice 页面用文字继续对话。Voice 按钮不可用时，请确认当前 Template 已开启 Realtime。
+Voice 中继只接受来自 `localhost`、`127.0.0.1` 或 `::1` 页面的一次性连接，并仅用于本机开发；请勿将本地代理端口 `3001` 暴露到公网。
+
 如果端口被占用，可以先停止占用 `5173` 或 `3001` 的本地进程，再重新执行 `npm run dev`。
 
 ## Vercel 部署
@@ -119,6 +127,7 @@ npm run dev
 
 - 本地运行继续使用 `npm run dev`，Vite 会将 `/api` 请求代理到本地 Express 服务。
 - Vercel 会构建 `client/dist` 并将现有 Express API 作为 Serverless Functions 部署；前端和 API 使用同一域名。
+- 当前 Vercel 在线 Demo 不提供 Voice WebSocket 中继；普通 HTTP、SSE 和其他现有能力不受影响。
 
 建议先 Fork 本仓库到自己的 GitHub 账号，再在 Vercel 导入 Fork 后的仓库。Vercel 检测到根目录的 `vercel.json` 后会自动使用正确的构建命令和 API 函数配置。
 
@@ -144,7 +153,7 @@ CN_PROD_CLOUD_API_BASE_URL
 GLOBAL_PROD_CLOUD_API_BASE_URL
 ```
 
-不要将 PAT、Vault 凭据或其他密钥提交到 Git 仓库或写入 Vercel 的公开前端变量。
+不要将 PAT、Vault 密钥或其他敏感信息提交到 Git 仓库或写入 Vercel 的公开前端变量。
 
 ## 体验流程
 
@@ -153,7 +162,7 @@ GLOBAL_PROD_CLOUD_API_BASE_URL
 3. 输入所选环境对应的 Forward PAT。
 4. 输入应用侧用户标识，例如 `user-001`。
 5. 创建或选择一个 Template。
-6. 上传或注册需要的资源，例如文件、技能、环境或凭据库。
+6. 创建或上传需要的资源，例如文件、技能、环境或密钥库。
 7. 创建 Session 并发送消息。
 8. 查看实时 SSE 事件流。
 9. 按需体验定时任务、IM 渠道和个人记忆等扩展能力。
@@ -181,13 +190,25 @@ PAT + external_id
 | POST | `/identities/{id}/access_tokens` | 创建 Identity 访问令牌 |
 | GET | `/templates` | 查询 Template 列表 |
 | POST | `/templates` | 创建 Template |
+| POST | `/templates/{id}` | 更新 Template |
+| POST | `/templates/{id}/clone` | 克隆 Template |
+| POST | `/templates/{id}/archive` | 归档 Template |
 | GET | `/identities/{id}/templates/{template_id}/effective` | 查看生效后的运行配置 |
 | POST | `/resources/registry` | 注册 Resource |
 | GET | `/resources` | 查询已注册 Resource |
+| GET/POST | `/skills` | 查询或上传 Skill |
+| GET/PUT/DELETE | `/skills/{id}` | 查看、更新或删除 Skill |
+| GET/POST | `/files` | 查询或上传 File |
+| GET/DELETE | `/files/{id}` | 查看或删除 File |
+| GET/POST | `/environments` | 查询或创建 Environment |
+| GET/POST/DELETE | `/environments/{id}` | 查看、更新或删除 Environment |
+| GET/POST | `/vaults` | 查询或创建 Vault |
+| GET/POST/DELETE | `/vaults/{id}` | 查看、更新或删除 Vault |
+| GET/POST/DELETE | `/vaults/{id}/credentials[/{credential_id}]` | 管理 Vault Credential |
 | POST | `/sessions` | 创建 Session |
 | GET | `/sessions` | 查询 Session 列表 |
 | GET | `/sessions/{id}` | 查询 Session 详情 |
-| POST | `/sessions/{id}/events` | 发送 Session 事件 |
+| POST | `/sessions/{id}/events` | 发送消息、工具确认和问题回答等 Session 事件 |
 | GET | `/sessions/{id}/events` | 查询 Session 事件历史 |
 | GET | `/sessions/{id}/events/stream` | 订阅 Session 事件流 |
 | POST | `/sessions/{id}/archive` | 归档 Session |
@@ -217,15 +238,11 @@ PAT + external_id
 
 ### Cloud API
 
-本示例也会调用 Cloud API 中的资源接口，配合 Forward Template 和 Resource Registry 使用。
+资源管理 CRUD 使用 Forward API。以下场景仍需调用 Cloud API，因为相关数据不一定存在于 Forward 资源视图中。
 
 | 资源 | 能力 |
 | --- | --- |
-| Models | 查询当前账号可用模型，用于创建 Template。 |
-| Environments | 查询、创建、查看、更新、归档和删除云端运行环境。 |
-| Skills | 查询、上传、查看、更新和删除技能包。 |
-| Files | 查询、上传、查看、获取下载地址和删除文件。 |
-| Vaults | 查询、创建、查看、归档和删除凭据库。 |
-| Vault Credentials | 查询、创建和删除凭据，支持 Bearer Token、OAuth Token 和环境变量类型。 |
+| Agent 生成文件 | 查询 Agent 交付物或系统生成文件的元数据，并获取签名下载地址。 |
+| Session Resources | 查询已挂载到 Session 的文件资源。 |
 | Agents | 查询 Managed Agent 列表，用于模板配置多 Agent 协作时选择可委派的 Agent。 |
 | Memory Stores | 读取 Template 生效配置中的 Memory Store，并查询记忆条目和内容。 |

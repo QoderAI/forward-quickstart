@@ -1,9 +1,11 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
+import { createServer } from 'node:http';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import './utils/env.js';
+import { createVoiceProxy } from './voiceProxy.js';
 
 // Headroom above the client-side caps (images 10 MB, text files 5 MB) so the
 // friendly client-side validation is what rejects oversized picks, rather than
@@ -21,6 +23,7 @@ const DEFAULT_API_BASE_URLS: Record<ForwardApiEnvironment, string> = {
 const API_BASE_URLS = Object.fromEntries(
   Object.entries(DEFAULT_API_BASE_URLS).map(([key, value]) => [key, value.replace(/\/+$/, '')]),
 ) as Record<ForwardApiEnvironment, string>;
+const voiceProxy = createVoiceProxy({ baseUrls: API_BASE_URLS, enabled: !process.env.VERCEL });
 const DEFAULT_CLOUD_API_BASE_URLS: Record<ForwardApiEnvironment, string> = {
   'cn-prod': process.env.CN_PROD_CLOUD_API_BASE_URL?.trim() || 'https://api.qoder.com.cn/api/v1/cloud',
   'global-prod': process.env.GLOBAL_PROD_CLOUD_API_BASE_URL?.trim() || 'https://api.qoder.com/api/v1/cloud',
@@ -33,6 +36,7 @@ const LOG_FILE = join(LOG_DIR, 'forward-proxy.log');
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+app.post('/api/voice/connect', voiceProxy.issueConnectionKey);
 
 function proxyLog(level: 'info' | 'warn', message: string, meta?: Record<string, unknown>) {
   const line = JSON.stringify({
@@ -168,6 +172,12 @@ function parseApiEnvironment(value: unknown): ForwardApiEnvironment {
   return 'cn-prod';
 }
 
+function readBearerToken(req: import('express').Request, fallback?: unknown) {
+  const auth = req.get('authorization') || '';
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  return String(match?.[1] ?? fallback ?? '').trim();
+}
+
 function buildForwardUrl(apiEnvironment: ForwardApiEnvironment, path: string, query?: Record<string, unknown>) {
   if (!path.startsWith('/')) {
     throw new Error('path must start with /');
@@ -198,10 +208,10 @@ app.post('/api/forward/request', async (req, res) => {
   } = req.body ?? {};
 
   const apiEnvironment = parseApiEnvironment(environment);
-  const authToken = String(pat ?? userId ?? '').trim();
+  const authToken = readBearerToken(req, pat ?? userId);
   const targetPath = String(path ?? '').trim();
   if (!authToken || !targetPath) {
-    res.status(400).json({ error: { message: 'pat and path are required' } });
+    res.status(400).json({ error: { message: 'token and path are required' } });
     return;
   }
 
@@ -293,10 +303,10 @@ app.post('/api/cloud/request', async (req, res) => {
   } = req.body ?? {};
 
   const apiEnvironment = parseApiEnvironment(environment);
-  const authToken = String(pat ?? userId ?? '').trim();
+  const authToken = readBearerToken(req, pat ?? userId);
   const targetPath = String(path ?? '').trim();
   if (!authToken || !targetPath) {
-    res.status(400).json({ error: { message: 'pat and path are required' } });
+    res.status(400).json({ error: { message: 'token and path are required' } });
     return;
   }
 
@@ -360,11 +370,11 @@ app.post('/api/cloud/request', async (req, res) => {
 // matching Vercel function shim stays valid.
 function makePreviewHandler(baseUrls: Record<ForwardApiEnvironment, string>, label: string) {
   return async (req: import('express').Request, res: import('express').Response) => {
-    const authToken = String(req.query.pat ?? req.query.userId ?? '').trim();
+    const authToken = readBearerToken(req, req.query.pat ?? req.query.userId);
     const fileId = String(req.params.fileId ?? '').trim();
     const environment = parseApiEnvironment(req.query.environment);
     if (!authToken || !fileId) {
-      res.status(400).json({ error: { message: 'pat and fileId are required' } });
+      res.status(400).json({ error: { message: 'token and fileId are required' } });
       return;
     }
     try {
@@ -421,10 +431,10 @@ app.get('/api/cloud/files/:fileId/preview', makePreviewHandler(CLOUD_API_BASE_UR
 app.get('/api/forward/sessions/:sessionId/events/stream', async (req, res) => {
   const startedAt = nowMs();
   const apiEnvironment = parseApiEnvironment(req.query.environment);
-  const authToken = String(req.query.pat ?? req.query.userId ?? '').trim();
+  const authToken = readBearerToken(req, req.query.pat ?? req.query.userId);
   const sessionId = String(req.params.sessionId ?? '').trim();
   if (!authToken || !sessionId) {
-    res.status(400).json({ error: { message: 'pat and sessionId are required' } });
+    res.status(400).json({ error: { message: 'token and sessionId are required' } });
     return;
   }
 
@@ -572,12 +582,13 @@ function makeUploadHandler(baseUrls: Record<ForwardApiEnvironment, string>, labe
   return async (req: import('express').Request, res: import('express').Response) => {
     const startedAt = nowMs();
     const { pat, environment, path: targetPath } = req.body ?? {};
+    const idempotencyKey = req.get('idempotency-key')?.trim();
     const apiEnvironment = parseApiEnvironment(environment);
-    const authToken = String(pat ?? '').trim();
+    const authToken = readBearerToken(req, pat);
     const target = String(targetPath ?? '').trim();
 
     if (!authToken || !target) {
-      res.status(400).json({ error: { message: 'pat and path are required' } });
+      res.status(400).json({ error: { message: 'token and path are required' } });
       return;
     }
 
@@ -597,11 +608,14 @@ function makeUploadHandler(baseUrls: Record<ForwardApiEnvironment, string>, labe
         }
       }
 
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${authToken}`,
+      };
+      if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+
       const upstream = await fetch(url, {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${authToken}`,
-        },
+        headers,
         body: formData,
       });
 
@@ -633,7 +647,7 @@ app.post('/api/cloud/upload', upload.single('file'), makeUploadHandler(CLOUD_API
 app.post('/api/forward/upload', upload.single('file'), makeUploadHandler(API_BASE_URLS, 'forward'));
 
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', forwardApiBaseUrls: API_BASE_URLS });
+  res.json({ status: 'ok', forwardApiBaseUrls: API_BASE_URLS, voiceRealtimeProxy: { enabled: voiceProxy.enabled, localOnly: true } });
 });
 
 export default app;
@@ -641,7 +655,9 @@ export default app;
 // Vercel imports the Express app as a serverless function. Keep the listener
 // for the existing local development and standalone production commands.
 if (!process.env.VERCEL) {
-  app.listen(PORT, () => {
+  const server = createServer(app);
+  voiceProxy.attach(server);
+  server.listen(PORT, () => {
     console.log(`Forward quickstart server running on http://localhost:${PORT}`);
     console.log('Forward API targets:', API_BASE_URLS);
   });
