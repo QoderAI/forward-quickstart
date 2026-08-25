@@ -31,8 +31,7 @@ export type TemplateResourceBindings = Record<string, { enabled: boolean }>;
 // coordinator itself; `type: 'agent'` references another Managed Agent by id.
 export interface MultiagentAgentEntry {
   type: 'self' | 'agent';
-  id?: string;
-  version?: number | string;
+  template_id?: string;
   name?: string;
 }
 
@@ -765,25 +764,11 @@ export async function archiveTemplate(ctx: ForwardContext, templateId: string) {
   );
 }
 
-// Managed-layer Agent, the unit referenced by a multiagent roster entry.
-// Each Forward Template compiles to a Managed Agent; the roster `id` must be
-// an agent ID (agent_xxx), not a template ID.
-export interface ManagedAgent {
-  id: string;
-  name: string;
-  version: number;
-  model?: string | { id?: string };
-  status?: string;
-}
-
-// List Managed Agents so the template editor can offer them as multiagent
-// roster candidates. Forward Templates don't expose their backing agent ID,
-// so the editor lists agents by name and stores the agent ID in the roster.
-export async function listManagedAgents(ctx: ForwardContext) {
-  return cloudRequest<Page<ManagedAgent>>(ctx, 'GET', '/agents', undefined, {
-    limit: 100,
-  });
-}
+// Multi-agent roster candidates are now sourced entirely from Forward
+// Templates via GET /api/v1/forward/templates. The Forward layer's
+// multiagent.agents[] uses template_id (not agent_id), so we no longer
+// need the Cloud API /agents endpoint — eliminating the qca.access
+// dependency in Service Account mode.
 
 export async function registerResource(ctx: ForwardContext, type: ForwardResourceType, id: string, name?: string) {
   return forwardRequest<ForwardResource>(ctx, 'POST', '/resources/registry', {

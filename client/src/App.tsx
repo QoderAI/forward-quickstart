@@ -60,8 +60,6 @@ import {
   getTeamsCallbackUrl,
   CHANNEL_MAX_COUNTS,
   waitForChannelBinding,
-  listManagedAgents,
-  type ManagedAgent,
   type MultiagentConfig,
   type MultiagentAgentEntry,
   type ForwardChannel,
@@ -2252,13 +2250,11 @@ export default function App() {
   const [toolsJson, setToolsJson] = useState('');
   const [mcpServersJson, setMcpServersJson] = useState('');
   // Multi-agent (coordinator) config in the template editor. The Forward API's
-  // multiagent roster references Managed Agent IDs (agent_xxx), not template IDs
-  // — Forward templates don't expose their backing agent_id, so the editor
-  // lists managed agents by name and stores the agent ID. Toolset
-  // (agent_toolset_20260401) is a hard prerequisite: the UI gates the section
-  // until the user has picked at least one built-in tool.
-  const [managedAgents, setManagedAgents] = useState<ManagedAgent[]>([]);
-  const [managedAgentsLoading, setManagedAgentsLoading] = useState(false);
+  // Multi-agent roster references Forward Template IDs (tmpl_xxx) via the
+  // template_id field. The picker reuses the already-loaded templates list,
+  // so no separate API call is needed — Forward-only, no qca.access required.
+  // Toolset (agent_toolset_20260401) is a hard prerequisite: the UI gates the
+  // section until the user has picked at least one built-in tool.
   const [multiagentEnabled, setMultiagentEnabled] = useState(false);
   const [multiagentSelectedAgentIds, setMultiagentSelectedAgentIds] = useState<string[]>([]);
   const [multiagentIncludeSelf, setMultiagentIncludeSelf] = useState(false);
@@ -2423,21 +2419,6 @@ export default function App() {
     const nextModelId = pickTemplateCreatableModelId(cloudModels, templateModel);
     if (nextModelId !== templateModel) setTemplateModel(nextModelId);
   }, [cloudModels, editingTemplateId, showTemplateModal, templateModel]);
-
-  // Load managed agents for the multiagent roster picker. Forward templates
-  // don't expose their backing agent_id, so the editor lists agents by name
-  // (each template compiles to a managed agent with a matching name).
-  const loadManagedAgents = useCallback(async (context: ForwardContext) => {
-    setManagedAgentsLoading(true);
-    try {
-      const res = await listManagedAgents(context);
-      setManagedAgents(res.data ?? []);
-    } catch {
-      setManagedAgents([]);
-    } finally {
-      setManagedAgentsLoading(false);
-    }
-  }, []);
 
   const getModelLabel = useCallback((model: ForwardTemplate['model'] | unknown): string => {
     const modelId = getTemplateModelId(model);
@@ -3158,8 +3139,8 @@ export default function App() {
     setError('');
     setShowTemplateModal(true);
     void loadTemplateResourceOptions();
-    if (ctx) { void loadModels(ctx); void loadManagedAgents(ctx); }
-  }, [cloudModels, ctx, loadModels, loadManagedAgents, loadTemplateResourceOptions]);
+    if (ctx) { void loadModels(ctx); void listTemplates(ctx).then(page => setTemplates(page.data)).catch(() => undefined); }
+  }, [cloudModels, ctx, loadModels, loadTemplateResourceOptions]);
 
   const openEditTemplateModal = useCallback((template: ForwardTemplate) => {
     setEditingTemplateId(template.id);
@@ -3207,23 +3188,23 @@ export default function App() {
         ? JSON.stringify(template.mcp_servers, null, 2)
         : '',
     );
-    // Multi-agent config → form state. The roster stores Managed Agent IDs;
-    // self entries map to the include-self toggle, agent entries to chips.
+    // Multi-agent config → form state. The roster stores Forward Template IDs
+    // via the template_id field; self entries map to the include-self toggle.
     const ma = template.multiagent;
     const maAgents = ma && Array.isArray(ma.agents) ? ma.agents : [];
     setMultiagentEnabled(!!ma && ma.type === 'coordinator' && maAgents.length > 0);
     setMultiagentSelectedAgentIds(
       maAgents
-        .filter((e: MultiagentAgentEntry) => e.type === 'agent' && typeof e.id === 'string')
-        .map((e: MultiagentAgentEntry) => e.id as string),
+        .filter((e: MultiagentAgentEntry) => e.type === 'agent' && typeof e.template_id === 'string')
+        .map((e: MultiagentAgentEntry) => e.template_id as string),
     );
     setMultiagentIncludeSelf(maAgents.some((e: MultiagentAgentEntry) => e.type === 'self'));
     setError('');
     setViewingTemplate(null);
     setShowTemplateModal(true);
     void loadTemplateResourceOptions();
-    if (ctx) { void loadModels(ctx); void loadManagedAgents(ctx); }
-  }, [ctx, loadModels, loadManagedAgents, loadTemplateResourceOptions]);
+    if (ctx) { void loadModels(ctx); void listTemplates(ctx).then(page => setTemplates(page.data)).catch(() => undefined); }
+  }, [ctx, loadModels, loadTemplateResourceOptions]);
 
   const connect = useCallback(async () => {
     const nextExternalId = externalId.trim();
@@ -3476,8 +3457,8 @@ export default function App() {
     });
     const rosterAgents: MultiagentAgentEntry[] = multiagentSelectedAgentIds
       .map((id) => {
-        const agent = managedAgents.find((a) => a.id === id);
-        return { type: 'agent' as const, id, ...(agent?.name ? { name: agent.name } : {}) };
+        const tmpl = templates.find((t) => t.id === id);
+        return { type: 'agent' as const, template_id: id, ...(tmpl?.name ? { name: tmpl.name } : {}) };
       });
     const multiagent: MultiagentConfig | null =
       multiagentEnabled && hasToolset && (rosterAgents.length > 0 || multiagentIncludeSelf)
@@ -3515,7 +3496,7 @@ export default function App() {
     environmentId,
     envVarsText,
     fileIdsText,
-    managedAgents,
+    templates,
     mcpServersJson,
     multiagentEnabled,
     multiagentIncludeSelf,
@@ -6533,8 +6514,8 @@ export default function App() {
                     <div className="mb-2 text-[11px] text-black/40">可委派 Agent（{vt.multiagent.agents.length} 个）</div>
                     <div className="flex flex-wrap gap-1.5">
                       {vt.multiagent.agents.map((entry, i) => (
-                        <span key={i} className="rounded-md bg-white px-2 py-0.5 text-xs text-black/60 shadow-[inset_0_0_0_1px_#E8EBF5]" title={entry.id || ''}>
-                          {entry.type === 'self' ? '自身（self）' : (entry.name || entry.id || '未知 Agent')}
+                        <span key={i} className="rounded-md bg-white px-2 py-0.5 text-xs text-black/60 shadow-[inset_0_0_0_1px_#E8EBF5]" title={entry.template_id || ''}>
+                          {entry.type === 'self' ? '自身（self）' : (entry.name || entry.template_id || '未知 Agent')}
                         </span>
                       ))}
                     </div>
@@ -6889,21 +6870,19 @@ export default function App() {
                 ) : multiagentEnabled ? (
                   <div className="space-y-2">
                     <div className="text-[11px] text-black/40">选择可委派的 Agent（对应其他模板）</div>
-                    {managedAgentsLoading ? (
-                      <div className="text-[11px] text-black/30">加载 Agent 列表...</div>
-                    ) : managedAgents.length === 0 ? (
-                      <div className="text-[11px] text-black/30">暂无可委派 Agent</div>
+                    {templates.filter((t) => t.id !== editingTemplateId).length === 0 ? (
+                      <div className="text-[11px] text-black/30">暂无可委派模板，请先创建其他模板</div>
                     ) : (
                       <div className="flex flex-wrap gap-1.5">
-                        {managedAgents.map((agent) => {
-                          const isSelected = multiagentSelectedAgentIds.includes(agent.id);
+                        {templates.filter((t) => t.id !== editingTemplateId).map((tmpl) => {
+                          const isSelected = multiagentSelectedAgentIds.includes(tmpl.id);
                           return (
-                            <button key={agent.id} type="button"
-                              onClick={() => setMultiagentSelectedAgentIds((prev) => isSelected ? prev.filter((id) => id !== agent.id) : [...prev, agent.id])}
+                            <button key={tmpl.id} type="button"
+                              onClick={() => setMultiagentSelectedAgentIds((prev) => isSelected ? prev.filter((id) => id !== tmpl.id) : [...prev, tmpl.id])}
                               className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${isSelected ? 'bg-[#3550FF] text-white shadow-sm' : 'bg-[#F4F6FC] text-black/55 hover:bg-[#E8EBF5]'}`}
-                              title={agent.id}
+                              title={tmpl.id}
                             >
-                              {agent.name}
+                              {tmpl.name}
                             </button>
                           );
                         })}

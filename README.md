@@ -244,5 +244,4 @@ PAT + external_id
 | --- | --- |
 | Agent 生成文件 | 查询 Agent 交付物或系统生成文件的元数据，并获取签名下载地址。 |
 | Session Resources | 查询已挂载到 Session 的文件资源。 |
-| Agents | 查询 Managed Agent 列表，用于模板配置多 Agent 协作时选择可委派的 Agent。 |
 | Memory Stores | 读取 Template 生效配置中的 Memory Store，并查询记忆条目和内容。 |
