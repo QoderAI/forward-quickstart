@@ -17,12 +17,37 @@ export const ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
 export const IMAGE_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 
 export const ATTACHMENT_EXTENSIONS = [
-  'txt', 'md', 'csv', 'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'conf', 'cfg', 'env', 'log',
+  'txt', 'md', 'csv', 'tsv', 'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'conf', 'cfg', 'env', 'log',
   'html', 'htm', 'css', 'scss', 'less', 'js', 'jsx', 'ts', 'tsx', 'vue', 'svelte',
-  'py', 'go', 'rs', 'java', 'kt', 'scala', 'c', 'cpp', 'cc', 'h', 'hpp', 'rb', 'php',
-  'swift', 'r', 'lua', 'pl', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'sql', 'graphql', 'gql',
-  'proto', 'dockerfile', 'makefile', 'gitignore', 'editorconfig', 'eslintrc', 'prettierrc',
+  'py', 'go', 'rs', 'java', 'kt', 'scala', 'c', 'cpp', 'cc', 'cs', 'h', 'hpp', 'rb', 'php',
+  'swift', 'm', 'mm', 'r', 'lua', 'pl', 'sh', 'bash', 'zsh', 'fish', 'bat', 'ps1', 'sql', 'graphql', 'gql',
+  'proto', 'diff', 'patch', 'dockerfile', 'makefile', 'gitignore', 'editorconfig', 'eslintrc', 'prettierrc',
   'tex', 'rst', 'adoc', 'org', 'svg',
+];
+
+// Binary document formats (office suites, PDF, iWork, OpenDocument). The live
+// Files API accepts all of them (verified 2026-08: pdf/doc/docx/xls/xlsx/
+// xlsm/ppt/pptx each upload with 201) even though the published schema doc
+// still says "text only". They mount into the agent workspace like any other
+// file — docx/xlsx/pptx are zip archives of XML the agent can unpack and read.
+export const DOCUMENT_ATTACHMENT_EXTENSIONS = [
+  'pdf', 'doc', 'docx', 'rtf',
+  'xls', 'xlsx', 'xlsm', 'ppt', 'pptx',
+  'odt', 'ods', 'odp',
+  'key', 'numbers', 'pages',
+];
+
+// Archives the agent can unpack (unzip/tar) inside its workspace. Same 5 MB
+// cap as documents; also accepted by the live Files API.
+export const ARCHIVE_ATTACHMENT_EXTENSIONS = ['zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar', 'zst'];
+
+// Everything a non-image attachment may be. Audio/video stay excluded: the
+// Files API would take them, but the 5 MB cap makes them useless and the
+// agent has no way to consume them.
+export const NON_IMAGE_ATTACHMENT_EXTENSIONS = [
+  ...ATTACHMENT_EXTENSIONS,
+  ...DOCUMENT_ATTACHMENT_EXTENSIONS,
+  ...ARCHIVE_ATTACHMENT_EXTENSIONS,
 ];
 
 // 'svg' is deliberately absent here while staying in ATTACHMENT_EXTENSIONS: it
@@ -34,7 +59,7 @@ export const IMAGE_ATTACHMENT_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp',
 // What the hidden <input type="file"> advertises. 'image/*' is appended so the
 // OS picker also offers camera formats not in the list above.
 export const ATTACHMENT_ACCEPT = [
-  ...ATTACHMENT_EXTENSIONS.map((ext) => `.${ext}`),
+  ...NON_IMAGE_ATTACHMENT_EXTENSIONS.map((ext) => `.${ext}`),
   ...IMAGE_ATTACHMENT_EXTENSIONS.map((ext) => `.${ext}`),
   'image/*',
 ].join(',');
@@ -62,7 +87,7 @@ export function attachmentMaxBytes(file: { name: string; type?: string }): numbe
 /** Reason a pick was rejected, or null when it is acceptable. */
 export function attachmentRejectReason(file: { name: string; type?: string; size: number }): string | null {
   const image = isImageAttachment(file);
-  if (!image && !ATTACHMENT_EXTENSIONS.includes(attachmentExt(file.name))) return '类型不支持';
+  if (!image && !NON_IMAGE_ATTACHMENT_EXTENSIONS.includes(attachmentExt(file.name))) return '类型不支持';
   const max = image ? IMAGE_ATTACHMENT_MAX_BYTES : ATTACHMENT_MAX_BYTES;
   if (file.size > max) return `超过 ${Math.round(max / 1024 / 1024)} MB 限制`;
   return null;

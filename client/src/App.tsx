@@ -2502,7 +2502,7 @@ export default function App() {
         previewUrl: image ? URL.createObjectURL(file) : undefined,
       });
     }
-    if (rejected.length > 0) setError(`附件已跳过：${rejected.join('、')}（图片 ≤10MB，文本类文件 ≤5MB）`);
+    if (rejected.length > 0) setError(`附件已跳过：${rejected.join('、')}（图片 ≤10MB，其他附件 ≤5MB）`);
     else setError('');
     if (accepted.length > 0) {
       setAttachments((prev) => [...prev, ...accepted]);
@@ -5416,7 +5416,7 @@ export default function App() {
                             <VoiceEntryButton availability={voiceAvailability} onStart={() => { streamAbort.current?.abort(); setEvents([]); setError(''); setCurrentVoiceConversationId(null); setVoiceViewOpen(true); setVoiceLaunchKey((value) => value + 1); }} />
                             <button
                               type="button"
-                              title="添加附件（图片 ≤10MB，文本类文件 ≤5MB）"
+                              title="添加附件（图片 ≤10MB，其他附件 ≤5MB）"
                               onClick={() => attachmentInputRef.current?.click()}
                               className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/40 transition hover:bg-black/5 hover:text-black/70"
                             >
@@ -5610,7 +5610,7 @@ export default function App() {
                             <VoiceEntryButton availability={voiceAvailability} onStart={() => { streamAbort.current?.abort(); setEvents([]); setError(''); setCurrentVoiceConversationId(null); setVoiceViewOpen(true); setVoiceLaunchKey((value) => value + 1); }} />
                             <button
                               type="button"
-                              title="添加附件（图片 ≤10MB，文本类文件 ≤5MB）"
+                              title="添加附件（图片 ≤10MB，其他附件 ≤5MB）"
                               onClick={() => attachmentInputRef.current?.click()}
                               className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/40 transition hover:bg-black/5 hover:text-black/70"
                             >

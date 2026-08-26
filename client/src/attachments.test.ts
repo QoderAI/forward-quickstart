@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'vitest';
 import {
+  ARCHIVE_ATTACHMENT_EXTENSIONS,
   ATTACHMENT_ACCEPT,
   ATTACHMENT_EXTENSIONS,
   ATTACHMENT_MAX_BYTES,
+  DOCUMENT_ATTACHMENT_EXTENSIONS,
   IMAGE_ATTACHMENT_MAX_BYTES,
   attachmentMaxBytes,
   attachmentMountPath,
@@ -35,7 +37,7 @@ describe('isImageAttachment', () => {
   });
 
   test('does not treat documents as images', () => {
-    for (const name of ['notes.md', 'data.csv', 'main.ts', 'report.pdf']) {
+    for (const name of ['notes.md', 'data.csv', 'main.ts', 'report.pdf', 'contract.docx']) {
       expect(isImageAttachment({ name })).toBe(false);
     }
   });
@@ -75,8 +77,37 @@ describe('attachmentRejectReason', () => {
   });
 
   test('still rejects unsupported non-image types', () => {
-    expect(attachmentRejectReason({ name: 'archive.zip', size: 1024 })).toBe('类型不支持');
     expect(attachmentRejectReason({ name: 'app.exe', size: 1024 })).toBe('类型不支持');
+    // Audio/video and notebooks stay out even though the Files API would take
+    // audio/video: the 5 MB cap makes them useless and the agent cannot
+    // consume them (ipynb is rejected by the live API itself).
+    expect(attachmentRejectReason({ name: 'song.mp3', size: 1024 })).toBe('类型不支持');
+    expect(attachmentRejectReason({ name: 'clip.mp4', size: 1024 })).toBe('类型不支持');
+    expect(attachmentRejectReason({ name: 'notebook.ipynb', size: 1024 })).toBe('类型不支持');
+  });
+
+  test('accepts office documents and keeps the 5 MB non-image cap for them', () => {
+    // Issue #11: a .doc rental contract used to be rejected as 类型不支持.
+    // All of these upload to the live Files API with 201 (verified 2026-08).
+    for (const name of [
+      '北京市房屋租赁合同(自行成交版).doc', 'contract.docx', 'report.pdf',
+      '预算表.xlsx', 'slides.pptx', 'memo.rtf', 'sheet.ods', 'doc.pages',
+    ]) {
+      const file = { name, size: 1024 };
+      expect(attachmentRejectReason(file)).toBeNull();
+      expect(isImageAttachment(file)).toBe(false);
+      expect(attachmentMaxBytes(file)).toBe(ATTACHMENT_MAX_BYTES);
+    }
+    expect(attachmentRejectReason({ name: 'contract.docx', size: ATTACHMENT_MAX_BYTES + 1 }))
+      .toBe('超过 5 MB 限制');
+  });
+
+  test('accepts archives the agent can unpack', () => {
+    for (const name of ['project.zip', 'backup.tar.gz', 'data.tgz', 'pack.7z']) {
+      expect(attachmentRejectReason({ name, size: 1024 })).toBeNull();
+    }
+    expect(attachmentRejectReason({ name: 'project.zip', size: ATTACHMENT_MAX_BYTES + 1 }))
+      .toBe('超过 5 MB 限制');
   });
 });
 
@@ -97,6 +128,19 @@ describe('ATTACHMENT_ACCEPT', () => {
     for (const ext of ['.md', '.csv', '.json', '.ts', '.py']) {
       expect(ATTACHMENT_ACCEPT).toContain(ext);
     }
+  });
+
+  test('advertises the office document and archive extensions (issue #11)', () => {
+    // The OS picker greys out anything not in accept=, so every newly allowed
+    // extension must be advertised.
+    for (const ext of ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.rtf']) {
+      expect(ATTACHMENT_ACCEPT).toContain(ext);
+    }
+    for (const ext of ['.zip', '.tar', '.gz', '.7z']) {
+      expect(ATTACHMENT_ACCEPT).toContain(ext);
+    }
+    expect(DOCUMENT_ATTACHMENT_EXTENSIONS).toContain('docx');
+    expect(ARCHIVE_ATTACHMENT_EXTENSIONS).toContain('zip');
   });
 });
 
