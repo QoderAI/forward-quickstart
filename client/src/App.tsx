@@ -2445,6 +2445,27 @@ export default function App() {
   // screen), so background stream/poll callbacks never paint into another view.
   const currentSessionIdRef = useRef('');
 
+  // Replace an optimistic local session id with the real one returned by the
+  // server, migrating any in-flight streaming accumulators and turn timestamps.
+  const migrateSessionId = useCallback((oldId: string, newId: string) => {
+    currentSessionIdRef.current = newId;
+    const streamText = _streamingTextBySession.get(oldId);
+    const streamMsgId = _streamingMsgIdBySession.get(oldId);
+    const turnTs = _turnTimestamps.get(oldId);
+    if (streamText !== undefined) {
+      _streamingTextBySession.delete(oldId);
+      _streamingTextBySession.set(newId, streamText);
+    }
+    if (streamMsgId !== undefined) {
+      _streamingMsgIdBySession.delete(oldId);
+      _streamingMsgIdBySession.set(newId, streamMsgId);
+    }
+    if (turnTs !== undefined) {
+      _turnTimestamps.delete(oldId);
+      _turnTimestamps.set(newId, turnTs);
+    }
+  }, []);
+
   const ctx = useMemo<ForwardContext | null>(
     () => (pat.trim() ? { pat: pat.trim(), environment: apiEnvironment, authMode } : null),
     [apiEnvironment, authMode, pat],
@@ -4021,13 +4042,53 @@ export default function App() {
     try {
       let sessionId = currentSessionId;
       if (!sessionId) {
-        const session = await createSession(ctx, identity.id, templateId, sessionTitle(displayText), readyAttachments.map((a) => a.fileId!));
-        setSessions((prev) => [session, ...prev]);
-        // Sync the ref immediately: startStream below runs before the effect that
-        // mirrors currentSessionId into the ref, and its guards need the new id.
-        currentSessionIdRef.current = session.id;
-        setCurrentSessionId(session.id);
-        sessionId = session.id;
+        // Optimistically switch to the chat view immediately so the user isn't
+        // left waiting on the new-conversation screen while the session is created.
+        const optimisticId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const currentTemplateMeta = templates.find((t) => t.id === templateId);
+        const now = new Date().toISOString();
+        const optimisticSession: ForwardSession = {
+          id: optimisticId,
+          type: 'session',
+          identity_id: identity.id,
+          template_id: templateId,
+          status: 'running',
+          title: sessionTitle(displayText),
+          template: currentTemplateMeta
+            ? { id: currentTemplateMeta.id, name: currentTemplateMeta.name }
+            : undefined,
+          created_at: now,
+          updated_at: now,
+        };
+        setSessions((prev) => [optimisticSession, ...prev]);
+        currentSessionIdRef.current = optimisticId;
+        setCurrentSessionId(optimisticId);
+        sessionId = optimisticId;
+
+        recordTurnStart(sessionId);
+        const localEvents = localTurnEvents(sessionId, finalText);
+        localThinkingId = localEvents.thinking.id;
+        stickToBottomRef.current = true;
+        _streamingTextBySession.delete(sessionId);
+        _streamingMsgIdBySession.delete(sessionId);
+        setEvents((prev) => {
+          const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
+          return [...cleaned, localEvents.user, localEvents.thinking];
+        });
+        // Attachment chips are no longer needed in the composer; the message
+        // bubble already carries the mount information.
+        setAttachments((prev) => {
+          for (const a of prev) if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+          return [];
+        });
+
+        const realSession = await createSession(ctx, identity.id, templateId, sessionTitle(displayText), readyAttachments.map((a) => a.fileId!));
+        const oldId = sessionId;
+        migrateSessionId(oldId, realSession.id);
+        setCurrentSessionId(realSession.id);
+        setSessions((prev) => prev.map((s) => (s.id === oldId ? realSession : s)));
+        setEvents((prev) => prev.map((e) => (e.session_id === oldId ? { ...e, session_id: realSession.id } : e)));
+        sessionId = realSession.id;
       } else {
         // Existing session: mount each attachment into the agent workspace
         // BEFORE the message lands, so the agent can read it immediately.
@@ -4037,21 +4098,22 @@ export default function App() {
             mount_path: attachmentMountPath(mountNames[i]),
           });
         }
+
+        recordTurnStart(sessionId);
+        const localEvents = localTurnEvents(sessionId, finalText);
+        localThinkingId = localEvents.thinking.id;
+        // Sending a new message should always bring the view back to the bottom.
+        stickToBottomRef.current = true;
+        // Remove old synthetic streaming messages from a previous turn that may
+        // not have been cleaned up (e.g. stream terminated before agent.message
+        // arrived). Also clear the streaming accumulators.
+        _streamingTextBySession.delete(sessionId);
+        _streamingMsgIdBySession.delete(sessionId);
+        setEvents((prev) => {
+          const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
+          return [...cleaned, localEvents.user, localEvents.thinking];
+        });
       }
-      recordTurnStart(sessionId);
-      const localEvents = localTurnEvents(sessionId, finalText);
-      localThinkingId = localEvents.thinking.id;
-      // Sending a new message should always bring the view back to the bottom.
-      stickToBottomRef.current = true;
-      // Remove old synthetic streaming messages from a previous turn that may
-      // not have been cleaned up (e.g. stream terminated before agent.message
-      // arrived). Also clear the streaming accumulators.
-      _streamingTextBySession.delete(sessionId);
-      _streamingMsgIdBySession.delete(sessionId);
-      setEvents((prev) => {
-        const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
-        return [...cleaned, localEvents.user, localEvents.thinking];
-      });
       const result = await sendUserMessage(ctx, sessionId, finalText);
       setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
       setAttachments((prev) => {
@@ -4073,10 +4135,21 @@ export default function App() {
       if (localThinkingId) {
         setEvents((prev) => prev.filter((event) => event.id !== localThinkingId));
       }
+      // Roll back an optimistic new-conversation session so the user can retry.
+      if (currentSessionIdRef.current.startsWith('local-')) {
+        const optimisticId = currentSessionIdRef.current;
+        setSessions((prev) => prev.filter((s) => s.id !== optimisticId));
+        setEvents((prev) => prev.filter((e) => e.session_id !== optimisticId));
+        _turnTimestamps.delete(optimisticId);
+        _streamingTextBySession.delete(optimisticId);
+        _streamingMsgIdBySession.delete(optimisticId);
+        currentSessionIdRef.current = '';
+        setCurrentSessionId('');
+      }
       setError(err instanceof Error ? err.message : String(err));
       setInput(text);
     }
-  }, [attachments, ctx, currentSessionId, identity, input, mergeSessionEvents, refreshSessions, startStream, templateId, streaming, stopping]);
+  }, [attachments, ctx, currentSessionId, identity, input, mergeSessionEvents, migrateSessionId, refreshSessions, startStream, templateId, templates, streaming, stopping]);
 
   const sendQuick = useCallback(async (text: string) => {
     if (!ctx || !identity || !templateId || !text.trim()) return;
@@ -4087,24 +4160,61 @@ export default function App() {
     try {
       let sessionId = currentSessionId;
       if (!sessionId) {
-        const session = await createSession(ctx, identity.id, templateId, sessionTitle(text));
-        setSessions((prev) => [session, ...prev]);
-        currentSessionIdRef.current = session.id;
-        setCurrentSessionId(session.id);
-        sessionId = session.id;
+        // Optimistically switch to the chat view immediately so the user isn't
+        // left waiting on the new-conversation screen while the session is created.
+        const optimisticId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const currentTemplateMeta = templates.find((t) => t.id === templateId);
+        const now = new Date().toISOString();
+        const optimisticSession: ForwardSession = {
+          id: optimisticId,
+          type: 'session',
+          identity_id: identity.id,
+          template_id: templateId,
+          status: 'running',
+          title: sessionTitle(text),
+          template: currentTemplateMeta
+            ? { id: currentTemplateMeta.id, name: currentTemplateMeta.name }
+            : undefined,
+          created_at: now,
+          updated_at: now,
+        };
+        setSessions((prev) => [optimisticSession, ...prev]);
+        currentSessionIdRef.current = optimisticId;
+        setCurrentSessionId(optimisticId);
+        sessionId = optimisticId;
+
+        recordTurnStart(sessionId);
+        const localEvents = localTurnEvents(sessionId, text);
+        localThinkingId = localEvents.thinking.id;
+        stickToBottomRef.current = true;
+        _streamingTextBySession.delete(sessionId);
+        _streamingMsgIdBySession.delete(sessionId);
+        setEvents((prev) => {
+          const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
+          return [...cleaned, localEvents.user, localEvents.thinking];
+        });
+
+        const realSession = await createSession(ctx, identity.id, templateId, sessionTitle(text));
+        const oldId = sessionId;
+        migrateSessionId(oldId, realSession.id);
+        setCurrentSessionId(realSession.id);
+        setSessions((prev) => prev.map((s) => (s.id === oldId ? realSession : s)));
+        setEvents((prev) => prev.map((e) => (e.session_id === oldId ? { ...e, session_id: realSession.id } : e)));
+        sessionId = realSession.id;
+      } else {
+        recordTurnStart(sessionId);
+        const localEvents = localTurnEvents(sessionId, text);
+        localThinkingId = localEvents.thinking.id;
+        // Sending a new message should always bring the view back to the bottom.
+        stickToBottomRef.current = true;
+        // Remove old synthetic streaming messages from a previous turn.
+        _streamingTextBySession.delete(sessionId);
+        _streamingMsgIdBySession.delete(sessionId);
+        setEvents((prev) => {
+          const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
+          return [...cleaned, localEvents.user, localEvents.thinking];
+        });
       }
-      recordTurnStart(sessionId);
-      const localEvents = localTurnEvents(sessionId, text);
-      localThinkingId = localEvents.thinking.id;
-      // Sending a new message should always bring the view back to the bottom.
-      stickToBottomRef.current = true;
-      // Remove old synthetic streaming messages from a previous turn.
-      _streamingTextBySession.delete(sessionId);
-      _streamingMsgIdBySession.delete(sessionId);
-      setEvents((prev) => {
-        const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
-        return [...cleaned, localEvents.user, localEvents.thinking];
-      });
       const result = await sendUserMessage(ctx, sessionId, text);
       setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
       startStream(sessionId, lastRemoteEventId(result.data ?? []), turnStartedAt, multiagentSessionsRef.current.has(sessionId));
@@ -4120,10 +4230,21 @@ export default function App() {
       if (localThinkingId) {
         setEvents((prev) => prev.filter((event) => event.id !== localThinkingId));
       }
+      // Roll back an optimistic new-conversation session so the user can retry.
+      if (currentSessionIdRef.current.startsWith('local-')) {
+        const optimisticId = currentSessionIdRef.current;
+        setSessions((prev) => prev.filter((s) => s.id !== optimisticId));
+        setEvents((prev) => prev.filter((e) => e.session_id !== optimisticId));
+        _turnTimestamps.delete(optimisticId);
+        _streamingTextBySession.delete(optimisticId);
+        _streamingMsgIdBySession.delete(optimisticId);
+        currentSessionIdRef.current = '';
+        setCurrentSessionId('');
+      }
       setError(err instanceof Error ? err.message : String(err));
       setInput(text);
     }
-  }, [ctx, currentSessionId, identity, mergeSessionEvents, refreshSessions, startStream, templateId]);
+  }, [ctx, currentSessionId, identity, mergeSessionEvents, migrateSessionId, refreshSessions, startStream, templateId, templates]);
 
   const stop = useCallback(async () => {
     if (!ctx || !currentSessionId || stopping) return;
