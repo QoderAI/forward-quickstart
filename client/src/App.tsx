@@ -2651,6 +2651,25 @@ export default function App() {
     return page.data;
   }, [ctx, identity]);
 
+  // Switch the active template. Every entry point that changes the template
+  // (top-bar dropdown, template detail "use this template" button, template
+  // creation) must go through this helper so the on-screen conversation of the
+  // previous template is always cleared along with its streaming state.
+  const switchTemplate = useCallback((nextTemplateId: string) => {
+    // Abort any running SSE stream from the previous template so its background
+    // polling stops calling refreshSessions and streaming state is cleared for
+    // the new template.
+    streamAbort.current?.abort();
+    setStreaming(false);
+    setStopping(false);
+    setTemplateId(nextTemplateId);
+    currentSessionIdRef.current = '';
+    setCurrentSessionId('');
+    setEvents([]);
+    setSessionLoading(false);
+    void refreshSessions(identity, nextTemplateId);
+  }, [identity, refreshSessions]);
+
   const loadSessionEvents = useCallback(async (sessionId: string) => {
     if (!ctx || !sessionId) return;
     const page = await listEvents(ctx, sessionId);
@@ -2784,8 +2803,9 @@ export default function App() {
         pollCount++;
         if (currentRun.status === 'failed' || currentRun.status === 'completed') break;
       }
-      // Jump to chat under the schedule's template
-      setTemplateId(schedule.template_id);
+      // Jump to chat under the schedule's template; switchTemplate clears the
+      // previous template's on-screen conversation and refreshes the list.
+      switchTemplate(schedule.template_id);
       setActivePanel('chat');
       if (currentRun.session_id) {
         currentSessionIdRef.current = currentRun.session_id;
@@ -2800,7 +2820,7 @@ export default function App() {
     } finally {
       setRunningScheduleId(null);
     }
-  }, [ctx, loadSessionEvents, loadSchedules]);
+  }, [ctx, loadSessionEvents, loadSchedules, switchTemplate]);
 
   const handleDeleteSchedule = useCallback(async (scheduleId: string) => {
     if (!ctx) return;
@@ -3553,15 +3573,17 @@ export default function App() {
     try {
       const template = await createTemplate(ctx, buildTemplateInput());
       setTemplates((prev) => [template, ...prev]);
-      setTemplateId(template.id);
-      await refreshSessions(identity, template.id);
+      // Switching to the brand-new template must also clear the on-screen
+      // conversation of the previous template; switchTemplate refreshes the
+      // session list for the new template as well.
+      switchTemplate(template.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       throw err;
     } finally {
       setLoading(false);
     }
-  }, [buildTemplateInput, ctx, identity, refreshSessions]);
+  }, [buildTemplateInput, ctx, switchTemplate]);
 
   const updateExistingTemplate = useCallback(async () => {
     if (!ctx || !editingTemplateId) return;
@@ -5278,18 +5300,8 @@ export default function App() {
                               <button
                                 key={template.id}
                                 onClick={() => {
-                                  // Abort any running SSE stream from the previous template
-                                  // so its background polling stops calling refreshSessions
-                                  // and streaming state is cleared for the new template.
-                                  streamAbort.current?.abort();
-                                  setStreaming(false);
-                                  setTemplateId(template.id);
-                                  currentSessionIdRef.current = '';
-                                  setCurrentSessionId('');
-                                  setEvents([]);
-                                  setSessionLoading(false);
+                                  switchTemplate(template.id);
                                   setShowTemplateSwitcher(false);
-                                  void refreshSessions(identity, template.id);
                                 }}
                                 className={`w-full rounded-lg px-3 py-2.5 text-left transition ${
                                   isSelected ? 'bg-[#F4F6FC]' : 'hover:bg-gray-50'
@@ -6717,7 +6729,7 @@ export default function App() {
             {/* Actions */}
             <div className="mt-6 flex items-center gap-3">
               <button
-                onClick={() => { setTemplateId(vt.id); setActivePanel('chat'); setViewingTemplate(null); void refreshSessions(identity, vt.id); }}
+                onClick={() => { switchTemplate(vt.id); setActivePanel('chat'); setViewingTemplate(null); }}
                 className={`flex-1 rounded-full py-2.5 text-center text-sm font-medium text-white transition ${
                   vtIsActive ? 'bg-black/15 text-black/50 cursor-default' : 'bg-[#3550FF] hover:bg-[#2a42e0]'
                 }`}
