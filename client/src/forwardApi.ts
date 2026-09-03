@@ -160,12 +160,15 @@ const LIST_EVENT_TYPES = [
 export class ForwardApiError extends Error {
   status: number;
   requestId?: string;
+  /** 机器可读错误码，如 batch_already_processing / rate_limit_exceeded / file_expired。 */
+  code?: string;
 
-  constructor(status: number, message: string, requestId?: string) {
+  constructor(status: number, message: string, requestId?: string, code?: string) {
     super(message);
     this.name = 'ForwardApiError';
     this.status = status;
     this.requestId = requestId;
+    this.code = code;
   }
 }
 
@@ -207,7 +210,7 @@ export async function forwardRequest<T>(
       request_id?: string;
       requestId?: string;
       message?: string;
-      error?: { request_id?: string; requestId?: string; message?: string };
+      error?: { request_id?: string; requestId?: string; message?: string; code?: string };
     }
     : null;
   if (!res.ok) {
@@ -218,11 +221,16 @@ export async function forwardRequest<T>(
       dataRecord?.error?.requestId;
     // Show raw upstream response when JSON parsing fails, so user can report to API provider
     const rawSnippet = text && !data ? `\n[原始响应] ${text.slice(0, 500)}` : '';
-    const message = dataRecord?.error?.message || dataRecord?.message || `Forward API error ${res.status}${rawSnippet}`;
+    const errCode = dataRecord?.error?.code || '';
+    const baseMessage = dataRecord?.error?.message || dataRecord?.message || `Forward API error ${res.status}${rawSnippet}`;
+    // Prefix the machine-readable code so callers can branch on it both via the
+    // structured `err.code` field and legacy `message.includes(...)` string checks.
+    const message = `${errCode ? `[${errCode}] ` : ''}${baseMessage}`;
     throw new ForwardApiError(
       res.status,
       requestId ? `${message} (request id: ${requestId})` : message,
       requestId || undefined,
+      errCode || undefined,
     );
   }
   return data as T;
@@ -1518,6 +1526,15 @@ export interface BatchRequestCounts {
   expired: number;
 }
 
+/** CAS Credit 用量汇总；Create 响应为 null，其余接口至少一个子任务有合法用量时返回。 */
+export interface BatchUsage {
+  total_credits: number;
+}
+
+/** 动态排队原因快照，仅 validating/queued 状态可能出现，可能随时变化。 */
+export type BatchQueueReason =
+  | 'idle_window' | 'owner_processing' | 'global_capacity' | 'scheduler_pending';
+
 export interface ForwardBatch {
   id: string;                        // 前缀 batch_
   object: 'batch';
@@ -1526,10 +1543,12 @@ export interface ForwardBatch {
   output_file_id?: string;           // 终态后才出现
   error_file_id?: string;            // 有失败行时才出现
   completion_window: BatchCompletionWindow;
+  ignore_idle_window: boolean;       // 始终返回；历史数据和创建时省略均为 false
+  queue_reason?: BatchQueueReason;   // 仅 validating/queued 时可能出现
   created_at: string;                // RFC 3339
   expires_at: string;
   request_counts: BatchRequestCounts;
-  usage: null;                       // v1 预留
+  usage: BatchUsage | null;
   metadata?: Record<string, unknown>;
   error_message?: string;            // 仅 failed 状态
 }
@@ -1547,11 +1566,12 @@ export const BATCH_TERMINAL_STATUSES: ReadonlySet<BatchStatus> =
 
 export async function listBatches(
   ctx: ForwardContext,
-  opts?: { status?: BatchStatus; limit?: number; afterId?: string },
+  opts?: { status?: BatchStatus; limit?: number; afterId?: string; beforeId?: string },
 ) {
   return forwardRequest<Page<ForwardBatch>>(ctx, 'GET', '/batches', undefined, {
     ...(opts?.status ? { status: opts.status } : {}),
     ...(opts?.afterId ? { after_id: opts.afterId } : {}),
+    ...(opts?.beforeId ? { before_id: opts.beforeId } : {}),
     limit: opts?.limit ?? 20,
   });
 }
@@ -1561,6 +1581,8 @@ export async function createBatch(
   input: {
     input_file_id: string;
     completion_window: BatchCompletionWindow;
+    /** true 时不受闲时窗口限制（不提高优先级；同 owner 已有 processing Batch 会 409）。 */
+    ignore_idle_window?: boolean;
     metadata?: Record<string, unknown>;
   },
 ) {
@@ -1577,4 +1599,48 @@ export async function cancelBatch(ctx: ForwardContext, batchId: string) {
 
 export async function getBatchOutput(ctx: ForwardContext, batchId: string) {
   return forwardRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/batches/${encodeURIComponent(batchId)}/output`);
+}
+
+/**
+ * error.jsonl 签名下载链接。Batch 结果文件是内部标识，不登记为 Forward 通用文件资源，
+ * 必须走该专用端点而非 Files API（/files/{id}/content 对 error_file_id 会 404）。
+ */
+export async function getBatchError(ctx: ForwardContext, batchId: string) {
+  return forwardRequest<{ url: string; expires_at?: string }>(ctx, 'GET', `/batches/${encodeURIComponent(batchId)}/error`);
+}
+
+// ─── Batch 子任务（/batches/{batch_id}/tasks） ────────────────
+
+export type BatchTaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'expired';
+
+/** 已交付制品；制品是通用文件资源，下载复用 Files API。 */
+export interface BatchTaskArtifact {
+  file_id: string;
+  name: string;
+  size: number;
+  content_type?: string;
+}
+
+export interface BatchTask {
+  custom_id: string;                 // 调用方任务标识，同时是分页游标
+  status: BatchTaskStatus;
+  started_at?: string;               // 未开始时省略
+  completed_at?: string;             // 未完成时省略
+  output_summary?: string;           // 最终回复文本，最多 500 字符
+  error?: { code: string; message: string };
+  artifacts?: BatchTaskArtifact[];   // 无制品时为空数组
+  usage?: { total_credits: number };
+}
+
+export async function listBatchTasks(
+  ctx: ForwardContext,
+  batchId: string,
+  opts?: { status?: BatchTaskStatus; customId?: string; limit?: number; afterId?: string },
+) {
+  return forwardRequest<Page<BatchTask>>(ctx, 'GET', `/batches/${encodeURIComponent(batchId)}/tasks`, undefined, {
+    ...(opts?.status ? { status: opts.status } : {}),
+    ...(opts?.customId ? { custom_id: opts.customId } : {}),
+    ...(opts?.afterId ? { after_id: opts.afterId } : {}),
+    limit: opts?.limit ?? 20,
+  });
 }

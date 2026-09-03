@@ -5,12 +5,18 @@ import {
   createBatch,
   downloadCloudFile,
   getBatch,
+  getBatchError,
   getBatchOutput,
   listBatches,
+  listBatchTasks,
   uploadCloudFile,
   type BatchCompletionWindow,
   type BatchInputLine,
+  type BatchQueueReason,
   type BatchStatus,
+  type BatchTask,
+  type BatchTaskArtifact,
+  type BatchTaskStatus,
   type ForwardBatch,
   type ForwardContext,
   type ForwardTemplate,
@@ -33,6 +39,24 @@ const BATCH_STATUS_META: Record<BatchStatus, { label: string; cls: string; spin?
 };
 
 const COMPLETION_WINDOWS: BatchCompletionWindow[] = ['24h', '48h', '72h'];
+
+// 排队原因（动态快照）文案，取值见 CreateBatch 契约的 queue_reason 优先级表
+const QUEUE_REASON_META: Record<BatchQueueReason, { label: string }> = {
+  idle_window: { label: '等待闲时窗口（默认 22:00~08:00）' },
+  owner_processing: { label: '同一账号有其他批量任务执行中' },
+  global_capacity: { label: '平台全局容量已满' },
+  scheduler_pending: { label: '等待调度器激活' },
+};
+
+// 子任务状态文案（与 Batch 状态口径一致，但不含 Batch 级的中间态）
+const TASK_STATUS_META: Record<BatchTaskStatus, { label: string; cls: string }> = {
+  pending: { label: '等待中', cls: 'bg-gray-100 text-black/40' },
+  running: { label: '执行中', cls: 'bg-blue-50 text-[#3550FF]' },
+  completed: { label: '已完成', cls: 'bg-emerald-50 text-emerald-600' },
+  failed: { label: '失败', cls: 'bg-red-50 text-red-500' },
+  cancelled: { label: '已取消', cls: 'bg-gray-100 text-black/40' },
+  expired: { label: '已过期', cls: 'bg-gray-100 text-black/40' },
+};
 
 // 状态时间线主路径（详情弹窗用）
 const TIMELINE_STEPS: Array<{ status: BatchStatus; label: string }> = [
@@ -92,6 +116,36 @@ interface JsonlValidation {
   autoFilledIdentity: number; // 自动补全 identity_id 的行数
 }
 
+// body.resources 结构校验（呼应契约：仅 type/file_id/mount_path 三字段，
+// type 只能为 file，mount_path 必须是规范绝对路径，违者整行 invalid_line）
+function validateResources(body: Record<string, unknown>): string | null {
+  if (body.resources === undefined) return null; // 省略表示不追加行级文件
+  if (!Array.isArray(body.resources)) return 'body.resources 必须是数组';
+  for (const item of body.resources) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return 'body.resources 每项必须是 JSON object';
+    }
+    const rec = item as Record<string, unknown>;
+    const known = new Set(['type', 'file_id', 'mount_path']);
+    if (Object.keys(rec).some((k) => !known.has(k))) {
+      return 'body.resources 存在未知字段（只允许 type/file_id/mount_path）';
+    }
+    if (rec.type !== 'file') return "body.resources[].type 只能为 'file'";
+    if (typeof rec.file_id !== 'string' || rec.file_id.trim().length === 0) {
+      return 'body.resources[].file_id 缺失或为空';
+    }
+    if (rec.mount_path !== undefined) {
+      const p = rec.mount_path;
+      if (typeof p !== 'string') return 'body.resources[].mount_path 必须是字符串';
+      if (!p.startsWith('/')) return 'body.resources[].mount_path 必须是绝对路径';
+      if (p.includes('..')) return 'body.resources[].mount_path 不能包含 ..';
+      if (p.includes('//')) return 'body.resources[].mount_path 不是规范路径（含连续斜杠）';
+      if (/[\u0000-\u001F\u007F]/.test(p)) return 'body.resources[].mount_path 不能包含控制字符';
+    }
+  }
+  return null;
+}
+
 function validateJsonl(text: string, currentIdentityId: string): JsonlValidation {
   const okLines: BatchInputLine[] = [];
   const errors: Array<{ line: number; reason: string }> = [];
@@ -127,6 +181,15 @@ function validateJsonl(text: string, currentIdentityId: string): JsonlValidation
     if (!body) missing.push('body');
     if (missing.length > 0) {
       errors.push({ line: lineNo, reason: `缺少必填字段 ${missing.join('、')}` });
+      return;
+    }
+    if (body && typeof body.input !== 'string') {
+      errors.push({ line: lineNo, reason: '缺少必填字段 body.input（且必须是字符串）' });
+      return;
+    }
+    const resourceError = body ? validateResources(body) : null;
+    if (resourceError) {
+      errors.push({ line: lineNo, reason: resourceError });
       return;
     }
     if (seenIds.has(customId)) {
@@ -176,6 +239,15 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
   const [downloadError, setDownloadError] = useState('');
   const [showWizard, setShowWizard] = useState(false);
   const pollTimerRef = useRef<number | null>(null);
+  // 详情弹窗：子任务明细（/batches/{id}/tasks，按 custom_id 游标分页）
+  const [tasks, setTasks] = useState<BatchTask[]>([]);
+  const [tasksLoading, setTasksLoading] = useState(false);
+  const [tasksHasMore, setTasksHasMore] = useState(false);
+  const [tasksError, setTasksError] = useState('');
+  const [taskStatusFilter, setTaskStatusFilter] = useState<'all' | BatchTaskStatus>('all');
+  // custom_id 精确查找：input 为原始输入，committed 值由「查询」按钮提交，避免逐键请求
+  const [taskCustomIdInput, setTaskCustomIdInput] = useState('');
+  const [taskCustomId, setTaskCustomId] = useState('');
 
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current !== null) {
@@ -247,7 +319,49 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
     }
   }, [ctx, cancelTarget]);
 
-  // 再次执行：复用原输入文件与参数新建一个 Batch（仅 completed/cancelled 可用）
+  // 子任务明细加载：详情弹窗打开 / 筛选变化时取第一页，也供「刷新」「加载更多」复用
+  const loadTasks = useCallback(async (opts?: { append?: boolean; afterId?: string }) => {
+    if (!ctx || !detailBatch) return;
+    setTasksLoading(true);
+    setTasksError('');
+    try {
+      const page = await listBatchTasks(ctx, detailBatch.id, {
+        ...(taskStatusFilter !== 'all' ? { status: taskStatusFilter } : {}),
+        ...(taskCustomId ? { customId: taskCustomId } : {}),
+        ...(opts?.afterId ? { afterId: opts.afterId } : {}),
+      });
+      setTasks((prev) => (opts?.append ? [...prev, ...(page.data ?? [])] : (page.data ?? [])));
+      setTasksHasMore(!!page.has_more);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setTasksError(`子任务加载失败：${msg}`);
+      if (!opts?.append) {
+        setTasks([]);
+        setTasksHasMore(false);
+      }
+    } finally {
+      setTasksLoading(false);
+    }
+  }, [ctx, detailBatch, taskStatusFilter, taskCustomId]);
+
+  // 切换详情对象时重置子任务筛选与数据
+  useEffect(() => {
+    setTasks([]);
+    setTasksHasMore(false);
+    setTasksError('');
+    setTaskStatusFilter('all');
+    setTaskCustomIdInput('');
+    setTaskCustomId('');
+  }, [detailBatch?.id]);
+
+  // 详情打开或筛选变化时加载第一页
+  useEffect(() => {
+    if (!ctx || !detailBatch) return;
+    void loadTasks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ctx, detailBatch?.id, taskStatusFilter, taskCustomId]);
+
+  // 再次执行：复用原输入文件与参数（含无视闲时窗口设置）新建一个 Batch（仅 completed/cancelled 可用）
   const handleRerun = useCallback(async (batch: ForwardBatch) => {
     if (!ctx || rerunningId) return;
     setRerunningId(batch.id);
@@ -256,13 +370,16 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
       const fresh = await createBatch(ctx, {
         input_file_id: batch.input_file_id,
         completion_window: batch.completion_window,
+        ignore_idle_window: batch.ignore_idle_window === true,
         ...(batch.metadata && Object.keys(batch.metadata).length > 0 ? { metadata: batch.metadata } : {}),
       });
       setBatches((prev) => [fresh, ...prev]);
       setDetailBatch(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('rate_limit') || msg.includes('429')) {
+      if (msg.includes('batch_already_processing') || msg.includes('409')) {
+        setListError('已有无视闲时窗口的批量任务正在执行，需等待其完成（或取消）后再试');
+      } else if (msg.includes('rate_limit') || msg.includes('429')) {
         setListError('进行中的批量任务数已达上限，请等待现有任务完成或取消部分任务');
       } else if (msg.includes('404') || msg.includes('not_found')) {
         setListError('原输入文件已不可用（可能超过保留期），请重新创建任务');
@@ -297,12 +414,35 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
     if (!ctx || !batch.error_file_id) return;
     setDownloadError('');
     try {
-      // error.jsonl 无专用端点，经 error_file_id 走 Cloud Files 下载链路
-      const { url } = await downloadCloudFile(ctx, batch.error_file_id);
+      // Batch 结果文件是内部标识，必须走 /batches/{id}/error 专用端点，
+      // 不能经 Files API（/files/{id}/content 对 error_file_id 会 404）
+      const { url } = await getBatchError(ctx, batch.id);
       if (!url) throw new Error('未获取到下载链接');
       triggerDownload(url, `batch-${batch.id}-error.jsonl`);
     } catch (err) {
-      setDownloadError(`下载失败：${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('file_expired') || msg.includes('410')) {
+        setDownloadError('错误文件已超过 30 天保留期，无法下载');
+      } else if (msg.includes('error_file_not_found')) {
+        setDownloadError('该任务没有失败行，未生成 error.jsonl');
+      } else if (msg.includes('batch_not_ready')) {
+        setDownloadError('任务完成后可下载');
+      } else {
+        setDownloadError(`下载失败：${msg}`);
+      }
+    }
+  }, [ctx]);
+
+  // 子任务制品下载：制品是通用文件资源，按契约复用 Files API 签名链接
+  const handleDownloadArtifact = useCallback(async (artifact: BatchTaskArtifact) => {
+    if (!ctx) return;
+    setDownloadError('');
+    try {
+      const { url } = await downloadCloudFile(ctx, artifact.file_id);
+      if (!url) throw new Error('未获取到下载链接');
+      triggerDownload(url, artifact.name);
+    } catch (err) {
+      setDownloadError(`制品下载失败：${err instanceof Error ? err.message : String(err)}`);
     }
   }, [ctx]);
 
@@ -368,8 +508,13 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
                     </div>
                     <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-black/40">
                       <span>窗口 {batch.completion_window}</span>
+                      {batch.ignore_idle_window && <span className="text-[#3550FF]/70">无视闲时窗口</span>}
+                      {batch.queue_reason && (
+                        <span className="text-amber-600" title="排队原因（动态快照，可能随时变化）">排队：{QUEUE_REASON_META[batch.queue_reason]?.label ?? batch.queue_reason}</span>
+                      )}
                       <span>创建 {displayTime(batch.created_at)}</span>
                       <span>执行截止 {displayTime(batch.expires_at)}</span>
+                      {batch.usage && <span title="CAS Credit 消耗（当前汇总）">Credit {batch.usage.total_credits}</span>}
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
@@ -503,6 +648,13 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
                 </div>
               </div>
 
+              {/* 排队原因（动态快照） */}
+              {b.queue_reason && (
+                <div className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700" title="动态快照，可能随时变化">
+                  排队原因：{QUEUE_REASON_META[b.queue_reason]?.label ?? b.queue_reason}
+                </div>
+              )}
+
               {/* 任务计数 */}
               {c && (
                 <div>
@@ -522,11 +674,109 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
                 </div>
               )}
 
+              {/* 子任务明细：逐条状态、回复摘要、错误、制品与用量 */}
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-[11px] font-medium text-black/40">子任务明细</span>
+                  <button
+                    onClick={() => void loadTasks()}
+                    disabled={tasksLoading}
+                    className="text-[11px] font-medium text-[#3550FF] hover:underline disabled:opacity-40"
+                  >
+                    刷新
+                  </button>
+                </div>
+                <div className="mb-2 flex items-center gap-1.5">
+                  <select
+                    value={taskStatusFilter}
+                    onChange={(e) => setTaskStatusFilter(e.target.value as typeof taskStatusFilter)}
+                    className="h-7 shrink-0 rounded-lg border border-[#E5E7EB] bg-white px-1.5 text-[11px] text-black/60 outline-none transition focus:border-[#3550FF]"
+                  >
+                    <option value="all">全部状态</option>
+                    {(Object.keys(TASK_STATUS_META) as BatchTaskStatus[]).map((s) => (
+                      <option key={s} value={s}>{TASK_STATUS_META[s].label}</option>
+                    ))}
+                  </select>
+                  <input
+                    value={taskCustomIdInput}
+                    onChange={(e) => setTaskCustomIdInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') setTaskCustomId(taskCustomIdInput.trim()); }}
+                    placeholder="按 custom_id 精确查找"
+                    className="h-7 min-w-0 flex-1 rounded-lg border border-[#E5E7EB] bg-white px-2 text-[11px] outline-none transition focus:border-[#3550FF]"
+                  />
+                  <button
+                    onClick={() => setTaskCustomId(taskCustomIdInput.trim())}
+                    className="h-7 shrink-0 rounded-lg bg-[#F4F6FC] px-2.5 text-[11px] font-medium text-black/55 transition hover:bg-[#E8EBF5]"
+                  >
+                    查询
+                  </button>
+                </div>
+                {tasksError && <div className="mb-2 rounded-lg bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-700">{tasksError}</div>}
+                <div className="space-y-1.5">
+                  {tasks.map((t) => (
+                    <div key={t.custom_id} className="rounded-lg border border-[#E5E7EB] px-2.5 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="truncate font-mono text-[11px] text-black/70">{t.custom_id}</span>
+                        <span className={`inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${TASK_STATUS_META[t.status].cls}`}>{TASK_STATUS_META[t.status].label}</span>
+                      </div>
+                      {t.output_summary && <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-black/55">{t.output_summary}</div>}
+                      {t.error && (
+                        <div className="mt-1 text-[11px] leading-4 text-red-500">[{t.error.code}] {t.error.message}</div>
+                      )}
+                      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-black/35">
+                        {t.started_at && <span>开始 {displayTime(t.started_at)}</span>}
+                        {t.completed_at && <span>完成 {displayTime(t.completed_at)}</span>}
+                        {t.usage && <span title="CAS Credit 消耗">Credit {t.usage.total_credits}</span>}
+                      </div>
+                      {t.artifacts && t.artifacts.length > 0 && (
+                        <div className="mt-1.5 flex flex-wrap gap-1.5">
+                          {t.artifacts.map((a) => (
+                            <button
+                              key={a.file_id}
+                              onClick={() => void handleDownloadArtifact(a)}
+                              title={`下载制品（${(a.size / 1024).toFixed(1)} KB）`}
+                              className="rounded-md border border-[#E5E7EB] bg-white px-2 py-0.5 text-[10px] text-black/55 transition hover:border-[#3550FF] hover:text-[#3550FF]"
+                            >
+                              ⬇ {a.name}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  {tasksLoading && (
+                    <div className="flex justify-center py-2">
+                      <span className="h-4 w-4 animate-spin rounded-full border-2 border-[#D7DBEA] border-t-[#3550FF]" />
+                    </div>
+                  )}
+                  {!tasksLoading && tasks.length === 0 && !tasksError && (
+                    <div className="py-1.5 text-center text-[11px] text-black/35">没有匹配的子任务</div>
+                  )}
+                  {tasksHasMore && tasks.length > 0 && (
+                    <div className="flex justify-center">
+                      <button
+                        onClick={() => void loadTasks({ append: true, afterId: tasks[tasks.length - 1]?.custom_id })}
+                        disabled={tasksLoading}
+                        className="rounded-full border border-[#DDE2F2] bg-white px-3 py-1 text-[11px] text-black/60 transition hover:border-[#3550FF] hover:text-[#3550FF] disabled:opacity-50"
+                      >
+                        {tasksLoading ? '加载中...' : '加载更多'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+
               {/* 基础信息 */}
               <div>
                 <div className="mb-2 text-[11px] font-medium text-black/40">基础信息</div>
                 <div className="space-y-1 text-xs text-black/60">
                   <div className="flex justify-between"><span className="text-black/40">完成窗口</span><span>{b.completion_window}</span></div>
+                  <div className="flex justify-between"><span className="text-black/40">无视闲时窗口</span><span>{b.ignore_idle_window ? '是' : '否'}</span></div>
+                  {b.usage && (
+                    <div className="flex justify-between" title="CAS Credit 消耗（当前汇总，非 token 数或货币金额）">
+                      <span className="text-black/40">已消耗 Credit</span><span>{b.usage.total_credits}</span>
+                    </div>
+                  )}
                   <div className="flex justify-between"><span className="text-black/40">创建时间</span><span>{displayTime(b.created_at)}</span></div>
                   <div className="flex justify-between"><span className="text-black/40">执行截止</span><span>{displayTime(b.expires_at)}</span></div>
                   {b.metadata && Object.keys(b.metadata).length > 0 && (
@@ -665,6 +915,8 @@ function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, getM
   const [uploadedSize, setUploadedSize] = useState(0);
   // Step 3 提交
   const [window_, setWindow_] = useState<BatchCompletionWindow>('24h');
+  // 无视闲时窗口（对应 API ignore_idle_window）：默认遵循闲时调度，勾选后全天可调度
+  const [ignoreIdle, setIgnoreIdle] = useState(false);
   // 自定义标签（API 层对应 metadata）：逐项键值对输入，避免用户面对裸 JSON 不知所措
   const [metaRows, setMetaRows] = useState<Array<{ key: string; value: string }>>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -765,12 +1017,15 @@ function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, getM
       const batch = await createBatch(ctx, {
         input_file_id: uploadedFileId,
         completion_window: window_,
+        ignore_idle_window: ignoreIdle,
         ...(metadata ? { metadata } : {}),
       });
       onCreated(batch);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('rate_limit') || msg.includes('429')) {
+      if (msg.includes('batch_already_processing') || msg.includes('409')) {
+        setError('已有无视闲时窗口的批量任务正在执行，需等待其完成（或取消）后再提交');
+      } else if (msg.includes('rate_limit') || msg.includes('429')) {
         setError('进行中的批量任务数已达上限，请等待现有任务完成或取消部分任务');
       } else {
         setError(msg);
@@ -778,7 +1033,7 @@ function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, getM
     } finally {
       setSubmitting(false);
     }
-  }, [ctx, uploadedFileId, window_, metaRows, onCreated]);
+  }, [ctx, uploadedFileId, window_, ignoreIdle, metaRows, onCreated]);
 
   return (
     <Modal open onClose={onClose} title="创建批量任务">
@@ -972,6 +1227,21 @@ function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, getM
             </div>
             <div className="mt-1 text-[11px] text-black/35">超过完成窗口未执行完的任务将标记为已过期</div>
           </div>
+          <div>
+            <div className="mb-1.5 text-[11px] font-medium text-black/50">调度方式</div>
+            <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-[#E5E7EB] bg-white px-3 py-2.5 transition hover:border-[#3550FF]">
+              <input
+                type="checkbox"
+                checked={ignoreIdle}
+                onChange={(e) => setIgnoreIdle(e.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5 accent-[#3550FF]"
+              />
+              <span className="text-xs text-black/60">
+                无视闲时窗口，全天可调度
+                <span className="mt-0.5 block text-[11px] leading-4 text-black/40">默认仅在平台闲时窗口（22:00~08:00）内调度；勾选后不受该时间限制，但不提高优先级，且同一账号同时只有一个此类任务可执行</span>
+              </span>
+            </label>
+          </div>
           <details>
             <summary className="cursor-pointer text-[11px] font-medium text-black/50">▸ 自定义标签（可选）</summary>
             <div className="mt-1.5 space-y-1.5">
@@ -1010,7 +1280,9 @@ function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, getM
             </div>
           </details>
           <div className="rounded-lg bg-[#F0F4FF] px-3 py-2 text-[11px] leading-4 text-black/50">
-            ℹ 提交后任务进入校验队列，将在平台闲时时段自动调度执行
+            {ignoreIdle
+              ? 'ℹ 提交后任务进入校验队列，不受闲时窗口限制，完成校验后即可调度执行'
+              : 'ℹ 提交后任务进入校验队列，将在平台闲时时段自动调度执行'}
           </div>
           {error && <div className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-500">{error}</div>}
           <div className="flex justify-end gap-2 pt-1">

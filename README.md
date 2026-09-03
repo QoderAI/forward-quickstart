@@ -25,7 +25,7 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 - **权限模式**：内置「开发者模式 / 用户模式」开关（默认用户模式，选择持久化到本地）。开发者模式解锁模板及模板资源（技能、文件、环境、密钥）的新建、编辑和删除权限，并显示对应的「模板资源」菜单；用户模式仅能查看和使用模板。切换到开发者模式时会弹出风险确认提示。
 - **会话历史与用量**：查看历史 Session、事件历史、执行状态和会话时长统计。
 - **定时任务**：创建、编辑、暂停、恢复、归档和手动执行 Schedule。
-- **批量任务**（仅开发者模式）：基于 JSONL 输入文件创建异步批量任务，平台闲时时段自动调度执行。支持表单构建（选模板逐行输入，自动生成 JSONL）和文件上传两种创建方式，前端预校验（JSON 解析/必填字段/custom_id 唯一/≤10000 行）并自动补全缺失的 identity_id；创建时可选添加「自定义标签」（逐项键值对输入，对应 API metadata 字段，仅用于标识查找不影响执行），绑定模板下拉展示模板当前使用的模型；列表页展示状态徽章与分段进度条，支持状态筛选与游标分页，已完成/已取消的任务支持「再次执行」（复用原输入文件与参数新建任务）；详情弹窗展示状态时间线、7 维任务计数与标签芯片，非终态自动轮询（5s 起步退避至 30s）；支持取消（二次确认）与终态后下载 output.jsonl / error.jsonl。
+- **批量任务**（仅开发者模式）：基于 JSONL 输入文件创建异步批量任务，平台闲时时段自动调度执行。支持表单构建（选模板逐行输入，自动生成 JSONL）和文件上传两种创建方式，前端预校验（JSON 解析/必填字段/custom_id 唯一/body.input/≤10,000 行/resources 结构：仅 type=file、file_id 非空、mount_path 规范绝对路径）并自动补全缺失的 identity_id；创建时可选「无视闲时窗口」（对应 ignore_idle_window，勾选后全天可调度，同 owner 已有 processing 任务时 409 有明确文案）与「自定义标签」（逐项键值对输入，对应 API metadata 字段）；绑定模板下拉展示模板当前使用的模型；列表页展示状态徽章、分段进度条、排队原因（queue_reason 中文文案）与 Credit 用量，支持状态筛选与游标分页（after_id/before_id），已完成/已取消的任务支持「再次执行」（复用原输入文件与参数，含闲时窗口设置）；详情弹窗展示状态时间线、7 维任务计数、子任务明细（逐条状态/回复摘要/错误码/制品下载/用量，支持状态筛选与 custom_id 精确查找，custom_id 游标分页）与标签芯片，非终态自动轮询（5s 起步退避至 30s）；支持取消（二次确认）与终态后下载 output.jsonl / error.jsonl（分别走 /output 与 /error 专用端点）。
 - **IM 渠道**：按环境展示并创建微信、企业微信、钉钉、飞书、Lark、Slack 和 Microsoft Teams 渠道，支持扫码绑定或手动密钥配置，并对齐各渠道数量上限；Teams 使用 App ID、Tenant ID 和 Client Secret 配置；创建渠道时显式传入 `identity_resolution` 以确保渠道授权后消息路由正确生效。
 
   Teams 需在 Microsoft Teams Developer Portal 将 Messaging Endpoint 配置为 `https://api.qoder.com/channels/teams/messages`。如部署使用独立 Channel Gateway，可在前端构建时通过 `VITE_TEAMS_CALLBACK_URL` 覆盖该地址。
@@ -235,6 +235,8 @@ PAT + external_id
 | GET | `/batches/{id}` | 查询 Batch 详情 |
 | POST | `/batches/{id}/cancel` | 取消 Batch |
 | GET | `/batches/{id}/output` | 获取 Batch 输出文件下载链接 |
+| GET | `/batches/{id}/error` | 获取 Batch 错误文件下载链接 |
+| GET | `/batches/{id}/tasks` | 查询 Batch 子任务 |
 
 ### Cloud API
 
