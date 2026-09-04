@@ -42,6 +42,7 @@ import {
   createSchedule,
   updateSchedule,
   archiveSchedule,
+  archiveSession,
   runSchedule,
   getScheduleRun,
   listMemoryEntries,
@@ -2308,6 +2309,12 @@ export default function App() {
       return next;
     });
   }, []);
+  // Multi-select delete for the conversation list (issue #15). Deletion maps to
+  // session archiving: the Forward API has no hard-delete, archived sessions
+  // disappear from ListSessions, and there is no restore endpoint.
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
+  const [deletingSessions, setDeletingSessions] = useState(false);
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -2667,6 +2674,9 @@ export default function App() {
     setCurrentSessionId('');
     setEvents([]);
     setSessionLoading(false);
+    // Select mode targets sessions of the current template — reset it on switch.
+    setSelectMode(false);
+    setSelectedSessionIds([]);
     void refreshSessions(identity, nextTemplateId);
   }, [identity, refreshSessions]);
 
@@ -3692,6 +3702,61 @@ export default function App() {
       if (currentSessionIdRef.current === sessionId) setSessionLoading(false);
     }
   }, [ctx, sessions]);
+
+  // Delete (archive) sessions and drop them from the local list (issue #15).
+  // The Forward API's removal primitive is POST /sessions/{id}/archive —
+  // archived sessions no longer appear in ListSessions and cannot be restored.
+  const handleDeleteSessions = useCallback(async (ids: string[]) => {
+    if (!ctx || ids.length === 0 || deletingSessions) return;
+    setDeletingSessions(true);
+    setError('');
+    const done: string[] = [];
+    try {
+      for (const id of ids) {
+        try {
+          // Optimistic local sessions (local-*) never reached the server — skip the API call.
+          if (!id.startsWith('local-')) await archiveSession(ctx, id);
+          done.push(id);
+        } catch (err) {
+          // 409 session_archived means it is already gone — treat as deleted.
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('session_archived') || msg.includes('409')) done.push(id);
+          else throw err;
+        }
+      }
+    } catch (err) {
+      setError(`删除对话失败：${err instanceof Error ? err.message : String(err)}（已删除 ${done.length}/${ids.length} 个）`);
+    }
+    if (done.length > 0) {
+      setSessions((prev) => prev.filter((s) => !done.includes(s.id)));
+      setPinnedSessionIds((prev) => {
+        const next = prev.filter((id) => !done.includes(id));
+        try { localStorage.setItem('pinned_sessions', JSON.stringify(next)); } catch { /* ignore */ }
+        return next;
+      });
+      // Streaming accumulators for deleted sessions are no longer reachable.
+      for (const id of done) {
+        _streamingTextBySession.delete(id);
+        _streamingMsgIdBySession.delete(id);
+        _turnTimestamps.delete(id);
+      }
+      // If the open conversation was deleted, reset to the welcome screen.
+      if (done.includes(currentSessionIdRef.current)) {
+        streamAbort.current?.abort();
+        setStreaming(false);
+        setStopping(false);
+        currentSessionIdRef.current = '';
+        setCurrentSessionId('');
+        setEvents([]);
+        setSessionLoading(false);
+        setVoiceViewOpen(false);
+        setCurrentVoiceConversationId(null);
+      }
+    }
+    setDeletingSessions(false);
+    setSelectMode(false);
+    setSelectedSessionIds([]);
+  }, [ctx, deletingSessions]);
 
   const startStream = useCallback((sessionId: string, lastEventId?: string, turnStartedAt?: string, initialHasMultiagent?: boolean) => {
     if (!ctx) return;
@@ -5345,6 +5410,15 @@ export default function App() {
                     )}
                   </div>
                   <button
+                    onClick={() => { setSelectMode((v) => !v); setSelectedSessionIds([]); }}
+                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${selectMode ? 'bg-[#3550FF]/10 text-[#3550FF]' : 'text-black/45 hover:bg-gray-100 hover:text-black'}`}
+                    title={selectMode ? '退出选择' : '批量选择对话'}
+                  >
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2m-6 9 2 2 4-4" />
+                    </svg>
+                  </button>
+                  <button
                     onClick={() => { currentSessionIdRef.current = ''; setCurrentSessionId(''); setEvents([]); setSessionLoading(false); setVoiceViewOpen(false); setCurrentVoiceConversationId(null); }}
                     className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/45 transition hover:bg-gray-100 hover:text-black"
                     title="新建对话"
@@ -5388,76 +5462,164 @@ export default function App() {
                       ...(searchQuery ? [{ label: '', items: rest }] : groupSessionsByDate(rest)),
                     ];
 
+                    // Select-mode action bar: select all (filtered), clear, batch delete.
+                    const selectActionBar = selectMode ? (
+                      <div className="mb-2 flex items-center gap-2 px-0.5">
+                        <div className="flex w-full items-center gap-2 rounded-xl border border-[#DDE2F2] bg-white px-3 py-2 text-xs">
+                          <span className="shrink-0 text-black/50">已选 {selectedSessionIds.length} 个</span>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedSessionIds(filtered.map((s) => s.id))}
+                            className="shrink-0 rounded-md px-1.5 py-0.5 font-medium text-[#3550FF] transition hover:bg-[#3550FF]/5"
+                          >
+                            全选
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedSessionIds([])}
+                            className="shrink-0 rounded-md px-1.5 py-0.5 font-medium text-black/50 transition hover:bg-black/5"
+                          >
+                            清除
+                          </button>
+                          <div className="flex-1" />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (selectedSessionIds.length === 0) return;
+                              if (window.confirm(`确定删除所选的 ${selectedSessionIds.length} 个对话吗？\n删除后将从列表中移除，且无法恢复。`)) {
+                                void handleDeleteSessions(selectedSessionIds);
+                              }
+                            }}
+                            disabled={selectedSessionIds.length === 0 || deletingSessions}
+                            className="shrink-0 rounded-lg bg-red-500 px-2.5 py-1 font-medium text-white transition hover:bg-red-600 disabled:opacity-50"
+                          >
+                            {deletingSessions ? '删除中...' : `删除所选 (${selectedSessionIds.length})`}
+                          </button>
+                        </div>
+                      </div>
+                    ) : null;
+
                     if (filtered.length === 0) {
                       return (
-                        <div className="py-12 text-center">
-                          <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-gray-100">
-                            <svg className="h-5 w-5 text-black/25" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                              <path strokeLinecap="round" strokeLinejoin="round" d="M8.625 12a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H8.25m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H12m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 0 1-2.555-.337A5.972 5.972 0 0 1 5.41 20.97a5.969 5.969 0 0 1-.474-.065 4.48 4.48 0 0 0 .978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25Z" />
-                            </svg>
+                        <>
+                          {selectActionBar}
+                          <div className="py-12 text-center">
+                            <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-gray-100">
+                              <svg className="h-5 w-5 text-black/25" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M8.625 12a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H8.25m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H12m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 0 1-2.555-.337A5.972 5.972 0 0 1 5.41 20.97a5.969 5.969 0 0 1-.474-.065 4.48 4.48 0 0 0 .978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25Z" />
+                              </svg>
+                            </div>
+                            <div className="text-sm text-black/35">{searchQuery ? '未找到匹配的对话' : '暂无对话'}</div>
+                            {!searchQuery && (
+                              <div className="mt-1 text-xs text-black/25">发送消息开始新对话</div>
+                            )}
                           </div>
-                          <div className="text-sm text-black/35">{searchQuery ? '未找到匹配的对话' : '暂无对话'}</div>
-                          {!searchQuery && (
-                            <div className="mt-1 text-xs text-black/25">发送消息开始新对话</div>
-                          )}
-                        </div>
+                        </>
                       );
                     }
 
-                    return groups.map((group) => (
-                      <div key={group.label} className="mb-1">
-                        {group.label && (
-                          <div className="px-2.5 py-2 text-[11px] font-medium text-black/35">{group.label}</div>
-                        )}
-                        {group.items.map((session) => {
-                          const isPinned = pinnedSessionIds.includes(session.id);
-                          return (
-                            <div
-                              key={session.id}
-                              role="button"
-                              tabIndex={0}
-                              onClick={() => void selectSession(session.id)}
-                              onKeyDown={(e) => { if (e.key === 'Enter') void selectSession(session.id); }}
-                              className={`group flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-3 py-2.5 text-left transition ${
-                                currentSessionId === session.id
-                                  ? 'bg-white shadow-[0_1px_3px_rgba(0,0,0,0.06)]'
-                                  : 'hover:bg-white/60'
-                              }`}
-                            >
-                              {isSessionOngoing(session.status) && (
-                                <span className="relative flex h-2 w-2 shrink-0">
-                                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
-                                  <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
-                                </span>
-                              )}
-                              <div className="min-w-0 flex-1">
-                                <div className={`flex items-center gap-1.5 text-[13px] ${currentSessionId === session.id ? 'font-medium text-black' : 'text-black/70'}`}>
-                                  <span className="truncate">{session.title || 'Forward 会话'}</span>
-                                  {isVoiceSession(session) && <span className="shrink-0 rounded-full bg-[#3550FF]/8 px-1.5 py-0.5 text-[10px] font-normal text-[#3550FF]">语音</span>}
+                    return (
+                      <>
+                        {selectActionBar}
+                        {groups.map((group) => (
+                          <div key={group.label} className="mb-1">
+                            {group.label && (
+                              <div className="px-2.5 py-2 text-[11px] font-medium text-black/35">{group.label}</div>
+                            )}
+                            {group.items.map((session) => {
+                              const isPinned = pinnedSessionIds.includes(session.id);
+                              const isSelected = selectedSessionIds.includes(session.id);
+                              return (
+                                <div
+                                  key={session.id}
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={() => (selectMode ? setSelectedSessionIds((prev) => (isSelected ? prev.filter((id) => id !== session.id) : [...prev, session.id])) : void selectSession(session.id))}
+                                  onKeyDown={(e) => {
+                                    if (e.key !== 'Enter') return;
+                                    if (selectMode) setSelectedSessionIds((prev) => (isSelected ? prev.filter((id) => id !== session.id) : [...prev, session.id]));
+                                    else void selectSession(session.id);
+                                  }}
+                                  className={`group flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-3 py-2.5 text-left transition ${
+                                    isSelected
+                                      ? 'bg-[#3550FF]/5'
+                                      : currentSessionId === session.id
+                                        ? 'bg-white shadow-[0_1px_3px_rgba(0,0,0,0.06)]'
+                                        : 'hover:bg-white/60'
+                                  }`}
+                                >
+                                  {selectMode && (
+                                    <span
+                                      role="checkbox"
+                                      aria-checked={isSelected}
+                                      title={isSelected ? '取消选择' : '选择'}
+                                      className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-[5px] border transition ${
+                                        isSelected ? 'border-[#3550FF] bg-[#3550FF] text-white' : 'border-black/25 bg-white'
+                                      }`}
+                                    >
+                                      {isSelected && (
+                                        <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3} strokeLinecap="round" strokeLinejoin="round">
+                                          <path d="m5 13 4 4L19 7" />
+                                        </svg>
+                                      )}
+                                    </span>
+                                  )}
+                                  {isSessionOngoing(session.status) && !selectMode && (
+                                    <span className="relative flex h-2 w-2 shrink-0">
+                                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
+                                      <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-500" />
+                                    </span>
+                                  )}
+                                  <div className="min-w-0 flex-1">
+                                    <div className={`flex items-center gap-1.5 text-[13px] ${currentSessionId === session.id ? 'font-medium text-black' : 'text-black/70'}`}>
+                                      <span className="truncate">{session.title || 'Forward 会话'}</span>
+                                      {isVoiceSession(session) && <span className="shrink-0 rounded-full bg-[#3550FF]/8 px-1.5 py-0.5 text-[10px] font-normal text-[#3550FF]">语音</span>}
+                                    </div>
+                                    <div className="mt-0.5 text-[11px] text-black/30">{relativeTime(session.created_at)}</div>
+                                  </div>
+                                  {!selectMode && (
+                                    <>
+                                      {/* Pin toggle: hidden until hover for unpinned rows, always visible when pinned */}
+                                      <button
+                                        type="button"
+                                        title={isPinned ? '取消置顶' : '置顶'}
+                                        onClick={(e) => { e.stopPropagation(); togglePinSession(session.id); }}
+                                        className={`shrink-0 rounded-md p-1 transition ${
+                                          isPinned
+                                            ? 'text-[#3550FF] hover:bg-black/5'
+                                            : 'text-black/30 opacity-0 hover:bg-black/5 hover:text-black/60 group-hover:opacity-100'
+                                        }`}
+                                      >
+                                        <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill={isPinned ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+                                          <path d="M16 4v7l2 3v2H6v-2l2-3V4h8Z" />
+                                          <path d="M12 16v5" />
+                                        </svg>
+                                      </button>
+                                      {/* Delete (archive): hidden until hover; archived sessions vanish from the list */}
+                                      <button
+                                        type="button"
+                                        title="删除对话"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          if (window.confirm(`确定删除对话「${session.title || session.id}」吗？\n删除后将从列表中移除，且无法恢复。`)) {
+                                            void handleDeleteSessions([session.id]);
+                                          }
+                                        }}
+                                        className="shrink-0 rounded-md p-1 text-black/30 opacity-0 transition hover:bg-red-50 hover:text-red-500 group-hover:opacity-100"
+                                      >
+                                        <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+                                          <path d="M4 7h16M10 11v6M14 11v6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3" />
+                                        </svg>
+                                      </button>
+                                    </>
+                                  )}
                                 </div>
-                                <div className="mt-0.5 text-[11px] text-black/30">{relativeTime(session.created_at)}</div>
-                              </div>
-                              {/* Pin toggle: hidden until hover for unpinned rows, always visible when pinned */}
-                              <button
-                                type="button"
-                                title={isPinned ? '取消置顶' : '置顶'}
-                                onClick={(e) => { e.stopPropagation(); togglePinSession(session.id); }}
-                                className={`shrink-0 rounded-md p-1 transition ${
-                                  isPinned
-                                    ? 'text-[#3550FF] hover:bg-black/5'
-                                    : 'text-black/30 opacity-0 hover:bg-black/5 hover:text-black/60 group-hover:opacity-100'
-                                }`}
-                              >
-                                <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill={isPinned ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-                                  <path d="M16 4v7l2 3v2H6v-2l2-3V4h8Z" />
-                                  <path d="M12 16v5" />
-                                </svg>
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ));
+                              );
+                            })}
+                          </div>
+                        ))}
+                      </>
+                    );
                   })()}
                 </div>
               </div>
