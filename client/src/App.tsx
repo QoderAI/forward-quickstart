@@ -324,6 +324,23 @@ async function fetchFilePreviewObjectUrl(ctx: ForwardContext, fileId: string) {
   }
 }
 
+/** Resolve a signed download URL for the file and hand it to the browser
+ * (issue #14: user-uploaded files must be downloadable wherever they show up).
+ * Cross-origin signed URLs name the file via their own content-disposition;
+ * `download` is only honored same-origin but stays as a hint. */
+async function downloadFileToDisk(ctx: ForwardContext, fileId: string, fallbackName: string): Promise<void> {
+  const { url } = await downloadCloudFile(ctx, fileId);
+  if (!url) throw new Error('未获取到下载链接');
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fallbackName;
+  a.target = '_blank';
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 const RESOURCE_TYPE_LABELS: Record<ForwardResourceType, string> = {
   skill: '技能',
   file: '文件',
@@ -1201,17 +1218,8 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
     setLoading(true);
     try {
       // Per Cloud API: GET /files/{id}/content returns a JSON body with a
-      // time-limited pre-signed `url`. We then navigate to that URL to download.
-      const { url } = await downloadCloudFile(ctx, fileId);
-      if (!url) throw new Error('未获取到下载链接');
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.target = '_blank';
-      a.rel = 'noopener';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      // time-limited pre-signed `url`; the browser then downloads from it.
+      await downloadFileToDisk(ctx, fileId, filename);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1524,7 +1532,8 @@ const ChatSettingsButton = memo(function ChatSettingsButton({
 // whenever that can't produce a viewable image — no ctx, resource not mounted,
 // or a file stored without purpose=session_resource (those come back
 // downloadable:false and the preview proxy 403s, which the browser then reports
-// as an opaque ORB block).
+// as an opaque ORB block). When the file is known downloadable the fallback chip
+// itself becomes a download button (issue #14).
 const SentImageAttachment = memo(function SentImageAttachment({
   ctx,
   sessionId,
@@ -1539,6 +1548,10 @@ const SentImageAttachment = memo(function SentImageAttachment({
   fileId?: string;
 }) {
   const [url, setUrl] = useState<string | null>(null);
+  // Set once the Cloud file metadata confirms the stored file can be fetched,
+  // so the fallback chip can offer a download even when the preview failed.
+  const [downloadableId, setDownloadableId] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
     if (!ctx || !sessionId) return;
@@ -1546,7 +1559,9 @@ const SentImageAttachment = memo(function SentImageAttachment({
     let objectUrl = '';
     const loadByFileId = async (resolvedFileId: string) => {
       const meta = await getCloudFile(ctx, resolvedFileId);
-      if (cancelled || meta.downloadable === false) return;
+      if (cancelled) return;
+      if (meta.downloadable !== false) setDownloadableId(resolvedFileId);
+      if (meta.downloadable === false) return;
       const previewUrl = await fetchFilePreviewObjectUrl(ctx, resolvedFileId);
       objectUrl = previewUrl;
       if (cancelled) {
@@ -1572,7 +1587,36 @@ const SentImageAttachment = memo(function SentImageAttachment({
     };
   }, [ctx, sessionId, path, fileId]);
 
+  const handleDownload = async () => {
+    if (!ctx || !downloadableId || downloading) return;
+    setDownloading(true);
+    try {
+      await downloadFileToDisk(ctx, downloadableId, name);
+    } catch { /* download is best-effort; the chip keeps naming the file */ }
+    finally { setDownloading(false); }
+  };
+
   if (!url) {
+    if (downloadableId) {
+      return (
+        <button
+          type="button"
+          onClick={handleDownload}
+          disabled={downloading}
+          title={`下载 ${name}（${path}）`}
+          className="inline-flex max-w-[220px] cursor-pointer items-center gap-1 rounded-lg bg-white/80 px-2 py-0.5 text-[12px] leading-4 text-black/60 transition hover:bg-white hover:text-[#3550FF] disabled:opacity-60"
+        >
+          {downloading ? (
+            <span className="block h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-[#D7DBEA] border-t-[#3550FF]" />
+          ) : (
+            <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 0 0 1.5-1.5V6a1.5 1.5 0 0 0-1.5-1.5H3.75A1.5 1.5 0 0 0 2.25 6v12a1.5 1.5 0 0 0 1.5 1.5Zm10.5-11.25h.008v.008h-.008V8.25Zm.375 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Z" />
+            </svg>
+          )}
+          <span className="truncate">{name}</span>
+        </button>
+      );
+    }
     return (
       <span title={path} className="inline-flex max-w-[220px] items-center gap-1 rounded-lg bg-white/80 px-2 py-0.5 text-[12px] leading-4 text-black/60">
         <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
@@ -1583,6 +1627,78 @@ const SentImageAttachment = memo(function SentImageAttachment({
     );
   }
   return <ChatImage src={url} alt={name} />;
+});
+
+// Chip for a non-image attachment inside a SENT user bubble (issue #14): clicking
+// downloads the stored file. The file id comes from the message marker when
+// present, else it is recovered from the session's mounted resources by
+// mount_path — the same resolution path as SentImageAttachment. Without a
+// resolvable id the chip stays inert.
+const SentFileAttachment = memo(function SentFileAttachment({
+  ctx,
+  sessionId,
+  name,
+  path,
+  fileId,
+}: {
+  ctx: ForwardContext | null;
+  sessionId?: string;
+  name: string;
+  path: string;
+  fileId?: string;
+}) {
+  const [resolvedId, setResolvedId] = useState<string | undefined>(fileId);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (fileId) { setResolvedId(fileId); return; }
+    if (!ctx || !sessionId) return;
+    let cancelled = false;
+    listSessionResources(ctx, sessionId)
+      .then((page) => {
+        if (cancelled) return;
+        const hit = (page.data || []).find((r) => r.type === 'file' && r.mount_path === path);
+        if (hit?.file_id) setResolvedId(hit.file_id);
+      })
+      .catch(() => { /* id resolution is best-effort; the chip stays inert */ });
+    return () => { cancelled = true; };
+  }, [ctx, sessionId, path, fileId]);
+
+  const handleDownload = async () => {
+    if (!ctx || !resolvedId || loading) return;
+    setLoading(true);
+    setFailed(false);
+    try {
+      await downloadFileToDisk(ctx, resolvedId, name);
+    } catch {
+      setFailed(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const clickable = !!ctx && !!resolvedId;
+  return (
+    <button
+      type="button"
+      onClick={handleDownload}
+      disabled={!clickable || loading}
+      title={clickable ? (failed ? `下载失败，点击重试（${path}）` : `下载 ${name}（${path}）`) : path}
+      className={`inline-flex max-w-[220px] items-center gap-1 rounded-lg bg-white/80 px-2 py-0.5 text-[12px] leading-4 transition ${
+        clickable ? 'cursor-pointer text-black/60 hover:bg-white hover:text-[#3550FF] disabled:opacity-60' : 'text-black/60'
+      }`}
+    >
+      {loading ? (
+        <span className="block h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-[#D7DBEA] border-t-[#3550FF]" />
+      ) : (
+        <svg className={`h-3 w-3 shrink-0 ${failed ? 'text-red-400' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="m18.375 12.739-7.693 7.693a4.5 4.5 0 0 1-6.364-6.364l10.94-10.94A3 3 0 1 1 19.5 7.372L8.552 18.32a1.5 1.5 0 0 1-2.122-2.122l7.693-7.693" />
+        </svg>
+      )}
+      <span className="truncate">{name}</span>
+    </button>
+  );
 });
 
 const ChatTextMessage = memo(function ChatTextMessage({ event, user, ctx, credits }: { event: ForwardEvent; user?: boolean; ctx?: ForwardContext | null; credits?: { calls: ModelCall[]; total: number | null } }) {
@@ -1605,12 +1721,14 @@ const ChatTextMessage = memo(function ChatTextMessage({ event, user, ctx, credit
                   fileId={a.fileId}
                 />
               ) : (
-                <span key={a.path} title={a.path} className="inline-flex max-w-[220px] items-center gap-1 rounded-lg bg-white/80 px-2 py-0.5 text-[12px] leading-4 text-black/60">
-                  <svg className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="m18.375 12.739-7.693 7.693a4.5 4.5 0 0 1-6.364-6.364l10.94-10.94A3 3 0 1 1 19.5 7.372L8.552 18.32a1.5 1.5 0 0 1-2.122-2.122l7.693-7.693" />
-                  </svg>
-                  <span className="truncate">{a.name}</span>
-                </span>
+                <SentFileAttachment
+                  key={a.path}
+                  ctx={ctx ?? null}
+                  sessionId={event.session_id}
+                  name={a.name}
+                  path={a.path}
+                  fileId={a.fileId}
+                />
               )))}
             </div>
           )}
@@ -2335,6 +2453,9 @@ export default function App() {
   const [templateActionLoading, setTemplateActionLoading] = useState<string | null>(null);
   const [chatActionLoading, setChatActionLoading] = useState<string | null>(null);
   const [viewingResource, setViewingResource] = useState<ForwardResource | null>(null);
+  // File resource currently fetching a signed download URL, so the card overlay
+  // and the detail modal can both show progress (issue #14).
+  const [downloadingFileResourceId, setDownloadingFileResourceId] = useState<string | null>(null);
   const [conversationSearch, setConversationSearch] = useState('');
   const [showCreateEnvModal, setShowCreateEnvModal] = useState(false);
   const [newEnvName, setNewEnvName] = useState('');
@@ -3425,6 +3546,22 @@ export default function App() {
       setLoading(false);
     }
   }, [ctx, deleteConfirmResource, loadManagedResources]);
+
+  // File resources download straight from the Files API (issue #14): for file
+  // resources the lifecycle id IS the file id (same key deleteForwardFile uses).
+  const handleDownloadResource = useCallback(async (resource: ForwardResource) => {
+    if (!ctx || downloadingFileResourceId) return;
+    const name = resource.name || specString(resource, 'filename') || resource.id;
+    setDownloadingFileResourceId(resource.id);
+    setError('');
+    try {
+      await downloadFileToDisk(ctx, resource.id, name);
+    } catch (err) {
+      setError(`下载失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setDownloadingFileResourceId(null);
+    }
+  }, [ctx, downloadingFileResourceId]);
 
   const openEditModal = useCallback((resource: ForwardResource) => {
     setEditingResource(resource);
@@ -5285,37 +5422,59 @@ export default function App() {
                   const source = specString(resource, 'source');
                   const createdAt = specString(resource, 'created_at') || '';
                   return (
-                    <button
-                      key={`${resource.type}-${resource.id}-main`}
-                      onClick={() => setViewingResource(resource)}
-                      className="group rounded-2xl border border-[#DDE2F2] bg-white p-5 text-left transition hover:border-[#B8C3FF] hover:shadow-md"
-                    >
-                      <div className="flex items-start gap-3">
-                        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#F4F6FC] text-lg">
-                          {RESOURCE_ICONS[resource.type]}
-                        </span>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <div className="truncate text-sm font-semibold text-black">{resName}</div>
-                            {version != null && (
-                              <span className="shrink-0 rounded-full bg-[#EDEEF6] px-1.5 py-0.5 text-[10px] text-black/40">v{version}</span>
-                            )}
+                    <div key={`${resource.type}-${resource.id}-main`} className="group/card relative">
+                      <button
+                        onClick={() => setViewingResource(resource)}
+                        className="w-full rounded-2xl border border-[#DDE2F2] bg-white p-5 text-left transition hover:border-[#B8C3FF] hover:shadow-md"
+                      >
+                        <div className="flex items-start gap-3">
+                          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#F4F6FC] text-lg">
+                            {RESOURCE_ICONS[resource.type]}
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <div className="truncate text-sm font-semibold text-black">{resName}</div>
+                              {version != null && (
+                                <span className="shrink-0 rounded-full bg-[#EDEEF6] px-1.5 py-0.5 text-[10px] text-black/40">v{version}</span>
+                              )}
+                            </div>
+                            <div className="mt-1 truncate text-xs text-black/45">{subtitle}</div>
                           </div>
-                          <div className="mt-1 truncate text-xs text-black/45">{subtitle}</div>
                         </div>
-                      </div>
-                      {/* Type-specific meta row */}
-                      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-black/35">
-                        {source && <span>{source === 'custom' ? '自定义' : source === 'qoder' ? '官方' : source}</span>}
-                        {resource.type === 'file' && specString(resource, 'mime_type') && (
-                          <span>{specString(resource, 'mime_type')}</span>
-                        )}
-                        {createdAt && <span>{relativeTime(createdAt)}</span>}
-                        <span className="ml-auto rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] text-emerald-600">
-                          {resource.status || '已注册'}
-                        </span>
-                      </div>
-                    </button>
+                        {/* Type-specific meta row */}
+                        <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-black/35">
+                          {source && <span>{source === 'custom' ? '自定义' : source === 'qoder' ? '官方' : source}</span>}
+                          {resource.type === 'file' && specString(resource, 'mime_type') && (
+                            <span>{specString(resource, 'mime_type')}</span>
+                          )}
+                          {createdAt && <span>{relativeTime(createdAt)}</span>}
+                          <span className="ml-auto rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] text-emerald-600">
+                            {resource.status || '已注册'}
+                          </span>
+                        </div>
+                      </button>
+                      {/* One-click download for file resources without opening the
+                          detail modal (issue #14). Sibling (not child) of the card
+                          button to keep the HTML valid. */}
+                      {resource.type === 'file' && (
+                        <button
+                          type="button"
+                          onClick={(event) => { event.stopPropagation(); void handleDownloadResource(resource); }}
+                          disabled={!ctx}
+                          title={`下载 ${resName}`}
+                          aria-label={`下载 ${resName}`}
+                          className="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-lg border border-[#DDE2F2] bg-white text-black/40 opacity-0 shadow-sm transition hover:border-[#3550FF] hover:text-[#3550FF] focus-visible:opacity-100 group-hover/card:opacity-100 disabled:opacity-60"
+                        >
+                          {downloadingFileResourceId === resource.id ? (
+                            <span className="block h-4 w-4 animate-spin rounded-full border-2 border-[#D7DBEA] border-t-[#3550FF]" />
+                          ) : (
+                            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                            </svg>
+                          )}
+                        </button>
+                      )}
+                    </div>
                   );
                 })}
                 {resources.length === 0 && (
@@ -6213,6 +6372,22 @@ export default function App() {
 
             {/* Actions */}
             <div className="mt-6 flex items-center gap-3">
+              {vr.type === 'file' && (
+                <button
+                  onClick={() => void handleDownloadResource(vr)}
+                  disabled={!ctx || downloadingFileResourceId === vr.id}
+                  className="flex flex-1 items-center justify-center gap-2 rounded-full bg-[#3550FF] py-2.5 text-center text-sm font-medium text-white transition hover:bg-[#2a42e0] disabled:opacity-60"
+                >
+                  {downloadingFileResourceId === vr.id ? (
+                    <span className="block h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />
+                  ) : (
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                    </svg>
+                  )}
+                  {downloadingFileResourceId === vr.id ? '获取下载链接中…' : '下载文件'}
+                </button>
+              )}
               {(vr.type === 'environment' || vr.type === 'skill' || vr.type === 'vault') && (
                 <button
                   onClick={() => openEditModal(vr)}
