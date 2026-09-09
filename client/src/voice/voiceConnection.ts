@@ -1,6 +1,6 @@
 const VERSION = 'voice.realtime.v1';
 const RETRY_DELAYS = [1000, 2000, 4000];
-const RETRY_CODES = new Set([1006, 1011, 1012, 1013]);
+const RETRY_CODES = new Set([1001, 1006, 1011, 1012, 1013]);
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const GRACEFUL_CLOSE_TIMEOUT_MS = 5_000;
 
@@ -9,10 +9,9 @@ export type VoiceConnectionState = 'connecting' | 'reconnecting' | 'disconnected
 export interface VoiceCloseResult { outcome: string }
 export class VoiceClientError extends Error { code: string; constructor(code: string, message: string) { super(message); this.code = code; } }
 
-export function buildLocalVoiceSocketUrl(key: string, base = window.location.href) {
+export function buildVoiceSocketUrl(base = window.location.href) {
   const url = new URL('/api/voice/socket', base);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  url.searchParams.set('key', key);
   return url.toString();
 }
 
@@ -26,7 +25,7 @@ export function isValidVoiceServerEvent(value: unknown, conversationId: string):
 
 interface VoiceConnectionOptions {
   conversationId: string;
-  getConnectionKey: () => Promise<string>;
+  getCredentials: () => Promise<{ pat: string; environment: 'cn-prod' | 'global-prod' }>;
   beforeReconnect?: () => Promise<void>;
   onEvent?: (event: VoiceServerEvent) => void;
   onState?: (state: VoiceConnectionState) => void;
@@ -43,6 +42,7 @@ export class VoiceConnection {
   private attemptActive = false;
   private reconnectAttempt = 0;
   private reconnectTimer: number | null = null;
+  private readyTimer: number | null = null;
   private heartbeat: number | null = null;
   private manual = false;
   private replaced = false;
@@ -72,6 +72,7 @@ export class VoiceConnection {
     this.graceful = false;
     this.seen.clear();
     this.clearReconnectTimer();
+    this.clearReadyTimer();
     this.stopHeartbeat();
     window.addEventListener('pagehide', this.handlePageHide);
     await this.open(false);
@@ -86,20 +87,29 @@ export class VoiceConnection {
     this.stopHeartbeat();
     this.options.onState?.(reconnecting ? 'reconnecting' : 'connecting');
     try {
-      const key = await this.options.getConnectionKey();
+      const credentials = await this.options.getCredentials();
       if (generation !== this.generation || this.manual) return;
-      const socket = (this.options.webSocketFactory || ((url) => new WebSocket(url)))(buildLocalVoiceSocketUrl(key));
+      const socket = (this.options.webSocketFactory || ((url) => new WebSocket(url)))(buildVoiceSocketUrl());
       this.socket = socket;
       socket.addEventListener('message', (message) => this.handleMessage(generation, message));
       socket.addEventListener('close', (event) => this.handleClose(generation, event));
-      socket.addEventListener('error', () => {
-        if (generation !== this.generation) return;
-        this.ready = false;
+      socket.addEventListener('open', () => {
+        if (generation !== this.generation || this.manual) return;
+        socket.send(JSON.stringify({ type: 'proxy.auth', ...credentials, conversation_id: this.options.conversationId }));
+      }, { once: true });
+      this.readyTimer = window.setTimeout(() => {
+        if (generation !== this.generation || this.ready) return;
+        this.generation += 1;
+        this.socket = null;
         this.attemptActive = false;
-        this.stopHeartbeat();
-        if (!this.manual) this.scheduleReconnect();
-      });
+        socket.close();
+        this.scheduleReconnect();
+      }, 30000);
+      // Browsers always follow an error with close; wait for its code so auth
+      // failures do not accidentally trigger retries.
+      socket.addEventListener('error', () => {});
     } catch {
+      if (generation !== this.generation) return;
       this.attemptActive = false;
       if (!this.manual) this.scheduleReconnect();
     }
@@ -117,6 +127,7 @@ export class VoiceConnection {
     this.seen.add(event.event_id);
     if (this.seen.size > 512) this.seen.delete(this.seen.values().next().value!);
     if (event.type === 'voice.ready') {
+      this.clearReadyTimer();
       this.ready = true;
       this.attemptActive = false;
       this.reconnectAttempt = 0;
@@ -150,7 +161,11 @@ export class VoiceConnection {
     this.ready = false;
     this.attemptActive = false;
     this.socket = null;
+    this.clearReadyTimer();
     this.stopHeartbeat();
+    if (event.code >= 4400 && event.code <= 4408) {
+      this.options.onError?.(new VoiceClientError('proxy_auth_failed', '语音连接鉴权失败，请检查 PAT、环境和会话后重试'));
+    }
     if (this.pendingClose) {
       const pending = this.pendingClose;
       this.pendingClose = null;
@@ -190,7 +205,7 @@ export class VoiceConnection {
   }
 
   send(type: string, payload: Record<string, unknown> = {}) {
-    if ((type === 'audio.append' || type === 'text.message') && !this.ready) return false;
+    if (!this.ready) return false;
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ version: VERSION, type, payload }));
     return true;
@@ -231,6 +246,7 @@ export class VoiceConnection {
     this.ready = false;
     this.attemptActive = false;
     this.clearReconnectTimer();
+    this.clearReadyTimer();
     this.stopHeartbeat();
     if (this.pendingClose) {
       const pending = this.pendingClose;
@@ -243,6 +259,7 @@ export class VoiceConnection {
     this.socket = null;
   }
 
+  private clearReadyTimer() { if (this.readyTimer !== null) window.clearTimeout(this.readyTimer); this.readyTimer = null; }
   private clearReconnectTimer() { if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
   private startHeartbeat() { this.stopHeartbeat(); this.heartbeat = window.setInterval(() => this.send('ping'), HEARTBEAT_INTERVAL_MS); }
   private stopHeartbeat() { if (this.heartbeat !== null) window.clearInterval(this.heartbeat); this.heartbeat = null; }

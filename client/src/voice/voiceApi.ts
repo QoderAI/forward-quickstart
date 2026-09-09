@@ -1,9 +1,24 @@
 import { ForwardApiError, forwardRequest, type ForwardContext } from '../forwardApi';
 
-export interface TemplateRealtimeConfig { type: 'template_realtime_config'; template_id: string; enabled: boolean }
-export interface RealtimeConversation { id: string; object: 'voice.conversation'; status: 'initializing' | 'ready' | 'failed'; title?: string | null; metadata?: Record<string, unknown>; created_at?: string; updated_at?: string }
+export const REALTIME_VOICES = [
+  { id: 'longanqian', name: '默认' },
+  { id: 'longanlingxin', name: '龙安灵心' },
+  { id: 'longanlingxi', name: '龙安灵希' },
+  { id: 'longanxiaoxin', name: '龙安小昕' },
+  { id: 'longanlufeng', name: '龙安鲁风' },
+] as const;
+export type RealtimeVoice = typeof REALTIME_VOICES[number]['id'];
+export interface RealtimeConfig { audio: { output: { voice: string } } }
+export function readRealtimeVoice(config: unknown): string | null {
+  const voice = (config as RealtimeConfig | null)?.audio?.output?.voice;
+  return typeof voice === 'string' && voice.trim() ? voice : null;
+}
+export function realtimeVoiceName(voice: string): string {
+  return REALTIME_VOICES.find((item) => item.id === voice)?.name ?? voice;
+}
+export interface RealtimeConversation { id: string; type: 'voice.conversation'; status: 'ready'; config: RealtimeConfig; title?: string | null; metadata?: Record<string, unknown>; created_at?: string; updated_at?: string }
 export interface RealtimeHistoryEvent { id: string; type: string; role?: 'user' | 'assistant'; status: string; text?: string; work_id?: string; objective?: string; result?: string; error?: { code: string }; occurred_at: string; turn_id?: string; user_message_event_id?: string }
-export interface RealtimeConversationHistory { conversation: { id: string; title?: string | null; initialization_status: 'initializing' | 'ready' | 'failed'; metadata?: Record<string, unknown>; created_at?: string; updated_at?: string }; events: RealtimeHistoryEvent[]; page: { next_before: string | null; has_more: boolean } }
+export interface RealtimeConversationHistory { conversation: { id: string; title?: string | null; initialization_status: 'initializing' | 'ready' | 'failed'; config?: RealtimeConfig; metadata?: Record<string, unknown>; created_at?: string; updated_at?: string }; events: RealtimeHistoryEvent[]; page: { next_before: string | null; has_more: boolean } }
 export interface RealtimeHistoryOptions { limit?: number; before?: string; types?: 'message,work' }
 
 export async function getVoiceProxyCapability() {
@@ -13,15 +28,12 @@ export async function getVoiceProxyCapability() {
   return data?.voiceRealtimeProxy?.enabled === true;
 }
 
-export function getTemplateRealtimeConfig(ctx: ForwardContext, templateId: string) {
-  return forwardRequest<TemplateRealtimeConfig>(ctx, 'GET', `/realtime/templates/${encodeURIComponent(templateId)}`);
-}
-
-export function createRealtimeConversation(ctx: ForwardContext, input: { templateId: string; identityId: string; title?: string; idempotencyKey: string }) {
+export function createRealtimeConversation(ctx: ForwardContext, input: { templateId: string; identityId: string; title?: string; voice?: RealtimeVoice; idempotencyKey: string }) {
   return forwardRequest<RealtimeConversation>(ctx, 'POST', '/realtime/conversations', {
     template_id: input.templateId,
     identity_id: input.identityId,
     title: input.title || 'Voice Session',
+    ...(input.voice ? { config: { audio: { output: { voice: input.voice } } } } : {}),
   }, undefined, { idempotencyKey: input.idempotencyKey });
 }
 
@@ -43,15 +55,4 @@ export async function getCompleteRealtimeConversationHistory(ctx: ForwardContext
     seenCursors.add(next);
     before = next;
   }
-}
-
-export async function requestVoiceConnectionKey(ctx: ForwardContext, conversationId: string) {
-  const response = await fetch('/api/voice/connect', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pat: ctx.pat, environment: ctx.environment, conversation_id: conversationId }),
-  });
-  const data = await response.json().catch(() => null) as { connection_key?: string; expires_in_ms?: number; error?: { message?: string } } | null;
-  if (!response.ok || !data?.connection_key) throw new ForwardApiError(response.status, data?.error?.message || 'Voice connection key request failed');
-  return { connection_key: data.connection_key, expires_in_ms: Number(data.expires_in_ms || 0) };
 }

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { ForwardContext } from '../forwardApi';
-import { createRealtimeConversation, getCompleteRealtimeConversationHistory, getRealtimeConversationHistory, getTemplateRealtimeConfig, getVoiceProxyCapability, requestVoiceConnectionKey } from './voiceApi';
+import { createRealtimeConversation, getCompleteRealtimeConversationHistory, getRealtimeConversationHistory, getVoiceProxyCapability } from './voiceApi';
 
 const ctx: ForwardContext = { pat: 'pat_secret', environment: 'global-prod' };
 
@@ -11,25 +11,38 @@ describe('voice API', () => {
     const bodies: Array<Record<string, unknown>> = [];
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
       bodies.push(JSON.parse(String(init?.body)));
-      return new Response(JSON.stringify({ id: 'conv_1', object: 'voice.conversation', status: 'ready', events: [], page: { has_more: false, next_before: null } }), { status: 200 });
+      return new Response(JSON.stringify({ id: 'conv_1', type: 'voice.conversation', status: 'ready', events: [], page: { has_more: false, next_before: null } }), { status: 200 });
     }));
-    await getTemplateRealtimeConfig(ctx, 'tmpl_1');
     await createRealtimeConversation(ctx, { templateId: 'tmpl_1', identityId: 'idn_1', title: 'Voice Session', idempotencyKey: 'voice-create-1' });
     await getRealtimeConversationHistory(ctx, 'conv_1', { limit: 100, types: 'message,work' });
-    expect(bodies[0]).toMatchObject({ environment: 'global-prod', method: 'GET', path: '/realtime/templates/tmpl_1' });
-    expect(bodies[1]).toMatchObject({ method: 'POST', path: '/realtime/conversations', body: { identity_id: 'idn_1', template_id: 'tmpl_1', title: 'Voice Session' }, idempotencyKey: 'voice-create-1' });
-    expect(bodies[2]).toMatchObject({ method: 'GET', path: '/realtime/conversations/conv_1/history', query: { limit: 100, types: 'message,work' } });
+    expect(bodies[0]).toMatchObject({ method: 'POST', path: '/realtime/conversations', body: { identity_id: 'idn_1', template_id: 'tmpl_1', title: 'Voice Session' }, idempotencyKey: 'voice-create-1' });
+    expect(bodies[1]).toMatchObject({ method: 'GET', path: '/realtime/conversations/conv_1/history', query: { limit: 100, types: 'message,work' } });
   });
 
-  test('requests a local one-time websocket key', async () => {
-    let body: Record<string, unknown> = {};
-    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
-      expect(url).toBe('/api/voice/connect');
-      body = JSON.parse(String(init?.body));
-      return new Response(JSON.stringify({ connection_key: 'key_1', expires_in_ms: 30000 }), { status: 200 });
+  test('sends each preset voice in conversation config and preserves the create operation on retry', async () => {
+    const { REALTIME_VOICES } = await import('./voiceApi');
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ id: 'conv_1', type: 'voice.conversation', status: 'ready', config: { audio: { output: { voice: 'longanlingxin' } } } }), { status: 201 });
     }));
-    expect(await requestVoiceConnectionKey(ctx, 'conv_1')).toEqual({ connection_key: 'key_1', expires_in_ms: 30000 });
-    expect(body).toEqual({ pat: 'pat_secret', environment: 'global-prod', conversation_id: 'conv_1' });
+    for (const voice of REALTIME_VOICES) {
+      const input = { templateId: 'tmpl_1', identityId: 'idn_1', voice: voice.id, idempotencyKey: `create-${voice.id}` };
+      const result = await createRealtimeConversation(ctx, input);
+      await createRealtimeConversation(ctx, input);
+      expect(bodies.at(-1)).toEqual(bodies.at(-2));
+      expect(bodies.at(-1)).toMatchObject({ body: { config: { audio: { output: { voice: voice.id } } } }, idempotencyKey: input.idempotencyKey });
+      expect(result.type).toBe('voice.conversation');
+      expect(result.config.audio.output.voice).toBe('longanlingxin');
+    }
+  });
+
+  test('omits config when requesting the server default', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body)).body).not.toHaveProperty('config');
+      return new Response('{}', { status: 201 });
+    }));
+    await createRealtimeConversation(ctx, { templateId: 'tmpl_1', identityId: 'idn_1', idempotencyKey: 'default-1' });
   });
 
   test('reads the local voice proxy capability from health', async () => {
