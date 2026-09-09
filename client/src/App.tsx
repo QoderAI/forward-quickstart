@@ -84,6 +84,7 @@ import { ChatImage } from './chatImage';
 import { isImageFile } from './imageUtils';
 import { BatchPanel } from './batchPanel';
 import { UsagePanel } from './usagePanel';
+import type { RealtimeVoice } from './voice/voiceApi';
 import { VoiceEntryButton } from './voice/VoiceEntryButton';
 import { channelBindingModes } from './channelBinding';
 import { VoiceSessionView } from './voice/VoiceSessionView';
@@ -2216,6 +2217,7 @@ export default function App() {
   const [resourceOptionsByType, setResourceOptionsByType] = useState<Record<ForwardResourceType, ForwardResource[]>>(emptyResourceOptions);
   const [sessions, setSessions] = useState<ForwardSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState('');
+  const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>('longanqian');
   const [voiceViewOpen, setVoiceViewOpen] = useState(false);
   const [currentVoiceConversationId, setCurrentVoiceConversationId] = useState<string | null>(null);
   const [voiceLaunchKey, setVoiceLaunchKey] = useState(0);
@@ -2417,7 +2419,7 @@ export default function App() {
     () => (pat.trim() ? { pat: pat.trim(), environment: apiEnvironment, authMode } : null),
     [apiEnvironment, authMode, pat],
   );
-  const voiceAvailability = useVoiceAvailability(ctx, templateId);
+  const voiceAvailability = useVoiceAvailability(ctx, templateId, identity?.id || '');
   useEffect(() => { setVoiceViewOpen(false); setCurrentVoiceConversationId(null); }, [templateId]);
 
   // Attachments picked in the composer. They upload immediately on selection
@@ -5307,6 +5309,7 @@ export default function App() {
                     identityId={identity.id}
                     templateId={templateId}
                     templateName={currentTemplate?.name || 'Voice'}
+                    selectedVoice={selectedVoice}
                     initialConversationId={currentVoiceConversationId}
                     autoStart={currentVoiceConversationId === null}
                     launchKey={voiceLaunchKey}
@@ -5318,7 +5321,6 @@ export default function App() {
                       });
                     }}
                     onStartFailed={(message) => { setVoiceViewOpen(false); setCurrentVoiceConversationId(null); setError(message); }}
-                    onNewConversation={() => { setCurrentVoiceConversationId(null); setVoiceLaunchKey((value) => value + 1); }}
                     onEnded={() => { void refreshSessions(); }}
                   />
                 )}
@@ -5371,7 +5373,7 @@ export default function App() {
                             <span>换行</span>
                           </div>
                           <div className="flex items-center gap-1.5">
-                            <VoiceEntryButton availability={voiceAvailability} onStart={() => { streamAbort.current?.abort(); setEvents([]); setError(''); setCurrentVoiceConversationId(null); setVoiceViewOpen(true); setVoiceLaunchKey((value) => value + 1); }} />
+                            <VoiceEntryButton selectedVoice={selectedVoice} onVoiceChange={setSelectedVoice} availability={voiceAvailability} onStart={() => { streamAbort.current?.abort(); setEvents([]); setError(''); setCurrentVoiceConversationId(null); setVoiceViewOpen(true); setVoiceLaunchKey((value) => value + 1); }} />
                             <button
                               type="button"
                               title="添加附件（图片 ≤10MB，文本类文件 ≤5MB）"
@@ -5545,7 +5547,7 @@ export default function App() {
                             <span>换行</span>
                           </div>
                           <div className="flex items-center gap-1.5">
-                            <VoiceEntryButton availability={voiceAvailability} onStart={() => { streamAbort.current?.abort(); setEvents([]); setError(''); setCurrentVoiceConversationId(null); setVoiceViewOpen(true); setVoiceLaunchKey((value) => value + 1); }} />
+                            <VoiceEntryButton selectedVoice={selectedVoice} onVoiceChange={setSelectedVoice} availability={voiceAvailability} onStart={() => { streamAbort.current?.abort(); setEvents([]); setError(''); setCurrentVoiceConversationId(null); setVoiceViewOpen(true); setVoiceLaunchKey((value) => value + 1); }} />
                             <button
                               type="button"
                               title="添加附件（图片 ≤10MB，文本类文件 ≤5MB）"

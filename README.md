@@ -1,6 +1,6 @@
 # Forward Quickstart
 
-Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示例 Web 应用。它展示了如何创建终端用户身份、配置 Agent 模板、启动会话、发送消息，并通过 SSE 接收实时 Agent 事件。
+Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示例 Web 应用。它展示了如何创建终端用户身份、配置 Agent 模板、启动会话、发送消息，通过 SSE 接收实时 Agent 事件，并通过 WebSocket 进行实时语音对话。
 
 你可以先通过本项目理解 Forward API 的主流程，再将相关能力集成到自己的应用中。
 
@@ -10,7 +10,7 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 
 👉 **[https://qca-quick-start.us/](https://qca-quick-start.us/)**
 
-打开页面后选择 API 环境并输入对应的 Forward PAT 即可开始体验。
+打开页面后选择 API 环境，使用对应的 Forward PAT 或 Service Account Key 登录，并填写应用侧用户标识。在线 Demo 的可用能力取决于实际部署版本和配置。
 
 ## 展示能力
 
@@ -20,7 +20,7 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 - **密钥管理**：在 Vault 中创建和删除密钥，支持 Bearer Token、OAuth Token 和环境变量类型。
 - **会话执行**：基于 Identity 和 Template 创建 Session，发送 `user.message`，并支持取消当前 Turn；遇到需要确认的工具调用或 `AskUserQuestion` 时，由用户显式允许、拒绝、作答或跳过后继续执行。已有任务执行时仍可点击「新建对话」另起新会话，后台任务继续执行且不会干扰当前视图。提问时可点击发送按钮旁的回形针图标添加本地文本类文件（单个 ≤5MB）作为对话附件——文件上传后挂载到 Agent 工作目录（新会话随创建挂载，进行中的会话动态追加挂载），消息中自动标注挂载路径，Agent 可直接读取附件内容作答；附件在消息气泡中以文件卡片展示，刷新后依然可见。
 - **实时事件**：通过 SSE 接收 Agent 状态、消息、思考过程、工具调用和工具结果，支持打字机流式输出并实时渲染 Markdown；Agent 通过 DeliverArtifacts 交付的图片文件在对话中内联预览，支持点击放大和下载原图；流式过程中不完整的表格/标题片段也能安全渲染，Session 运行失败（如模型过载）会在对话中显示错误提示；消息按服务端时间戳排序展示，多轮追问时新提问始终显示在对话最底部。多 Agent 协作场景下，子线程的创建、委派、运行和完成等状态事件以轻量标签形式在对话中展示，子线程完成不会提前终止 SSE 流，确保协调者能正确接收子线程结果；单 Agent 会话中自动过滤从其他会话 SSE 流泄漏的多 Agent 状态事件（如「子线程已完成」），避免显示无关标签；协调者（Coordinator）输出的重复回复（如先输出草稿再输出验收版）会通过字符二元组 Jaccard 相似度自动去重，仅保留最终版本。发送按钮旁的设置图标可开关「显示思考过程 / 显示工具调用过程」（选择持久化到本地）；点击历史会话加载事件时显示加载动画，不会闪现欢迎页；历史会话列表支持置顶——悬浮某条记录时显示图钉图标，点击后该会话固定到列表顶部的「置顶」分组（再次点击取消置顶，置顶状态持久化到本地）。
-- **实时语音（本地）**：Template 开启 Realtime 后，可从聊天输入框单击麦克风直接启动独立 Voice Session；页面展示实时字幕、Agent 音频、Work 任务进度、文字混输、静音与结束控制。语音 Session 在历史列表带有“语音”标签，并通过后端 metadata 中的 `conversation_id` 恢复时间线。CN 与 Global 使用相同交互；WebSocket URL 只携带短时单次 connection key，本地 Node 代理负责携带用户在页面中输入的 PAT 连接上游 WebSocket。
+- **实时语音**：选择 Template 后，点击聊天输入框的麦克风，在音色弹窗中选择并确认，启动独立 Voice Session；无需 Template Realtime 开关。页面展示实时字幕、Agent 音频、Work 任务进度，支持文字混输、麦克风静音、扬声器静音和结束连接。语音 Session 在历史列表带有“语音”标签，通过 metadata 中的 `conversation_id` 恢复时间线。CN 与 Global 使用相同交互，本地和 Vercel 共用语音中继；连接鉴权和部署条件见下文。
 - **模板快速切换**：在对话列表顶部直接切换当前会话使用的 Template，无需离开对话界面。
 - **权限模式**：内置「开发者模式 / 用户模式」开关（默认用户模式，选择持久化到本地）。开发者模式解锁模板及模板资源（技能、文件、环境、密钥）的新建、编辑和删除权限，并显示对应的「模板资源」菜单；用户模式仅能查看和使用模板。切换到开发者模式时会弹出风险确认提示。
 - **会话历史与用量**：查看历史 Session、事件历史、执行状态和会话时长统计。
@@ -48,7 +48,9 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 
 ```text
 client/   React + Vite + TailwindCSS 前端
-server/   本地 Express 代理，用于 API 转发和 SSE 流代理
+server/   Express API/SSE 代理，以及本地与 Vercel 共用的 Voice WebSocket 中继
+api/      Vercel API 函数与 Voice WebSocket 服务入口
+tests/    Vercel 入口测试、本地与 Vercel 入口的部署对照测试
 docs/     公开产品说明与安全说明
 ```
 
@@ -85,7 +87,7 @@ npm -v
 
 ## 配置
 
-应用会在登录页面要求输入 PAT 和 API 环境。如果需要覆盖默认 API 地址，也可以复制 `.env.example` 为 `.env`：
+登录页面支持 PAT 和 Service Account 两种方式。Service Account 模式使用 Key 换取 Token，后续请求携带该 Token；两种方式都需要选择 API 环境并填写应用侧用户标识。如果需要覆盖默认 API 地址，也可以复制 `.env.example` 为 `.env`：
 
 ```bash
 cp .env.example .env
@@ -114,10 +116,13 @@ npm run dev
 - 前端：`http://localhost:5173`
 - 本地代理：`http://localhost:3001`
 
-启动成功后，终端会同时显示前端 Vite 服务和 Express 本地代理的日志。打开前端地址后，在登录页面选择 API 环境并输入对应的 Forward PAT 即可开始体验。
+启动成功后，终端会同时显示前端 Vite 服务和 Express 本地代理的日志。打开前端地址后，在登录页面选择 API 环境、登录方式并填写相应凭据和用户标识即可开始体验。
 
-Voice 仅在本地开发模式可用。首次启动会请求麦克风权限；若麦克风不可用，仍可在 Voice 页面用文字继续对话。Voice 按钮不可用时，请确认当前 Template 已开启 Realtime。
-Voice 中继只接受来自 `localhost`、`127.0.0.1` 或 `::1` 页面的一次性连接，并仅用于本机开发；请勿将本地代理端口 `3001` 暴露到公网。
+Voice 支持本地运行和按下文配置的 Vercel 部署。首次启动语音时会请求麦克风权限；若麦克风不可用，仍可在 Voice 页面用文字继续对话。Voice 无需 Template 开关；按钮不可用时，请确认已登录、已选择 Template、Identity 已就绪且语音代理正常运行。
+
+点击麦克风后，在弹窗中选择默认、龙安灵心、龙安灵希、龙安小昕或龙安鲁风，再点击开始。音色在创建 Conversation 时固定，通话中展示服务端确认的音色；继续历史会话沿用原音色。若要更换音色，请从侧边栏点击「新建对话」，再点击麦克风选择音色并开始。扬声器静音仅关闭本地声音输出，仍继续处理音频和播放回执。
+
+本地 Voice 中继接受来自 `localhost`、`127.0.0.1` 或 `::1` 页面的连接。浏览器连接同源 `/api/voice/socket`，通过首条 `proxy.auth` 消息提交当前登录 Token、环境和会话 ID（鉴权字段名为 `pat`）；中继仅向所选环境的 Forward API 添加 Bearer 鉴权，Token 和会话 ID 不进入浏览器到中继的 WebSocket URL，Token 也不存入中继的跨请求缓存。
 
 如果端口被占用，可以先停止占用 `5173` 或 `3001` 的本地进程，再重新执行 `npm run dev`。
 
@@ -127,9 +132,9 @@ Voice 中继只接受来自 `localhost`、`127.0.0.1` 或 `::1` 页面的一次�
 
 - 本地运行继续使用 `npm run dev`，Vite 会将 `/api` 请求代理到本地 Express 服务。
 - Vercel 会构建 `client/dist` 并将现有 Express API 作为 Serverless Functions 部署；前端和 API 使用同一域名。
-- 当前 Vercel 在线 Demo 不提供 Voice WebSocket 中继；普通 HTTP、SSE 和其他现有能力不受影响。
+- Voice 使用 `api/voice/socket.ts` 导出的 HTTP Server 接收 WebSocket upgrade，与本地共用中继实现。`vercel.json` 启用 Fluid Compute，并将函数最长执行时间设为 300 秒。
 
-建议先 Fork 本仓库到自己的 GitHub 账号，再在 Vercel 导入 Fork 后的仓库。Vercel 检测到根目录的 `vercel.json` 后会自动使用正确的构建命令和 API 函数配置。
+建议先 Fork 本仓库到自己的 GitHub 账号，再在 Vercel 导入 Fork 后的仓库，Root Directory 使用仓库根目录。Vercel 检测到根目录的 `vercel.json` 后会自动使用正确的构建命令和 API 函数配置。
 
 也可以使用 Vercel CLI 部署：
 
@@ -155,28 +160,62 @@ GLOBAL_PROD_CLOUD_API_BASE_URL
 
 不要将 PAT、Vault 密钥或其他敏感信息提交到 Git 仓库或写入 Vercel 的公开前端变量。
 
+### Voice 部署配置与验收
+
+Vercel 的 [WebSocket 支持](https://vercel.com/docs/functions/websockets) 当前为 Beta。已有 Git 集成的项目推送后会自动部署这些代码和 `vercel.json`；生产域名更新需要推送或合并到项目配置的生产分支。
+
+- 默认 API 地址和页面登录方式不变，无需新增 Redis、独立中继服务或服务器端 PAT。
+- 中继从 Vercel 系统变量 `VERCEL_URL`、`VERCEL_BRANCH_URL`、`VERCEL_PROJECT_PRODUCTION_URL` 接受精确匹配的 HTTPS Origin，不放行其他项目的 `*.vercel.app` 域名。
+- 自定义域名或额外别名未包含在上述系统变量时：配置 `VOICE_ALLOWED_ORIGINS=https://demo.example.com,https://other.example.com`，不带路径或末尾斜杠，选择所需的 Production / Preview 环境后重新部署。如果关闭了系统环境变量自动暴露，也需要手动配置允许的域名。使用 README 中的 `qca-quick-start.us` 域名时，应确认它已被系统变量或 `VOICE_ALLOWED_ORIGINS` 包含。
+- Vercel 上每条连接在 280 秒时主动关闭（1012），客户端尝试回读历史并重新鉴权连接同一个 Conversation；历史加载失败会提示警告，但仍尝试连接。恢复期间可能短暂中断音频，不保证无缝续播。可重试的断线最多重试三次，基础间隔为 1/2/4 秒；服务端指定更长等待时间时遵循该时间，连接就绪后重置重试次数。鉴权失败、手动结束和被其他连接接管不会自动重连。本地中继不设置 280 秒定时关闭。
+- `/api/health` 的 `voiceRealtimeProxy.enabled` 只表示中继配置可用，不代表真实上游鉴权或音频已验证。
+
+在仓库根目录执行本地检查：
+
+```bash
+npm run test --workspace=server
+npm run test --workspace=client
+npm run test:deployment
+npm run build --workspace=server
+npm run build --workspace=client
+```
+
+`test:deployment` 会先构建服务端，再用模拟 Forward 上游对照本地构建产物和 Vercel 导出入口，覆盖音色配置、CN/Global 路由、鉴权、消息收发、重连和结束连接。它不会部署到 Vercel，也不验证真实语音识别或合成。部署后还需在实际域名确认麦克风授权、CN / Global 连接、语音输入输出，以及超过 280 秒后的会话恢复；GitHub 上部署成功不能代替这些在线验收。
+
 ## 体验流程
 
 1. 打开前端页面。
 2. 选择 `cn-prod` 或 `global-prod`。
-3. 输入所选环境对应的 Forward PAT。
-4. 输入应用侧用户标识，例如 `user-001`。
+3. 选择 PAT 或 Service Account 登录方式，输入对应环境的凭据。
+4. 输入应用侧用户标识，例如 `user-001`，点击「开始使用」。
 5. 创建或选择一个 Template。
 6. 创建或上传需要的资源，例如文件、技能、环境或密钥库。
 7. 创建 Session 并发送消息。
 8. 查看实时 SSE 事件流。
-9. 按需体验定时任务、IM 渠道和个人记忆等扩展能力。
+9. 点击麦克风、选择音色并确认，体验语音对话；通过侧边栏「新建对话」更换音色。
+10. 按需体验定时任务、IM 渠道和个人记忆等扩展能力。
 
 ## 核心流程
 
 ```text
-PAT + external_id
+登录 Token + external_id
   -> 查找或创建 Identity
   -> 选择或创建 Template
   -> 创建 Session
   -> 发送 user.message
   -> 订阅 /sessions/{session_id}/events/stream
   -> 接收 status、message、tool_use、tool_result 等事件
+```
+
+语音对话流程：
+
+```text
+登录 Token + Identity + Template + 所选音色
+  -> POST /realtime/conversations
+  -> 连接同源 /api/voice/socket，首条消息发送 proxy.auth
+  -> 中继使用 Bearer Token 连接上游 /realtime?conversation_id=...
+  -> 收到 voice.ready 后收发音频、文字和事件
+  -> 结束连接
 ```
 
 ## 覆盖的 API
@@ -188,6 +227,7 @@ PAT + external_id
 | POST | `/identities` | 创建 Identity |
 | GET | `/identities` | 查询或查找 Identity |
 | POST | `/identities/{id}/access_tokens` | 创建 Identity 访问令牌 |
+| POST | `/service_account_tokens` | 使用 Service Account Key 换取登录 Token |
 | GET | `/templates` | 查询 Template 列表 |
 | POST | `/templates` | 创建 Template |
 | POST | `/templates/{id}` | 更新 Template |
@@ -213,6 +253,11 @@ PAT + external_id
 | GET | `/sessions/{id}/events/stream` | 订阅 Session 事件流 |
 | POST | `/sessions/{id}/archive` | 归档 Session |
 | POST | `/sessions/{id}/cancel` | 取消当前 Turn |
+| POST | `/sessions/{id}/resources` | 向会话追加挂载文件 |
+| POST | `/realtime/conversations` | 创建语音会话并指定音色 |
+| GET（WebSocket Upgrade） | `/realtime?conversation_id={id}` | 中继连接上游实时语音服务 |
+| GET | `/memory_stores/{id}/memories` | 查询记忆条目 |
+| GET | `/memory_stores/{id}/memories/{entry_id}` | 查询记忆内容 |
 | GET | `/schedules` | 查询 Schedule 列表 |
 | POST | `/schedules` | 创建 Schedule |
 | GET | `/schedules/{id}` | 查询 Schedule 详情 |
@@ -238,11 +283,10 @@ PAT + external_id
 
 ### Cloud API
 
-资源管理 CRUD 使用 Forward API。以下场景仍需调用 Cloud API，因为相关数据不一定存在于 Forward 资源视图中。
+资源管理 CRUD 和 Memory 查询使用 Forward API。以下场景仍会调用 Cloud API：
 
 | 资源 | 能力 |
 | --- | --- |
-| Agent 生成文件 | 查询 Agent 交付物或系统生成文件的元数据，并获取签名下载地址。 |
+| 文件兼容回退 | 文件元数据、内容地址等优先请求 Forward；允许回退的登录模式下，收到 404 时尝试 Cloud。Service Account 模式不使用这项文件回退。 |
 | Session Resources | 查询已挂载到 Session 的文件资源。 |
 | Agents | 查询 Managed Agent 列表，用于模板配置多 Agent 协作时选择可委派的 Agent。 |
-| Memory Stores | 读取 Template 生效配置中的 Memory Store，并查询记忆条目和内容。 |

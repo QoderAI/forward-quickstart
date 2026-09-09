@@ -1,3 +1,5 @@
+import { VoiceCallControls } from './VoiceCallControls';
+import { realtimeVoiceName, type RealtimeVoice } from './voiceApi';
 import { useState } from 'react';
 import type { ForwardContext } from '../forwardApi';
 import { useVoiceSession, type VoiceStage } from './useVoiceSession';
@@ -33,12 +35,12 @@ interface VoiceSessionViewProps {
   identityId: string;
   templateId: string;
   templateName: string;
+  selectedVoice: RealtimeVoice;
   initialConversationId: string | null;
   autoStart: boolean;
   launchKey: number;
   onConversationCreated: (id: string) => void;
   onStartFailed: (message: string) => void;
-  onNewConversation: () => void;
   onEnded?: () => void;
 }
 
@@ -169,58 +171,6 @@ function TimelineItem({ entry }: { entry: TimelineEntry }) {
   );
 }
 
-function MicrophoneIcon({ muted }: { muted: boolean }) {
-  return muted ? (
-    <svg className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-      <path strokeLinecap="round" strokeLinejoin="round" d="m4 4 16 16M9.5 5.3A3.5 3.5 0 0 1 15.5 7.8v3.4c0 .5-.1 1-.3 1.4M18.5 11.5a6.5 6.5 0 0 1-1.1 3.6M13.5 18.8V22m-3 0h6M5.5 11.5a6.5 6.5 0 0 0 9.9 5.5M8.5 10.5V7.8" />
-    </svg>
-  ) : (
-    <svg className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-      <rect x="8" y="3" width="8" height="12" rx="4" />
-      <path strokeLinecap="round" strokeLinejoin="round" d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-3 0h6" />
-    </svg>
-  );
-}
-
-function CallControls({
-  stage,
-  muted,
-  onMutedChange,
-  onEnd,
-}: {
-  stage: VoiceStage;
-  muted: boolean;
-  onMutedChange: (muted: boolean) => void;
-  onEnd: () => void;
-}) {
-  if (!activeVoiceStages.has(stage)) return null;
-
-  return (
-    <>
-      <button
-        type="button"
-        aria-label={muted ? '取消静音' : '静音'}
-        title={muted ? '取消静音' : '静音'}
-        onClick={() => onMutedChange(!muted)}
-        className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full border transition ${muted ? 'border-orange-300 bg-orange-50 text-orange-600' : 'border-black/15 bg-white text-black/65 hover:border-[#3550FF] hover:text-[#3550FF]'}`}
-      >
-        <MicrophoneIcon muted={muted} />
-      </button>
-      <button
-        type="button"
-        aria-label="结束语音"
-        title="结束语音"
-        onClick={onEnd}
-        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#FF5A64] text-white shadow-[0_5px_14px_rgba(255,90,100,0.24)] transition hover:bg-[#F24955]"
-      >
-        <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-          <rect x="7" y="7" width="10" height="10" rx="1.5" />
-        </svg>
-      </button>
-    </>
-  );
-}
-
 export function VoiceSessionView(props: VoiceSessionViewProps) {
   const voice = useVoiceSession(props);
   const [text, setText] = useState('');
@@ -232,21 +182,21 @@ export function VoiceSessionView(props: VoiceSessionViewProps) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-white">
-      <div className="flex items-center justify-between border-b border-black/5 px-7 py-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-black/5 px-7 py-4">
         <div className="flex items-center gap-2 text-sm">
           <span className="h-2 w-2 rounded-full bg-[#3550FF]" />
           <b>{stageCopy[voice.stage]}</b>
           <span className="text-black/35">· {props.templateName}</span>
+          <span className="text-black/45">· 音色：{voice.effectiveVoice ? realtimeVoiceName(voice.effectiveVoice) : '待连接确认'}</span>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <code className="text-xs text-black/35">{voice.conversationId || 'creating...'}</code>
-          <button type="button" onClick={props.onNewConversation} className="rounded-lg border border-black/10 px-3 py-1.5 text-xs text-black/55 transition hover:border-[#3550FF]/50 hover:text-[#3550FF]">新建对话</button>
         </div>
       </div>
 
-      {(voice.error || voice.microphoneWarning || voice.stage === 'reconnecting') && (
+      {(voice.error || voice.historyWarning || voice.microphoneWarning || voice.stage === 'reconnecting') && (
         <div className="mx-7 mt-3 rounded-xl bg-amber-50 px-4 py-2 text-xs text-amber-700">
-          {voice.error || voice.microphoneWarning || '正在恢复连接，期间语音不会被处理'}
+          {voice.error || voice.historyWarning || voice.microphoneWarning || '正在恢复连接，期间语音不会被处理'}
         </div>
       )}
 
@@ -273,12 +223,13 @@ export function VoiceSessionView(props: VoiceSessionViewProps) {
             ))}
           </div>
           <div className="flex items-center gap-3">
-            <CallControls
-              stage={voice.stage}
+            {activeVoiceStages.has(voice.stage) && <VoiceCallControls
               muted={voice.muted}
+              speakerMuted={voice.speakerMuted}
+              onSpeakerMutedChange={voice.setSpeakerMuted}
               onMutedChange={voice.setMuted}
               onEnd={() => void voice.end().then(() => props.onEnded?.())}
-            />
+            />}
             {voice.stage === 'ended' ? (
               <button type="button" onClick={() => void voice.continueConversation()} className="h-10 flex-1 rounded-xl bg-[#3550FF] text-sm text-white">继续语音对话</button>
             ) : (
