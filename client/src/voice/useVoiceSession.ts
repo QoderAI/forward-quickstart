@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ForwardApiError, type ForwardContext } from '../forwardApi';
+import type { ForwardContext } from '../forwardApi';
 import { AudioPlayback, handleVoicePlaybackEvent, MicrophoneCapture, type VoicePlaybackRuntime } from './voiceAudio';
-import { createRealtimeConversation, getCompleteRealtimeConversationHistory, readRealtimeVoice, type RealtimeVoice } from './voiceApi';
+import { createRealtimeConversation, getCompleteRealtimeConversationHistory, requestVoiceConnectionKey } from './voiceApi';
 import { VoiceConnection, type VoiceServerEvent } from './voiceConnection';
 import {
   applyVoiceTimelineEvent,
@@ -21,7 +21,6 @@ interface VoiceSessionOptions {
   ctx: ForwardContext;
   identityId: string;
   templateId: string;
-  selectedVoice: RealtimeVoice;
   initialConversationId: string | null;
   autoStart: boolean;
   launchKey: number;
@@ -36,13 +35,9 @@ const MAX_CLIENT_TEXT_BYTES = 16 * 1024;
 
 export function useVoiceSession(options: VoiceSessionOptions) {
   const [conversationId, setConversationId] = useState(options.initialConversationId);
-  const [effectiveVoice, setEffectiveVoice] = useState<string | null>(null);
-  const [historyWarning, setHistoryWarning] = useState<string | null>(null);
   const [stage, setStage] = useState<VoiceStage>(options.initialConversationId ? 'loading-history' : 'idle');
   const [timelineState, setTimelineState] = useState<VoiceTimelineState>(createVoiceTimelineState());
-  const [muted, setMutedState] = useState(false);
-  const [speakerMuted, setSpeakerMutedState] = useState(false);
-  const speakerMutedRef = useRef(false);
+  const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [microphoneWarning, setMicrophoneWarning] = useState<string | null>(null);
   const mutedRef = useRef(muted);
@@ -51,48 +46,24 @@ export function useVoiceSession(options: VoiceSessionOptions) {
   const microphone = useRef(new MicrophoneCapture());
   const playback = useRef<AudioPlayback | null>(null);
   const generation = useRef(0);
-  // Each mounted launch owns one immutable create operation, including its voice.
-  const [createInput] = useState(() => ({
-    templateId: options.templateId,
-    identityId: options.identityId,
-    title: 'Voice Session',
-    voice: options.selectedVoice,
-    idempotencyKey: crypto.randomUUID(),
-  }));
+  const createIdempotencyKey = useRef(crypto.randomUUID());
 
-  useEffect(() => { stageRef.current = stage; }, [stage]);
-
-  const setMuted = useCallback((next: boolean) => {
-    mutedRef.current = next;
-    setMutedState(next);
-  }, []);
-  const setSpeakerMuted = useCallback((next: boolean) => {
-    speakerMutedRef.current = next;
-    playback.current?.setMuted(next);
-    setSpeakerMutedState(next);
-  }, []);
+  useEffect(() => { mutedRef.current = muted; stageRef.current = stage; }, [muted, stage]);
 
   const loadHistory = useCallback(async (id: string) => {
-    setHistoryWarning(null);
     const history = await getCompleteRealtimeConversationHistory(options.ctx, id, { limit: 100, types: 'message,work' });
-    const storedVoice = readRealtimeVoice(history.conversation?.config);
-    if (storedVoice) setEffectiveVoice(storedVoice);
     setTimelineState(createVoiceTimelineStateFromEntries(projectVoiceHistory(history.events)));
     return history;
   }, [options.ctx]);
 
-  const createPlayback = useCallback(() => {
-    const audio = new AudioPlayback({
-      onReceipt: (type, identity) => connection.current?.send(type, identity),
-      onState: (value) => {
-        if (value === 'idle') {
-          setStage((current) => current === 'speaking' ? 'listening' : current);
-        }
-      },
-    });
-    audio.setMuted(speakerMutedRef.current);
-    return audio;
-  }, []);
+  const createPlayback = useCallback(() => new AudioPlayback({
+    onReceipt: (type, identity) => connection.current?.send(type, identity),
+    onState: (value) => {
+      if (value === 'idle') {
+        setStage((current) => current === 'speaking' ? 'listening' : current);
+      }
+    },
+  }), []);
 
   const handleEvent = useCallback((event: VoiceServerEvent) => {
     const runtime: VoicePlaybackRuntime = {
@@ -105,7 +76,6 @@ export function useVoiceSession(options: VoiceSessionOptions) {
       return;
     }
     if (event.type === 'voice.ready') {
-      setEffectiveVoice(readRealtimeVoice(event.payload.config));
       setError(null);
       setStage('listening');
       return;
@@ -120,10 +90,7 @@ export function useVoiceSession(options: VoiceSessionOptions) {
     }
     if (event.type === 'error') {
       const code = typeof event.payload.code === 'string' ? event.payload.code : 'unknown';
-      if (!hiddenErrorCodes.has(code)) {
-        const message = code === 'voice_configuration_failed' ? '音色配置失败，请新建语音对话后重试' : String(event.payload.message || '语音服务异常');
-        setError(`${message}（${code}）`);
-      }
+      if (!hiddenErrorCodes.has(code)) setError(`${String(event.payload.message || '语音服务异常')}（${code}）`);
       return;
     }
     if (event.type.startsWith('transcript.') || event.type.startsWith('work.')) {
@@ -137,11 +104,11 @@ export function useVoiceSession(options: VoiceSessionOptions) {
     connection.current?.disconnect();
     const next = new VoiceConnection({
       conversationId: id,
-      getCredentials: async () => ({ pat: options.ctx.pat, environment: options.ctx.environment }),
+      getConnectionKey: async () => (await requestVoiceConnectionKey(options.ctx, id)).connection_key,
       beforeReconnect: async () => {
         setStage('reconnecting');
         await playback.current?.cancel();
-        await loadHistory(id).catch(() => setHistoryWarning('历史记录暂时无法加载，仍可继续语音对话'));
+        await loadHistory(id);
       },
       onEvent: handleEvent,
       onState: (value) => {
@@ -152,12 +119,12 @@ export function useVoiceSession(options: VoiceSessionOptions) {
         }
         if (value === 'disconnected' && !['ending', 'ended', 'error'].includes(stageRef.current)) {
           setStage('error');
-          setError((current) => current || '语音连接已断开');
+          setError('语音连接已断开');
           void microphone.current.stop();
           void playback.current?.cancel();
         }
       },
-      onError: (value) => { setStage('error'); setError((current) => current || value.message); },
+      onError: (value) => { setStage('error'); setError(value.message); },
     });
     connection.current = next;
     setStage('connecting');
@@ -185,24 +152,25 @@ export function useVoiceSession(options: VoiceSessionOptions) {
     await startMicrophone();
     if (run !== generation.current) return;
     try {
-      const created = await createRealtimeConversation(options.ctx, createInput);
-      if (created.type !== 'voice.conversation' || created.status !== 'ready') throw new Error('语音会话尚未就绪，请重试');
+      const created = await createRealtimeConversation(options.ctx, {
+        templateId: options.templateId,
+        identityId: options.identityId,
+        title: 'Voice Session',
+        idempotencyKey: createIdempotencyKey.current,
+      });
       if (run !== generation.current) return;
-      setEffectiveVoice(readRealtimeVoice(created.config));
       setConversationId(created.id);
       options.onConversationCreated(created.id);
       await connect(created.id);
     } catch (value) {
       if (run !== generation.current) return;
       await microphone.current.stop();
-      const message = value instanceof ForwardApiError && value.code === 'invalid_voice'
-        ? '所选音色不可用，请选择其他音色后重试'
-        : value instanceof Error ? value.message : String(value);
+      const message = value instanceof Error ? value.message : String(value);
       setStage('error');
       setError(message);
       options.onStartFailed(message);
     }
-  }, [connect, createInput, options, startMicrophone]);
+  }, [connect, options, startMicrophone]);
 
   useEffect(() => {
     const mic = microphone.current;
@@ -212,8 +180,8 @@ export function useVoiceSession(options: VoiceSessionOptions) {
         setConversationId(id);
         setStage('loading-history');
         await loadHistory(id).then(() => setStage('ended')).catch((value) => {
-          setStage('ended');
-          setHistoryWarning(value instanceof Error ? `历史记录加载失败：${value.message}` : '历史记录加载失败，可继续语音对话');
+          setStage('error');
+          setError(value instanceof Error ? value.message : String(value));
         });
       } else if (options.autoStart) {
         await startNew();
@@ -240,7 +208,7 @@ export function useVoiceSession(options: VoiceSessionOptions) {
     setError(null);
     const id = `local-${crypto.randomUUID()}`;
     setTimelineState((state) => upsertLocalUserTextDraft(state, id, value, true));
-    activeConnection.send('interrupt', {});
+    activeConnection.send('interrupt', { reason: 'text_message' });
     void playback.current?.cancel();
     const sent = activeConnection.send('text.message', { text: value });
     setTimelineState((state) => sent
@@ -251,13 +219,12 @@ export function useVoiceSession(options: VoiceSessionOptions) {
   }, []);
 
   const end = useCallback(async () => {
-    generation.current += 1;
     const activeConnection = connection.current;
     setStage('ending');
     await Promise.allSettled([microphone.current.stop(), playback.current?.cancel()]);
     try {
       await activeConnection?.closeGracefully();
-      if (conversationId) await loadHistory(conversationId).catch(() => setHistoryWarning('通话已结束，历史记录暂时无法加载'));
+      if (conversationId) await loadHistory(conversationId);
     } catch (value) {
       setError(value instanceof Error ? value.message : '语音连接未能安全结束');
     } finally {
@@ -277,14 +244,10 @@ export function useVoiceSession(options: VoiceSessionOptions) {
 
   return {
     conversationId,
-    effectiveVoice,
-    historyWarning,
     stage,
     timeline: selectTimelineEntries(timelineState) as TimelineEntry[],
     muted,
     setMuted,
-    speakerMuted,
-    setSpeakerMuted,
     error,
     microphoneWarning,
     startNew,

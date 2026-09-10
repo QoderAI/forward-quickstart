@@ -152,14 +152,12 @@ const LIST_EVENT_TYPES = [
 export class ForwardApiError extends Error {
   status: number;
   requestId?: string;
-  code?: string;
 
-  constructor(status: number, message: string, requestId?: string, code?: string) {
+  constructor(status: number, message: string, requestId?: string) {
     super(message);
     this.name = 'ForwardApiError';
     this.status = status;
     this.requestId = requestId;
-    this.code = code;
   }
 }
 
@@ -201,8 +199,7 @@ export async function forwardRequest<T>(
       request_id?: string;
       requestId?: string;
       message?: string;
-      code?: string;
-      error?: { request_id?: string; requestId?: string; message?: string; code?: string };
+      error?: { request_id?: string; requestId?: string; message?: string };
     }
     : null;
   if (!res.ok) {
@@ -218,7 +215,6 @@ export async function forwardRequest<T>(
       res.status,
       requestId ? `${message} (request id: ${requestId})` : message,
       requestId || undefined,
-      dataRecord?.error?.code || dataRecord?.code,
     );
   }
   return data as T;

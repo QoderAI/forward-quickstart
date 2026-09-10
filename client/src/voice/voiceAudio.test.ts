@@ -15,8 +15,6 @@ class FakeAudioContext {
   state = 'running';
   destination = {};
   sources: FakeSource[] = [];
-  gain = { gain: { value: 1, setValueAtTime: vi.fn() }, connect: vi.fn(), disconnect: vi.fn() };
-  createGain = vi.fn(() => this.gain);
   resume = vi.fn();
   close = vi.fn(async () => undefined);
   createBuffer = vi.fn(() => ({ duration: 1 / 24_000, copyToChannel: vi.fn() }));
@@ -76,47 +74,5 @@ describe('voice audio conversion', () => {
 
     expect(FakeAudioContext.instances).toHaveLength(1);
     expect(FakeAudioContext.instances[0].createBufferSource).toHaveBeenCalledOnce();
-  });
-});
-
-
-describe('speaker mute', () => {
-  beforeEach(() => { FakeAudioContext.instances = []; vi.stubGlobal('AudioContext', FakeAudioContext); });
-  afterEach(() => vi.unstubAllGlobals());
-
-  test('mutes and unmutes queued audio without stopping playback or changing receipts', async () => {
-    const receipt = vi.fn();
-    const playback = new AudioPlayback({ onReceipt: receipt });
-    playback.begin({ work_id: 'w1' });
-    playback.append('AAA=');
-    const context = FakeAudioContext.instances[0];
-    playback.setMuted(true);
-    expect(context.gain.gain.setValueAtTime).toHaveBeenLastCalledWith(0, 0);
-    playback.append('AAA=');
-    playback.setMuted(false);
-    expect(context.gain.gain.setValueAtTime).toHaveBeenLastCalledWith(1, 0);
-    expect(context.sources[1].start).toHaveBeenCalledWith(1 / 24_000);
-    for (const source of context.sources) {
-      expect(source.connect).toHaveBeenCalledWith(context.gain);
-      expect(source.stop).not.toHaveBeenCalled();
-    }
-    expect(receipt.mock.calls.map(call => call[0])).toEqual(['playback.started']);
-    playback.finish();
-    context.sources.forEach(source => source.onended?.());
-    expect(receipt.mock.calls.map(call => call[0])).toEqual(['playback.started', 'playback.ended']);
-    await playback.cancel();
-  });
-
-  test('retains mute across audio segments including mute before the first frame', async () => {
-    const playback = new AudioPlayback();
-    playback.setMuted(true);
-    playback.append('AAA=');
-    expect(FakeAudioContext.instances[0].gain.gain.value).toBe(0);
-    await playback.cancel();
-    playback.append('AAA=');
-    expect(FakeAudioContext.instances[1].gain.gain.value).toBe(0);
-    playback.setMuted(false);
-    expect(FakeAudioContext.instances[1].gain.gain.setValueAtTime).toHaveBeenLastCalledWith(1, 0);
-    await playback.cancel();
   });
 });

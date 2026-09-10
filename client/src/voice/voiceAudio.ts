@@ -77,8 +77,6 @@ export class MicrophoneCapture {
 
 export type PlaybackIdentity = { work_id?: string; announcement_id?: string };
 export class AudioPlayback {
-  private gainNode: GainNode | null = null;
-  private muted = false;
   private context: AudioContext | null = null;
   private cursor = 0;
   private sources = new Set<AudioBufferSourceNode>();
@@ -89,18 +87,14 @@ export class AudioPlayback {
   private handlers: { onReceipt?: (type: 'playback.started' | 'playback.ended' | 'playback.cancelled', identity: PlaybackIdentity) => void; onState?: (state: 'playing' | 'idle') => void };
   constructor(handlers: { onReceipt?: (type: 'playback.started' | 'playback.ended' | 'playback.cancelled', identity: PlaybackIdentity) => void; onState?: (state: 'playing' | 'idle') => void } = {}) { this.handlers = handlers; }
   get active() { return this.context !== null; }
-  begin(identity: PlaybackIdentity = {}) { if (this.context) return; this.context = new AudioContext({ sampleRate: OUTPUT_RATE }); this.gainNode = this.context.createGain(); this.gainNode.gain.value = this.muted ? 0 : 1; this.gainNode.connect(this.context.destination); if (this.context.state === 'suspended') void this.context.resume(); this.cursor = this.context.currentTime; this.identity = { ...identity }; this.started = false; this.finished = false; }
-  setMuted(muted: boolean) {
-    this.muted = muted;
-    if (this.context && this.gainNode) this.gainNode.gain.setValueAtTime(muted ? 0 : 1, this.context.currentTime);
-  }
+  begin(identity: PlaybackIdentity = {}) { if (this.context) return; this.context = new AudioContext({ sampleRate: OUTPUT_RATE }); if (this.context.state === 'suspended') void this.context.resume(); this.cursor = this.context.currentTime; this.identity = { ...identity }; this.started = false; this.finished = false; }
   matches(identity: PlaybackIdentity) { return this.identity.work_id === identity.work_id && this.identity.announcement_id === identity.announcement_id; }
   append(audio: string) {
     if (!this.context) this.begin();
     const context = this.context!;
     const samples = base64Pcm16ToFloat(audio);
     const buffer = context.createBuffer(1, samples.length, OUTPUT_RATE); buffer.copyToChannel(samples, 0);
-    const source = context.createBufferSource(); source.buffer = buffer; source.connect(this.gainNode ?? context.destination);
+    const source = context.createBufferSource(); source.buffer = buffer; source.connect(context.destination);
     this.cursor = Math.max(this.cursor, context.currentTime); source.start(this.cursor); this.cursor += buffer.duration; this.sources.add(source);
     if (!this.started) { this.started = true; this.handlers.onState?.('playing'); this.handlers.onReceipt?.('playback.started', this.identity); }
     source.onended = () => { this.sources.delete(source); void this.complete(); };
@@ -117,7 +111,7 @@ export class AudioPlayback {
     try { await this.cancelPromise; } finally { this.cancelPromise = null; }
   }
   private async complete() { if (!this.finished || this.sources.size) return; if (this.started) this.handlers.onReceipt?.('playback.ended', this.identity); await this.reset(); }
-  private async reset() { const context = this.context; this.context = null; this.gainNode?.disconnect(); this.gainNode = null; this.identity = {}; this.started = false; this.finished = false; this.handlers.onState?.('idle'); await context?.close(); }
+  private async reset() { const context = this.context; this.context = null; this.identity = {}; this.started = false; this.finished = false; this.handlers.onState?.('idle'); await context?.close(); }
 }
 
 export interface VoicePlaybackEvent {

@@ -1,7 +1,42 @@
+import { randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
+import type { RequestHandler } from 'express';
 import { WebSocket, WebSocketServer } from 'ws';
 
 export type VoiceEnvironment = 'cn-prod' | 'global-prod';
+export interface VoiceConnectionPayload { pat: string; environment: VoiceEnvironment; conversationId: string }
+export interface ConnectionKeyStore { issue(payload: VoiceConnectionPayload): string; consume(key: string): VoiceConnectionPayload | null }
+
+interface ConnectionKeyStoreOptions {
+  ttlMs?: number;
+  now?: () => number;
+  randomKey?: () => string;
+  scheduleExpiry?: (callback: () => void, delayMs: number) => void;
+}
+
+function scheduleExpiry(callback: () => void, delayMs: number) {
+  setTimeout(callback, delayMs).unref();
+}
+
+export function createConnectionKeyStore({ ttlMs = 30_000, now = Date.now, randomKey = () => randomBytes(32).toString('base64url'), scheduleExpiry: schedule = scheduleExpiry }: ConnectionKeyStoreOptions = {}): ConnectionKeyStore {
+  const entries = new Map<string, { payload: VoiceConnectionPayload; expiresAt: number }>();
+  return {
+    issue(payload) {
+      const key = randomKey();
+      const entry = { payload, expiresAt: now() + ttlMs };
+      entries.set(key, entry);
+      schedule(() => {
+        if (entries.get(key) === entry) entries.delete(key);
+      }, ttlMs);
+      return key;
+    },
+    consume(key) {
+      const entry = entries.get(key);
+      entries.delete(key);
+      return entry && entry.expiresAt >= now() ? entry.payload : null;
+    },
+  };
+}
 
 export function buildRealtimeUrl(baseUrl: string, conversationId: string): URL {
   const url = new URL(`${baseUrl.replace(/\/+$/, '')}/realtime`);
@@ -11,90 +46,93 @@ export function buildRealtimeUrl(baseUrl: string, conversationId: string): URL {
 }
 
 export function isAllowedLocalOrigin(origin: string | undefined): boolean {
+  if (!origin) return false;
   try {
-    const url = new URL(origin || '');
-    return ['http:', 'https:'].includes(url.protocol) && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
-  } catch { return false; }
+    const hostname = new URL(origin).hostname;
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+  } catch {
+    return false;
+  }
 }
 
 export function relayCloseCode(code: number, fallback: number): number {
-  return (code >= 1000 && code <= 1014 && ![1004, 1005, 1006].includes(code)) || (code >= 3000 && code <= 4999) ? code : fallback;
+  const protocolCode = code >= 1000 && code <= 1014 && ![1004, 1005, 1006].includes(code);
+  return protocolCode || (code >= 3000 && code <= 4999) ? code : fallback;
+}
+
+function rejectUpgrade(socket: import('node:stream').Duplex, status: number, message: string) {
+  socket.write(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+  socket.destroy();
 }
 
 export function createVoiceProxy(options: {
   baseUrls: Record<VoiceEnvironment, string>;
-  allowedOrigins?: string[];
-  allowLocal?: boolean;
-  authTimeoutMs?: number;
-  maxConnectionMs?: number;
+  enabled?: boolean;
+  ttlMs?: number;
 }) {
-  const allowedOrigins = new Set(options.allowedOrigins || []);
-  const enabled = (options.allowLocal ?? true) || allowedOrigins.size > 0;
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+  const enabled = options.enabled ?? true;
+  const ttlMs = options.ttlMs ?? 30_000;
+  const store = createConnectionKeyStore({ ttlMs });
+  const wss = new WebSocketServer({ noServer: true });
   let attached = false;
+
+  const issueConnectionKey: RequestHandler = (req, res) => {
+    if (!enabled) {
+      res.status(501).json({ error: { message: 'Voice WebSocket proxy is available in local development only' } });
+      return;
+    }
+    if (!isAllowedLocalOrigin(req.headers.origin)) {
+      res.status(403).json({ error: { message: 'Voice WebSocket proxy only accepts loopback browser origins' } });
+      return;
+    }
+    const pat = String(req.body?.pat ?? '').trim();
+    const environment = req.body?.environment;
+    const conversationId = String(req.body?.conversation_id ?? '').trim();
+    if (!pat || !conversationId || (environment !== 'cn-prod' && environment !== 'global-prod')) {
+      res.status(400).json({ error: { message: 'pat, environment and conversation_id are required' } });
+      return;
+    }
+    res.json({ connection_key: store.issue({ pat, environment, conversationId }), expires_in_ms: ttlMs });
+  };
+
   function attach(server: Server) {
-    if (attached) return;
+    if (!enabled || attached) return;
     attached = true;
     server.on('upgrade', (request, socket, head) => {
       const url = new URL(request.url || '/', 'http://localhost');
-      const origin = request.headers.origin;
-      const allowed = !!origin && (allowedOrigins.has(origin) || ((options.allowLocal ?? true) && isAllowedLocalOrigin(origin)));
-      const status = url.pathname !== '/api/voice/socket' ? 404 : !enabled || !allowed ? 403 : url.search ? 400 : 0;
-      if (status) {
-        socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      if (url.pathname !== '/api/voice/socket') {
+        rejectUpgrade(socket, 404, 'Not Found');
+        return;
+      }
+      if (!isAllowedLocalOrigin(request.headers.origin)) {
+        rejectUpgrade(socket, 403, 'Forbidden');
+        return;
+      }
+      const payload = store.consume(url.searchParams.get('key') || '');
+      if (!payload) {
+        rejectUpgrade(socket, 401, 'Unauthorized');
         return;
       }
       wss.handleUpgrade(request, socket, head, (client) => {
-        let upstream: WebSocket | undefined;
-        let authenticated = false;
-        const close = (peer: WebSocket | undefined, code: number, reason: string) => {
-          if (peer?.readyState === WebSocket.CONNECTING) peer.terminate();
-          else if (peer?.readyState === WebSocket.OPEN) peer.close(relayCloseCode(code, 1011), reason);
-        };
-        const authTimer = setTimeout(() => close(client, 4408, 'authentication timeout'), options.authTimeoutMs ?? 5000);
-        const lifetime = options.maxConnectionMs ? setTimeout(() => {
-          close(upstream, 1000, 'proxy rotation');
-          close(client, 1012, 'proxy rotation');
-        }, options.maxConnectionMs) : undefined;
-        const relay = (peer: WebSocket | undefined, data: import('ws').RawData, binary: boolean) => {
-          if (peer?.readyState !== WebSocket.OPEN) return;
-          if (peer.bufferedAmount > 4 * 1024 * 1024) {
-            close(client, 1013, 'slow consumer'); close(upstream, 1013, 'slow consumer');
-          } else peer.send(data, { binary });
-        };
-        client.on('message', (data, binary) => {
-          if (client.readyState !== WebSocket.OPEN) return;
-          if (authenticated) {
-            if (upstream?.readyState !== WebSocket.OPEN) { close(client, 4400, 'upstream not ready'); return; }
-            relay(upstream, data, binary); return;
-          }
-          let auth;
-          try { auth = JSON.parse(data.toString()); } catch { close(client, 4400, 'invalid authentication'); return; }
-          if (binary || data.toString().length > 16384 || auth?.type !== 'proxy.auth' || typeof auth.pat !== 'string' || !auth.pat.trim() || /[\r\n]/.test(auth.pat) || typeof auth.conversation_id !== 'string' || !auth.conversation_id.trim() || !['cn-prod', 'global-prod'].includes(auth.environment)) {
-            close(client, 4400, 'invalid authentication'); return;
-          }
-          authenticated = true;
-          clearTimeout(authTimer);
-          upstream = new WebSocket(buildRealtimeUrl(options.baseUrls[auth.environment as VoiceEnvironment], auth.conversation_id), {
-            headers: { Authorization: `Bearer ${auth.pat}` }, handshakeTimeout: 15000, maxPayload: 1024 * 1024,
-          });
-          upstream.on('message', (message, isBinary) => relay(client, message, isBinary));
-          upstream.on('unexpected-response', (_req, response) => {
-            const status = response.statusCode;
-            response.resume();
-            close(client, status === 401 ? 4401 : status === 403 ? 4403 : status === 404 ? 4404 : 1011, 'upstream rejected connection');
-            upstream?.terminate();
-          });
-          upstream.on('error', () => close(client, 1011, 'upstream unavailable'));
-          upstream.on('close', code => close(client, code === 1000 ? 1000 : relayCloseCode(code, 1011), 'upstream closed'));
+        const upstream = new WebSocket(buildRealtimeUrl(options.baseUrls[payload.environment], payload.conversationId), {
+          headers: { Authorization: `Bearer ${payload.pat}` },
         });
-        client.on('close', () => {
-          clearTimeout(authTimer); clearTimeout(lifetime);
-          close(upstream, 1000, 'client closed');
+        const closePeer = (peer: WebSocket, code = 1011, reason = 'voice proxy closed', fallback = 1011) => {
+          if (peer.readyState === WebSocket.OPEN || peer.readyState === WebSocket.CONNECTING) peer.close(relayCloseCode(code, fallback), reason);
+        };
+        client.on('message', (data, isBinary) => {
+          if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
         });
-        client.on('error', () => close(upstream, 1011, 'client error'));
+        upstream.on('message', (data, isBinary) => {
+          if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
+        });
+        client.on('close', (code) => closePeer(upstream, code, 'client closed', 1000));
+        upstream.on('close', (code) => closePeer(client, code, 'upstream closed', 1011));
+        client.on('error', () => closePeer(upstream));
+        upstream.on('error', () => closePeer(client));
       });
     });
   }
-  return { enabled, attach };
+
+  return { enabled, issueConnectionKey, attach };
 }

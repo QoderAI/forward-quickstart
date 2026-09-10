@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { buildVoiceSocketUrl, isValidVoiceServerEvent, VoiceConnection } from './voiceConnection';
+import { buildLocalVoiceSocketUrl, isValidVoiceServerEvent, VoiceConnection } from './voiceConnection';
 
 class FakeWebSocket {
   static readonly OPEN = 1;
@@ -40,8 +40,8 @@ describe('voice connection contract', () => {
   });
 
   test('keeps credentials and conversation id out of the browser websocket URL', () => {
-    const url = buildVoiceSocketUrl('http://localhost:5173/');
-    expect(url).toBe('ws://localhost:5173/api/voice/socket');
+    const url = buildLocalVoiceSocketUrl('key only', 'http://localhost:5173/');
+    expect(url).toBe('ws://localhost:5173/api/voice/socket?key=key+only');
     expect(url).not.toContain('conv_');
     expect(url).not.toContain('pat_');
   });
@@ -59,7 +59,7 @@ describe('voice connection contract', () => {
     vi.stubGlobal('crypto', { randomUUID: () => 'close-request-1' });
     const connection = new VoiceConnection({
       conversationId: 'conv_1',
-      getCredentials: async () => ({ pat: 'pat_secret', environment: 'cn-prod' }),
+      getConnectionKey: async () => 'key-1',
       webSocketFactory: () => new FakeWebSocket() as unknown as WebSocket,
     });
     await connection.connect();
@@ -91,7 +91,7 @@ describe('voice connection contract', () => {
     vi.stubGlobal('crypto', { randomUUID: () => 'close-request-timeout' });
     const connection = new VoiceConnection({
       conversationId: 'conv_1',
-      getCredentials: async () => ({ pat: 'pat_secret', environment: 'cn-prod' }),
+      getConnectionKey: async () => 'key-1',
       webSocketFactory: () => new FakeWebSocket() as unknown as WebSocket,
     });
     await connection.connect();
@@ -115,7 +115,7 @@ describe('voice connection contract', () => {
     installBrowser();
     const connection = new VoiceConnection({
       conversationId: 'conv_1',
-      getCredentials: async () => ({ pat: 'pat_secret', environment: 'cn-prod' }),
+      getConnectionKey: async () => 'key-1',
       webSocketFactory: () => new FakeWebSocket() as unknown as WebSocket,
     });
     await connection.connect();
@@ -129,66 +129,4 @@ describe('voice connection contract', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     expect(FakeWebSocket.instances).toHaveLength(2);
   });
-  test('sends credentials only after open and uses WSS on HTTPS', async () => {
-    installBrowser();
-    expect(buildVoiceSocketUrl('https://demo.vercel.app/path')).toBe('wss://demo.vercel.app/api/voice/socket');
-    const connection = new VoiceConnection({ conversationId: 'conv_1', getCredentials: async () => ({ pat: 'secret', environment: 'global-prod' }), webSocketFactory: () => new FakeWebSocket() as unknown as WebSocket });
-    await connection.connect();
-    const socket = FakeWebSocket.instances[0];
-    expect(socket.send).not.toHaveBeenCalled();
-    socket.emit('open');
-    expect(JSON.parse(socket.send.mock.calls[0][0])).toEqual({ type: 'proxy.auth', pat: 'secret', environment: 'global-prod', conversation_id: 'conv_1' });
-    expect(connection.send('audio.append', {})).toBe(false);
-    connection.disconnect();
-  });
-
-  test.each([1001, 1006, 1012])('restores history and authenticates again after close %s', async code => {
-    vi.useFakeTimers(); installBrowser();
-    const credentials = vi.fn(async () => ({ pat: 'secret', environment: 'cn-prod' as const }));
-    const restore = vi.fn(async () => {});
-    const connection = new VoiceConnection({ conversationId: 'conv_1', getCredentials: credentials, beforeReconnect: restore, webSocketFactory: () => new FakeWebSocket() as unknown as WebSocket });
-    await connection.connect();
-    FakeWebSocket.instances[0].emit('close', { code });
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(restore).toHaveBeenCalledOnce();
-    expect(credentials).toHaveBeenCalledTimes(2);
-    expect(FakeWebSocket.instances).toHaveLength(2);
-    connection.disconnect();
-  });
-
-  test('authentication failure does not retry even after a browser error', async () => {
-    vi.useFakeTimers(); installBrowser();
-    const onError = vi.fn();
-    const connection = new VoiceConnection({ conversationId: 'conv_1', getCredentials: async () => ({ pat: 'secret', environment: 'cn-prod' }), onError, webSocketFactory: () => new FakeWebSocket() as unknown as WebSocket });
-    await connection.connect();
-    FakeWebSocket.instances[0].emit('error');
-    FakeWebSocket.instances[0].emit('close', { code: 4401 });
-    await vi.advanceTimersByTimeAsync(60000);
-    expect(FakeWebSocket.instances).toHaveLength(1);
-    expect(onError.mock.calls[0][0].code).toBe('proxy_auth_failed');
-    connection.disconnect();
-  });
-
-  test('readiness timeout closes obsolete sockets and stops after three retries', async () => {
-    vi.useFakeTimers(); installBrowser();
-    const onError = vi.fn();
-    const connection = new VoiceConnection({ conversationId: 'conv_1', getCredentials: async () => ({ pat: 'secret', environment: 'cn-prod' }), onError, webSocketFactory: () => new FakeWebSocket() as unknown as WebSocket });
-    await connection.connect();
-    await vi.advanceTimersByTimeAsync(128000);
-    expect(FakeWebSocket.instances).toHaveLength(4);
-    expect(FakeWebSocket.instances.every(s => s.close.mock.calls.length === 1)).toBe(true);
-    expect(onError.mock.calls[0][0].code).toBe('realtime_connection_failed');
-    connection.disconnect();
-  });
-
-  test('manual disconnect cancels scheduled reconnect', async () => {
-    vi.useFakeTimers(); installBrowser();
-    const connection = new VoiceConnection({ conversationId: 'conv_1', getCredentials: async () => ({ pat: 'secret', environment: 'cn-prod' }), webSocketFactory: () => new FakeWebSocket() as unknown as WebSocket });
-    await connection.connect();
-    FakeWebSocket.instances[0].emit('close', { code: 1012 });
-    connection.disconnect();
-    await vi.advanceTimersByTimeAsync(60000);
-    expect(FakeWebSocket.instances).toHaveLength(1);
-  });
-
 });

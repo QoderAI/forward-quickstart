@@ -6,7 +6,6 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import './utils/env.js';
 import { createVoiceProxy } from './voiceProxy.js';
-import { voiceConfig } from './voiceConfig.js';
 
 // Headroom above the client-side caps (images 10 MB, text files 5 MB) so the
 // friendly client-side validation is what rejects oversized picks, rather than
@@ -24,7 +23,7 @@ const DEFAULT_API_BASE_URLS: Record<ForwardApiEnvironment, string> = {
 const API_BASE_URLS = Object.fromEntries(
   Object.entries(DEFAULT_API_BASE_URLS).map(([key, value]) => [key, value.replace(/\/+$/, '')]),
 ) as Record<ForwardApiEnvironment, string>;
-const voiceProxy = createVoiceProxy(voiceConfig());
+const voiceProxy = createVoiceProxy({ baseUrls: API_BASE_URLS, enabled: !process.env.VERCEL });
 const DEFAULT_CLOUD_API_BASE_URLS: Record<ForwardApiEnvironment, string> = {
   'cn-prod': process.env.CN_PROD_CLOUD_API_BASE_URL?.trim() || 'https://api.qoder.com.cn/api/v1/cloud',
   'global-prod': process.env.GLOBAL_PROD_CLOUD_API_BASE_URL?.trim() || 'https://api.qoder.com/api/v1/cloud',
@@ -37,6 +36,7 @@ const LOG_FILE = join(LOG_DIR, 'forward-proxy.log');
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+app.post('/api/voice/connect', voiceProxy.issueConnectionKey);
 
 function proxyLog(level: 'info' | 'warn', message: string, meta?: Record<string, unknown>) {
   const line = JSON.stringify({
@@ -647,7 +647,7 @@ app.post('/api/cloud/upload', upload.single('file'), makeUploadHandler(CLOUD_API
 app.post('/api/forward/upload', upload.single('file'), makeUploadHandler(API_BASE_URLS, 'forward'));
 
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', forwardApiBaseUrls: API_BASE_URLS, voiceRealtimeProxy: { enabled: voiceProxy.enabled, localOnly: false } });
+  res.json({ status: 'ok', forwardApiBaseUrls: API_BASE_URLS, voiceRealtimeProxy: { enabled: voiceProxy.enabled, localOnly: true } });
 });
 
 export default app;

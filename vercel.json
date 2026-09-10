@@ -1,6 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "fluid": true,
   "installCommand": "npm ci --registry=https://registry.npmjs.org/",
   "buildCommand": "npm run build --workspace=client",
   "outputDirectory": "client/dist",

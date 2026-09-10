@@ -15,24 +15,20 @@ const props = {
   identityId: 'identity-1',
   templateId: 'template-1',
   templateName: '测试模板',
-  selectedVoice: 'longanqian' as const,
   initialConversationId: null,
   autoStart: false,
   launchKey: 1,
   onConversationCreated: vi.fn(),
   onStartFailed: vi.fn(),
+  onNewConversation: vi.fn(),
 };
 
 beforeEach(() => {
   Object.assign(mocks.voice, {
     conversationId: 'conv-1',
-    effectiveVoice: 'longanlingxin',
-    historyWarning: null,
     stage: 'listening',
     timeline: [],
     muted: false,
-    speakerMuted: false,
-    setSpeakerMuted: vi.fn(),
     error: null,
     microphoneWarning: null,
     sendText: vi.fn(() => true),
@@ -92,11 +88,8 @@ describe('VoiceSessionView call controls', () => {
   test('uses an icon-only microphone control with an explicit action label', () => {
     const html = renderToStaticMarkup(<VoiceSessionView {...props} />);
 
-    expect(html).toContain('aria-label="将麦克风静音"');
+    expect(html).toContain('aria-label="静音"');
     expect(html).toContain('<svg');
-    expect(html).toContain('aria-label="将扬声器静音"');
-    expect(html).toContain('aria-label="结束连接"');
-    expect(html.indexOf('将扬声器静音')).toBeLessThan(html.indexOf('将麦克风静音'));
     expect(html).not.toContain('>麦<');
   });
 
@@ -105,24 +98,7 @@ describe('VoiceSessionView call controls', () => {
 
     const html = renderToStaticMarkup(<VoiceSessionView {...props} />);
 
-    expect(html).toContain('aria-label="取消麦克风静音"');
+    expect(html).toContain('aria-label="取消静音"');
     expect(html).not.toContain('>静<');
-  });
-});
-
-describe('VoiceSessionView voice configuration', () => {
-  test('shows the confirmed voice without a duplicate new conversation action', () => {
-    const html = renderToStaticMarkup(<VoiceSessionView {...props} />);
-    expect(html).toContain('音色：龙安灵心');
-    expect(html).not.toContain('换音色 / 新对话');
-    expect(html).not.toContain('<select');
-    expect(html).not.toContain('新对话音色');
-  });
-  test('does not assume a selected voice for unconnected history', () => {
-    mocks.voice.effectiveVoice = null;
-    mocks.voice.stage = 'ended';
-    const html = renderToStaticMarkup(<VoiceSessionView {...props} />);
-    expect(html).toContain('待连接确认');
-    expect(html).toContain('继续语音对话');
   });
 });
