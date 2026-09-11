@@ -77,18 +77,34 @@ test('Vercel entry exports a non-listening server and relays websocket upgrades'
   assert.equal(server.listening, false);
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const base = `127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
-  let socket: WebSocket | undefined;
+  const sockets: WebSocket[] = [];
   t.after(async () => {
     restoreEnv();
-    socket?.terminate();
+    for (const peer of sockets) peer.terminate();
     for (const peer of upstream.clients) peer.terminate();
     await Promise.all([new Promise<void>(r => server.close(() => r())), new Promise<void>(r => upstreamServer.close(() => r()))]);
     upstream.close();
   });
   assert.equal((await fetch(`http://${base}/api/voice/socket`)).status, 426);
-  socket = new WebSocket(`ws://${base}/api/voice/socket`, { headers: { Origin: 'https://deployment-test.vercel.app' } });
+  const socket = new WebSocket(`ws://${base}/api/voice/socket`, { headers: { Origin: 'https://deployment-test.vercel.app' } });
+  sockets.push(socket);
   await once(socket, 'open');
   const message = once(socket, 'message');
   socket.send(JSON.stringify({ type: 'proxy.auth', pat: 'deployment-test', environment: 'cn-prod', conversation_id: 'conv_deployment' }));
   assert.equal((await message)[0].toString(), 'ready');
+  // Same-origin requests (browser Origin matching the routed Host) are
+  // allowed even when the Host is not one of the configured domains.
+  const sameOrigin = new WebSocket(`ws://${base}/api/voice/socket`, { headers: { Origin: `https://${base}` } });
+  sockets.push(sameOrigin);
+  await once(sameOrigin, 'open');
+  const sameOriginMessage = once(sameOrigin, 'message');
+  sameOrigin.send(JSON.stringify({ type: 'proxy.auth', pat: 'deployment-test', environment: 'cn-prod', conversation_id: 'conv_deployment' }));
+  assert.equal((await sameOriginMessage)[0].toString(), 'ready');
+  // Foreign origins stay rejected.
+  const foreign = new WebSocket(`ws://${base}/api/voice/socket`, { headers: { Origin: 'https://foreign.example' } });
+  sockets.push(foreign);
+  foreign.on('error', () => {});
+  const [, foreignResponse] = await once(foreign, 'unexpected-response') as unknown as [unknown, { statusCode: number; resume: () => void }];
+  assert.equal(foreignResponse.statusCode, 403);
+  foreignResponse.resume();
 });

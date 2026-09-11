@@ -38,7 +38,13 @@ export function createVoiceProxy(options: {
     server.on('upgrade', (request, socket, head) => {
       const url = new URL(request.url || '/', 'http://localhost');
       const origin = request.headers.origin;
-      const allowed = !!origin && (allowedOrigins.has(origin) || ((options.allowLocal ?? true) && isAllowedLocalOrigin(origin)));
+      // Vercel reports only one production domain in VERCEL_PROJECT_PRODUCTION_URL
+      // even when several are bound to the project, so additionally accept
+      // same-origin requests whose browser Origin matches the routed Host.
+      const host = request.headers.host;
+      const allowed = !!origin && (allowedOrigins.has(origin)
+        || (typeof host === 'string' && origin === `https://${host}`)
+        || ((options.allowLocal ?? true) && isAllowedLocalOrigin(origin)));
       const status = url.pathname !== '/api/voice/socket' ? 404 : !enabled || !allowed ? 403 : url.search ? 400 : 0;
       if (status) {
         socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);

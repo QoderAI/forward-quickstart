@@ -132,7 +132,7 @@ Voice 支持本地运行和按下文配置的 Vercel 部署。首次启动语音
 
 - 本地运行继续使用 `npm run dev`，Vite 会将 `/api` 请求代理到本地 Express 服务。
 - Vercel 会构建 `client/dist` 并将现有 Express API 作为 Serverless Functions 部署；前端和 API 使用同一域名。
-- Voice 使用 `api/voice/socket.ts` 导出的 HTTP Server 接收 WebSocket upgrade，与本地共用中继实现。`vercel.json` 启用 Fluid Compute，并将函数最长执行时间设为 300 秒。
+- Voice 使用 `api/voice/socket.ts` 导出的 HTTP Server 接收 WebSocket upgrade，与本地共用中继实现。Vercel 上接受与访问域名同源（Origin 与 Host 一致）以及 `VERCEL_URL`、`VERCEL_PROJECT_PRODUCTION_URL` 或 `VOICE_ALLOWED_ORIGINS` 列出的来源。`vercel.json` 启用 Fluid Compute，并将函数最长执行时间设为 300 秒。
 
 建议先 Fork 本仓库到自己的 GitHub 账号，再在 Vercel 导入 Fork 后的仓库，Root Directory 使用仓库根目录。Vercel 检测到根目录的 `vercel.json` 后会自动使用正确的构建命令和 API 函数配置。
 
