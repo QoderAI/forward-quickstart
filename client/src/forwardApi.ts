@@ -1108,13 +1108,22 @@ export async function sendCustomToolResult(
   );
 }
 
-export async function listEvents(ctx: ForwardContext, sessionId: string) {
+export async function listEvents(
+  ctx: ForwardContext,
+  sessionId: string,
+  opts: { afterId?: string } = {},
+) {
   return forwardRequest<Page<ForwardEvent>>(
     ctx,
     'GET',
     `/sessions/${encodeURIComponent(sessionId)}/events`,
     undefined,
-    { limit: 100, order: 'desc', types: LIST_EVENT_TYPES },
+    {
+      limit: 100,
+      order: 'desc',
+      types: LIST_EVENT_TYPES,
+      ...(opts.afterId ? { after_id: opts.afterId } : {}),
+    },
   );
 }
 

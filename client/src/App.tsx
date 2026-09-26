@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import {
   cancelSession,
   createCloudEnvironment,
@@ -955,6 +955,14 @@ function deduplicateAgentMessageList(events: ForwardEvent[]): ForwardEvent[] {
     result.push(event);
   }
   return result;
+}
+
+function mergeHistoricalEvents(current: ForwardEvent[], older: ForwardEvent[]) {
+  const currentIds = new Set(current.map((event) => event.id));
+  return sortEventsForView([
+    ...older.filter((event) => !currentIds.has(event.id)),
+    ...current,
+  ]);
 }
 
 function mergeIncomingEvents(prev: ForwardEvent[], incoming: ForwardEvent[]) {
@@ -2388,6 +2396,8 @@ export default function App() {
   const [currentVoiceConversationId, setCurrentVoiceConversationId] = useState<string | null>(null);
   const [voiceLaunchKey, setVoiceLaunchKey] = useState(0);
   const [events, setEvents] = useState<ForwardEvent[]>([]);
+  const [eventsHasMore, setEventsHasMore] = useState(false);
+  const [loadingOlderEvents, setLoadingOlderEvents] = useState(false);
   const [input, setInput] = useState('');
   const [showThinking, setShowThinking] = useState<boolean>(() => {
     try { return localStorage.getItem('show_thinking') !== '0'; } catch { return true; }
@@ -2561,6 +2571,14 @@ export default function App() {
   const userMenuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  const eventHistoryGenerationRef = useRef(0);
+  const olderEventsCursorRef = useRef<{ sessionId: string; cursor: string } | null>(null);
+  const loadingOlderEventsRef = useRef<string | null>(null);
+  const pendingHistoryScrollRef = useRef<{
+    sessionId: string;
+    scrollHeight: number;
+    scrollTop: number;
+  } | null>(null);
   // Whether the chat should auto-stick to the bottom. Turns off when the user
   // scrolls up, so streaming updates during a running task won't yank them back.
   const stickToBottomRef = useRef(true);
@@ -2698,6 +2716,65 @@ export default function App() {
 
   useEffect(() => () => streamAbort.current?.abort(), []);
 
+  const loadOlderEvents = useCallback(async () => {
+    const sessionId = currentSessionIdRef.current;
+    const cursorState = olderEventsCursorRef.current;
+    if (
+      !ctx ||
+      !sessionId ||
+      cursorState?.sessionId !== sessionId ||
+      !eventsHasMore ||
+      loadingOlderEventsRef.current === sessionId ||
+      !chatScrollRef.current
+    ) return;
+
+    const cursor = cursorState.cursor;
+    const generation = eventHistoryGenerationRef.current;
+    loadingOlderEventsRef.current = sessionId;
+    setLoadingOlderEvents(true);
+    setError('');
+    try {
+      const page = await listEvents(ctx, sessionId, { afterId: cursor });
+      const scrollElement = chatScrollRef.current;
+      if (
+        currentSessionIdRef.current !== sessionId ||
+        eventHistoryGenerationRef.current !== generation ||
+        !scrollElement
+      ) return;
+      const chronologicalData = [...page.data].reverse();
+      // Snapshot after the request completes so events streamed while it was in
+      // flight are not mistaken for prepended history in the height adjustment.
+      pendingHistoryScrollRef.current = {
+        sessionId,
+        scrollHeight: scrollElement.scrollHeight,
+        scrollTop: scrollElement.scrollTop,
+      };
+      setEvents((prev) => mergeHistoricalEvents(prev, chronologicalData));
+      const nextCursor = page.last_id || undefined;
+      olderEventsCursorRef.current = nextCursor ? { sessionId, cursor: nextCursor } : null;
+      setEventsHasMore(Boolean(page.has_more && nextCursor && nextCursor !== cursor));
+    } catch (err) {
+      if (currentSessionIdRef.current === sessionId) {
+        setError(`加载历史记录失败：${err instanceof Error ? err.message : String(err)}`);
+      }
+    } finally {
+      if (eventHistoryGenerationRef.current === generation) {
+        if (loadingOlderEventsRef.current === sessionId) loadingOlderEventsRef.current = null;
+        if (currentSessionIdRef.current === sessionId) setLoadingOlderEvents(false);
+      }
+    }
+  }, [ctx, eventsHasMore]);
+
+  // Prepending an older page increases scrollHeight. Restore the same visible
+  // message after React commits so loading history never jumps the user upward.
+  useLayoutEffect(() => {
+    const pending = pendingHistoryScrollRef.current;
+    const scrollElement = chatScrollRef.current;
+    if (!pending || !scrollElement || currentSessionIdRef.current !== pending.sessionId) return;
+    scrollElement.scrollTop = pending.scrollTop + (scrollElement.scrollHeight - pending.scrollHeight);
+    pendingHistoryScrollRef.current = null;
+  }, [events]);
+
   // Track whether the user is pinned to the bottom of the chat. When they scroll
   // up during a running task, we stop auto-scrolling to preserve their position.
   const handleChatScroll = useCallback(() => {
@@ -2705,7 +2782,8 @@ export default function App() {
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     stickToBottomRef.current = distanceFromBottom < 80;
-  }, []);
+    if (el.scrollTop < 80) void loadOlderEvents();
+  }, [loadOlderEvents]);
 
   // Auto-scroll to bottom on new events only when the user is already at the bottom.
   useEffect(() => {
@@ -2805,8 +2883,14 @@ export default function App() {
 
   const loadSessionEvents = useCallback(async (sessionId: string) => {
     if (!ctx || !sessionId) return;
+    const generation = ++eventHistoryGenerationRef.current;
     const page = await listEvents(ctx, sessionId);
-    // Events are returned in descending order (newest first), reverse to chronological order
+    if (currentSessionIdRef.current !== sessionId || eventHistoryGenerationRef.current !== generation) return;
+    // Events are returned in descending order (newest first), reverse to chronological order.
+    olderEventsCursorRef.current = page.last_id ? { sessionId, cursor: page.last_id } : null;
+    loadingOlderEventsRef.current = null;
+    setLoadingOlderEvents(false);
+    setEventsHasMore(Boolean(page.has_more && olderEventsCursorRef.current));
     setEvents([...page.data].reverse());
   }, [ctx]);
 
@@ -3790,8 +3874,14 @@ export default function App() {
     setActivePanel('chat');
     stickToBottomRef.current = true;
     currentSessionIdRef.current = sessionId;
+    const generation = ++eventHistoryGenerationRef.current;
+    olderEventsCursorRef.current = null;
+    pendingHistoryScrollRef.current = null;
+    loadingOlderEventsRef.current = null;
     setCurrentSessionId(sessionId);
     setEvents([]);
+    setEventsHasMore(false);
+    setLoadingOlderEvents(false);
     setError('');
     setSessionLoading(true);
     streamAbort.current?.abort();
@@ -3807,8 +3897,13 @@ export default function App() {
     setCurrentVoiceConversationId(null);
     try {
       const page = await listEvents(ctx!, sessionId);
-      // Events are returned in descending order (newest first), reverse to chronological order
+      if (currentSessionIdRef.current !== sessionId || eventHistoryGenerationRef.current !== generation) return;
+      // Events are returned in descending order (newest first), reverse to chronological order.
       const chronologicalData = [...page.data].reverse();
+      olderEventsCursorRef.current = page.last_id ? { sessionId, cursor: page.last_id } : null;
+      loadingOlderEventsRef.current = null;
+      setLoadingOlderEvents(false);
+      setEventsHasMore(Boolean(page.has_more && olderEventsCursorRef.current));
       setEvents(chronologicalData);
       // Check if session is still active and restart stream if needed
       const session = sessions.find((s) => s.id === sessionId);
@@ -5927,6 +6022,18 @@ export default function App() {
                 {!voiceViewOpen && events.length > 0 && (
                   <div ref={chatScrollRef} onScroll={handleChatScroll} className="min-h-0 flex-1 overflow-y-auto px-8">
                     <div className="mx-auto flex max-w-[860px] flex-col py-6">
+                    {eventsHasMore && olderEventsCursorRef.current?.sessionId === currentSessionId && (
+                      <div className="mb-4 flex justify-center">
+                        <button
+                          type="button"
+                          onClick={() => void loadOlderEvents()}
+                          disabled={loadingOlderEvents}
+                          className="rounded-full border border-[#DDE2F2] bg-white px-4 py-2 text-xs text-black/50 transition hover:border-[#3550FF] hover:text-[#3550FF] disabled:opacity-50"
+                        >
+                          {loadingOlderEvents ? '正在加载历史记录...' : '加载更早记录'}
+                        </button>
+                      </div>
+                    )}
                     <div className="space-y-4 pb-8">
                       {events.map((event, index) => {
                         const kind = eventViewKind(event);

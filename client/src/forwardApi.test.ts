@@ -64,6 +64,32 @@ describe('listEvents', () => {
     });
     expect(requestBody.query).not.toHaveProperty('types[]');
   });
+
+  test('uses the previous page last id to load older events', async () => {
+    let requestBody: { query?: Record<string, unknown> } = {};
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        data: [{ id: 'evt_older', type: 'user.message', session_id: 'sess_123' }],
+        last_id: 'evt_older',
+        has_more: false,
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    const ctx: ForwardContext = { pat: 'pat_test', environment: 'cn-pre' };
+    const page = await listEvents(ctx, 'sess_123', { afterId: 'evt_cursor' });
+
+    expect(requestBody.query).toMatchObject({
+      after_id: 'evt_cursor',
+      limit: 100,
+      order: 'desc',
+    });
+    expect(page.last_id).toBe('evt_older');
+    expect(page.has_more).toBe(false);
+  });
 });
 
 describe('memory store endpoints', () => {
