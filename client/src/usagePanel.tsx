@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   listIdentityUsage,
   listSessionsPage,
@@ -11,7 +11,6 @@ import {
 import {
   DASH,
   WINDOW_PRESETS,
-  averageCredits,
   dailyCreditSeries,
   dayLabel,
   formatCount,
@@ -82,77 +81,85 @@ export function UsagePanel({ ctx, identityId, displayName, getModelLabel }: {
   const [error, setError] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('credits');
 
-  // Recomputed per preset change; `resolveWindow` clamps to the API's 31-day cap.
-  // Not named `window`: that would shadow the global used for timers below.
-  const activeWindow = useMemo(() => resolveWindow(preset), [preset]);
+  const [refreshAt, setRefreshAt] = useState(() => Date.now());
+  const generation = useRef(0);
+  // One immutable hourly window for aggregates, ledger pages and the chart.
+  const activeWindow = useMemo(() => resolveWindow(preset, refreshAt), [preset, refreshAt]);
 
   const load = useCallback(async () => {
     if (!ctx || !identityId) return;
+    const request = ++generation.current;
+    setLoadingMore(false);
     setLoading(true);
     setError('');
     try {
-      const { startMs, endMs } = resolveWindow(preset);
+      const { startMs, endMs } = activeWindow;
       // The authoritative totals and the itemized ledger come from different
       // endpoints, so fetch them together rather than serially.
       const [identityUsage, templateUsage, page] = await Promise.all([
         listIdentityUsage(ctx, { startMs, endMs, identityId }),
         listTemplateUsage(ctx, { startMs, endMs, identityId }),
-        listSessionsPage(ctx, {
+        startMs === endMs ? Promise.resolve({ data: [], has_more: false }) : listSessionsPage(ctx, {
           identityIds: identityId,
           createdAtGte: toRfc3339(startMs),
-          createdAtLte: toRfc3339(endMs),
+          createdAtLt: toRfc3339(endMs),
           limit: PAGE_SIZE,
           includeArchived: true,
           order: 'desc',
         }),
       ]);
+      if (request !== generation.current) return;
       setIdentityRow(identityUsage.data?.[0] ?? null);
       setTemplateRows(templateUsage.data ?? []);
       setSessions(page.data ?? []);
       setHasMore(Boolean(page.has_more));
     } catch (err) {
+      if (request !== generation.current) return;
       setError(err instanceof Error ? err.message : String(err));
       setIdentityRow(null);
       setTemplateRows([]);
       setSessions([]);
       setHasMore(false);
     } finally {
-      setLoading(false);
+      if (request === generation.current) setLoading(false);
     }
-  }, [ctx, identityId, preset]);
+  }, [ctx, identityId, activeWindow]);
 
   const loadMore = useCallback(async () => {
     if (!ctx || !identityId || sessions.length === 0) return;
+    const request = generation.current;
     setLoadingMore(true);
     setError('');
     try {
-      const { startMs, endMs } = resolveWindow(preset);
+      const { startMs, endMs } = activeWindow;
       const page = await listSessionsPage(ctx, {
         identityIds: identityId,
         createdAtGte: toRfc3339(startMs),
-        createdAtLte: toRfc3339(endMs),
+        createdAtLt: toRfc3339(endMs),
         limit: PAGE_SIZE,
         afterId: sessions[sessions.length - 1]?.id,
         includeArchived: true,
         order: 'desc',
       });
+      if (request !== generation.current) return;
       setSessions((prev) => {
         const seen = new Set(prev.map((s) => s.id));
         return [...prev, ...(page.data ?? []).filter((s) => !seen.has(s.id))];
       });
       setHasMore(Boolean(page.has_more));
     } catch (err) {
+      if (request !== generation.current) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoadingMore(false);
+      if (request === generation.current) setLoadingMore(false);
     }
-  }, [ctx, identityId, preset, sessions]);
+  }, [ctx, identityId, activeWindow, sessions]);
 
   // Deferred by a 0ms timer for the same reason batchPanel does it: the loader
   // flips loading state synchronously, which must not happen inside the effect body.
   useEffect(() => {
     const timer = window.setTimeout(() => void load(), 0);
-    return () => window.clearTimeout(timer);
+    return () => { window.clearTimeout(timer); generation.current += 1; };
   }, [load]);
 
   // ── Derived views ──
@@ -161,8 +168,9 @@ export function UsagePanel({ ctx, identityId, displayName, getModelLabel }: {
   const totalCredits = identityRow?.credits ?? null;
   const creditsUnavailable = identityRow != null && identityRow.credits == null;
   const sessionCount = identityRow?.session_count ?? null;
-  const durationSeconds = identityRow?.duration_seconds ?? null;
-  const avgPerSession = useMemo(() => averageCredits(sessions), [sessions]);
+  const durationSeconds = identityRow?.active_seconds ?? null;
+  const avgPerSession = totalCredits != null && sessionCount != null && sessionCount > 0
+    ? totalCredits / sessionCount : null;
   const ledgerSum = useMemo(() => sumSessionCredits(sessions), [sessions]);
 
   const series = useMemo(() => dailyCreditSeries(sessions, activeWindow), [sessions, activeWindow]);
@@ -196,9 +204,8 @@ export function UsagePanel({ ctx, identityId, displayName, getModelLabel }: {
     return rows;
   }, [sessions, sortKey]);
 
-  // The trend and the average are derived from loaded rows only, so say so when
-  // the window holds more than we have.
-  const partial = sessionCount != null && sessions.length < sessionCount;
+  // The ledger has its own pagination and can include sessions absent from usage.
+  const partial = hasMore;
 
   return (
     <div className="h-full overflow-y-auto bg-[#FAFBFF]">
@@ -216,7 +223,7 @@ export function UsagePanel({ ctx, identityId, displayName, getModelLabel }: {
               <button
                 key={value}
                 type="button"
-                onClick={() => setPreset(value)}
+                onClick={() => { setPreset(value); setRefreshAt(Date.now()); }}
                 className={`rounded-full px-3.5 py-1.5 text-xs font-medium transition ${
                   preset === value ? 'bg-[#3550FF] text-white' : 'bg-white text-black/55 shadow-[inset_0_0_0_1px_#2F3A801A] hover:text-black'
                 }`}
@@ -225,11 +232,11 @@ export function UsagePanel({ ctx, identityId, displayName, getModelLabel }: {
               </button>
             ))}
             <span className="ml-2 font-mono text-[11px] text-black/30">
-              {new Date(activeWindow.startMs).toLocaleDateString()} – {new Date(activeWindow.endMs).toLocaleDateString()}
+              {new Date(activeWindow.startMs).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' })} – 截至 {new Date(activeWindow.endMs).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间，当前小时未计入）
             </span>
           </div>
           <button
-            onClick={() => void load()}
+            onClick={() => setRefreshAt(Date.now())}
             disabled={!ctx || loading}
             className="rounded-full border border-[#D9DCEA] bg-white px-4 py-2 text-xs font-medium text-black/65 transition hover:bg-[#F8F9FC] disabled:opacity-45"
           >
@@ -257,7 +264,7 @@ export function UsagePanel({ ctx, identityId, displayName, getModelLabel }: {
           <StatCard
             label="平均每会话"
             value={formatCredits(avgPerSession)}
-            hint={partial ? `基于已加载 ${sessions.length} 条` : undefined}
+            hint={identityRow ? '来自官方用量汇总' : undefined}
           />
           <StatCard label="运行时长" value={formatDuration(durationSeconds)} />
         </div>
@@ -331,14 +338,14 @@ export function UsagePanel({ ctx, identityId, displayName, getModelLabel }: {
             <div>
               <h2 className="text-sm font-semibold text-black">Credit 消耗记录</h2>
               <p className="mt-1 text-xs text-black/40">
-                按会话逐条列出该时间段的 Credit 消耗
+                按创建时间筛选会话，显示各会话累计消耗；统计口径与上方时段汇总不同
                 {ledgerSum.unknown > 0 && `，其中 ${ledgerSum.unknown} 条无 Credit 数据`}
               </p>
             </div>
             <div className="flex items-center gap-3">
               <span className="text-[11px] text-black/35">
                 已加载 {formatCount(sessions.length)}
-                {sessionCount != null && ` / 共 ${formatCount(sessionCount)}`} 条
+                {hasMore ? ' 条（还有更多）' : ' 条（已全部加载）'}
                 <span className="mx-1.5 text-black/20">·</span>
                 小计 {formatCredits(ledgerSum.total)}
               </span>

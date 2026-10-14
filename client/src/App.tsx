@@ -7,6 +7,7 @@ import {
   deleteForwardFile,
   getCloudFile,
   downloadCloudFile,
+  previewCloudFile,
   type CloudFile,
   deleteCloudSkill,
   deleteCloudEnvironment,
@@ -80,7 +81,7 @@ import {
 } from './forwardApi';
 import { renderMarkdown } from './markdown';
 import { ChatImage } from './chatImage';
-import { isImageFile } from './imageUtils';
+import { loadArtifactPreview } from './artifactPreview';
 import { BatchPanel } from './batchPanel';
 import { UsagePanel } from './usagePanel';
 import type { RealtimeVoice } from './voice/voiceApi';
@@ -303,26 +304,8 @@ function readSavedAuth() {
   }
 }
 
-function localApiBase() {
-  return window.location.port === '5173' ? 'http://localhost:3001' : '';
-}
-
-async function fetchAuthorizedPreviewObjectUrl(ctx: ForwardContext, apiPath: string) {
-  const params = new URLSearchParams({ environment: ctx.environment });
-  const response = await fetch(`${localApiBase()}${apiPath}?${params.toString()}`, {
-    headers: { Authorization: `Bearer ${ctx.pat}` },
-  });
-  if (!response.ok) throw new Error(`Preview failed: ${response.status}`);
-  return URL.createObjectURL(await response.blob());
-}
-
 async function fetchFilePreviewObjectUrl(ctx: ForwardContext, fileId: string) {
-  const encoded = encodeURIComponent(fileId);
-  try {
-    return await fetchAuthorizedPreviewObjectUrl(ctx, `/api/forward/files/${encoded}/preview`);
-  } catch (err) {
-    return fetchAuthorizedPreviewObjectUrl(ctx, `/api/cloud/files/${encoded}/preview`);
-  }
+  return URL.createObjectURL(await previewCloudFile(ctx, fileId));
 }
 
 /** Resolve a signed download URL for the file and hand it to the browser
@@ -1192,25 +1175,13 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
     if (!ctx) return;
     let cancelled = false;
     let objectUrl = '';
-    void getCloudFile(ctx, fileId)
-      .then((file) => {
+    void loadArtifactPreview(ctx, fileId)
+      .then(({ file, image }) => {
         if (cancelled) return;
         setMeta(file);
-        // 图片类型：通过服务端代理预览（绕过 OSS CORS 和 attachment 头）
-        // dev 模式下直接请求 Express 端口（3001）避免 Vite proxy 覆盖 Content-Type；
-        // 生产环境同源，用相对路径即可。
-        if (isImageFile(file)) {
-          return fetchFilePreviewObjectUrl(ctx, fileId)
-            .then((previewUrl) => {
-              objectUrl = previewUrl;
-              if (cancelled) {
-                URL.revokeObjectURL(previewUrl);
-                return;
-              }
-              setImageUrl(previewUrl);
-            });
-        }
-        return undefined;
+        if (!image) return;
+        objectUrl = URL.createObjectURL(image);
+        setImageUrl(objectUrl);
       })
       .catch(() => { /* filename is best-effort; keep showing the id */ });
     return () => {
@@ -3568,7 +3539,7 @@ export default function App() {
   const activeResourceLabel = RESOURCE_TYPE_LABELS[activeResourceType];
 
   const handleCreateResource = useCallback(async () => {
-    if (!ctx || !newResName.trim()) return;
+    if (!ctx || (activeResourceType !== 'skill' && !newResName.trim())) return;
     setLoading(true);
     setError('');
     try {
@@ -3585,7 +3556,7 @@ export default function App() {
         }
         case 'skill': {
           if (!newResFile) throw new Error('请选择技能文件（.zip 格式，包含 SKILL.md）');
-          await uploadCloudSkill(ctx, { name, description: desc || undefined, file: newResFile });
+          await uploadCloudSkill(ctx, { file: newResFile });
           break;
         }
         case 'file': {
@@ -6838,18 +6809,18 @@ export default function App() {
           </div>
 
           {/* Name field */}
-          <label className="block">
+          {activeResourceType !== 'skill' && <label className="block">
             <span className="mb-1.5 block text-xs font-medium text-black/50">
               {activeResourceType === 'vault' ? '密钥库名称' : activeResourceType === 'file' ? '文件名' : '名称'} <span className="text-red-400">*</span>
             </span>
             <input
               value={newResName}
               onChange={(e) => setNewResName(e.target.value)}
-              placeholder={activeResourceType === 'skill' ? '例如：customer-reply-skill' : activeResourceType === 'file' ? '例如：config.yaml' : activeResourceType === 'vault' ? '例如：MCP 服务密钥' : '例如：开发环境'}
+              placeholder={activeResourceType === 'file' ? '例如：config.yaml' : activeResourceType === 'vault' ? '例如：MCP 服务密钥' : '例如：开发环境'}
               className="h-11 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none transition focus:border-[#3550FF] focus:shadow-[0_0_0_3px_rgba(53,80,255,0.08)]"
               autoFocus
             />
-          </label>
+          </label>}
 
           {/* File upload */}
           {(activeResourceType === 'skill' || activeResourceType === 'file') && (
@@ -6866,7 +6837,7 @@ export default function App() {
                 />
               </div>
               {activeResourceType === 'skill' && (
-                <div className="mt-1.5 text-[11px] text-black/35">ZIP 文件须包含 SKILL.md（含 YAML frontmatter: name, description）</div>
+                <div className="mt-1.5 text-[11px] text-black/35">名称和描述取自 ZIP 包内 SKILL.md 的 name、description 字段。</div>
               )}
               {newResFile && (
                 <div className="mt-2 flex items-center gap-2 rounded-lg bg-[#3550FF]/5 px-3 py-2">
@@ -6879,7 +6850,7 @@ export default function App() {
           )}
 
           {/* Description */}
-          {activeResourceType !== 'file' && (
+          {activeResourceType !== 'file' && activeResourceType !== 'skill' && (
             <label className="block">
               <span className="mb-1.5 block text-xs font-medium text-black/50">描述（可选）</span>
               <input
@@ -6926,7 +6897,7 @@ export default function App() {
           {/* Submit */}
           <button
             onClick={() => void handleCreateResource()}
-            disabled={!ctx || loading || !newResName.trim() || ((activeResourceType === 'skill' || activeResourceType === 'file') && !newResFile)}
+            disabled={!ctx || loading || (activeResourceType !== 'skill' && !newResName.trim()) || ((activeResourceType === 'skill' || activeResourceType === 'file') && !newResFile)}
             className="flex h-12 w-full items-center justify-center rounded-xl bg-[#3550FF] text-sm font-semibold text-white transition hover:bg-[#2a42e0] disabled:cursor-not-allowed disabled:opacity-40"
           >
             {loading ? (

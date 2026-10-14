@@ -1,3 +1,4 @@
+import { toUsageHour } from './credits';
 export const DEFAULT_FORWARD_ENVIRONMENT_ID = 'env_019ef4d7c6c9742fa028eeed7ec232b5';
 
 export type ForwardApiEnvironment = 'cn-prod' | 'global-prod';
@@ -189,6 +190,7 @@ export async function forwardRequest<T>(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       pat: ctx.pat,
+      authMode: ctx.authMode,
       environment: ctx.environment,
       method,
       path,
@@ -248,6 +250,7 @@ async function cloudRequest<T>(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       pat: ctx.pat,
+      authMode: ctx.authMode,
       environment: ctx.environment,
       method,
       path,
@@ -378,15 +381,15 @@ export async function getCloudSkill(ctx: ForwardContext, skillId: string) {
 
 export async function uploadCloudSkill(
   ctx: ForwardContext,
-  input: { name: string; description?: string; file: File },
+  input: { name?: string; description?: string; file: File },
 ) {
   const uploadForm = new FormData();
   uploadForm.append('pat', ctx.pat);
   uploadForm.append('environment', ctx.environment);
+  uploadForm.append('authMode', ctx.authMode || 'pat');
   uploadForm.append('path', '/skills');
   uploadForm.append('file', input.file);
-  uploadForm.append('name', input.name);
-  if (input.description) uploadForm.append('description', input.description);
+  // Skill name and description are read from the uploaded SKILL.md.
 
   // Forward-layer multipart upload (server forwards to /api/v1/forward/skills).
   const uploadRes = await fetch('/api/forward/upload', {
@@ -466,6 +469,7 @@ export async function uploadCloudFile(
   const uploadForm = new FormData();
   uploadForm.append('pat', ctx.pat);
   uploadForm.append('environment', ctx.environment);
+  uploadForm.append('authMode', ctx.authMode || 'pat');
   uploadForm.append('path', '/files');
   uploadForm.append('file', input.file);
   if (input.name) uploadForm.append('name', input.name);
@@ -500,6 +504,23 @@ export async function downloadCloudFile(ctx: ForwardContext, fileId: string) {
       return cloudRequest<{ url: string; expires_at?: string }>(ctx, 'GET', path);
     }
     throw err;
+  }
+}
+
+export async function previewCloudFile(ctx: ForwardContext, fileId: string): Promise<Blob> {
+  const base = typeof window !== 'undefined' && window.location.port === '5173' ? 'http://localhost:3001' : '';
+  const query = new URLSearchParams({ environment: ctx.environment, authMode: ctx.authMode || 'pat' });
+  const preview = async (layer: 'forward' | 'cloud') => {
+    const response = await fetch(`${base}/api/${layer}/files/${encodeURIComponent(fileId)}/preview?${query}`, {
+      headers: { Authorization: `Bearer ${ctx.pat}` },
+    });
+    if (!response.ok) throw new ForwardApiError(response.status, `Preview failed: ${response.status}`, response.headers.get('x-request-id') || undefined);
+    return response.blob();
+  };
+  try { return await preview('forward'); }
+  catch (error) {
+    if (canUseCloudFileFallback(ctx) && error instanceof ForwardApiError && error.status === 404) return preview('cloud');
+    throw error;
   }
 }
 
@@ -884,6 +905,7 @@ export async function listSessionsPage(
     templateId?: string;
     createdAtGte?: string;
     createdAtLte?: string;
+    createdAtLt?: string;
     limit?: number;
     afterId?: string;
     includeArchived?: boolean;
@@ -896,6 +918,7 @@ export async function listSessionsPage(
     ...(opts.templateId ? { template_id: opts.templateId } : {}),
     ...(opts.createdAtGte ? { 'created_at[gte]': opts.createdAtGte } : {}),
     ...(opts.createdAtLte ? { 'created_at[lte]': opts.createdAtLte } : {}),
+    ...(opts.createdAtLt ? { 'created_at[lt]': opts.createdAtLt } : {}),
     ...(opts.afterId ? { after_id: opts.afterId } : {}),
     include_archived: opts.includeArchived ?? true,
     order: opts.order ?? 'desc',
@@ -905,57 +928,63 @@ export async function listSessionsPage(
 }
 
 // ─── Usage / credits ──────────────────────────────────────────────
-// Both endpoints take start_time/end_time as Unix MILLISECONDS (start inclusive,
-// end exclusive) and reject any span over 31 days with
-// 400 "time range must not exceed 31 days". `credits` is null when credit lookup
-// is unavailable, which is not the same as zero.
-
+// Aggregates use inclusive/exclusive whole hours in Asia/Shanghai.
+// Missing credits remain unknown; fractional active_seconds are preserved.
 export interface IdentityUsageRow {
   type: string;
   identity_id: string;
   session_count: number;
-  duration_seconds: number;
+  active_seconds: number;
   credits: number | null;
-  session_ids?: string[];
 }
-
 export interface TemplateUsageRow {
   type: string;
   template_id: string;
   active_identities: number;
   session_count: number;
-  duration_seconds: number;
+  active_seconds: number;
   credits: number | null;
 }
-
 interface UsageEnvelope<T> {
-  type: string;
-  start_time: number;
-  end_time: number;
   data: T[];
+  has_more?: boolean;
+  last_id?: string;
+  start_at?: string;
+  end_at?: string;
 }
-
-export async function listIdentityUsage(
-  ctx: ForwardContext,
-  opts: { startMs: number; endMs: number; identityId?: string },
-) {
-  return forwardRequest<UsageEnvelope<IdentityUsageRow>>(ctx, 'GET', '/usage/identities', undefined, {
-    start_time: Math.floor(opts.startMs),
-    end_time: Math.floor(opts.endMs),
-    ...(opts.identityId ? { identity_id: opts.identityId } : {}),
-  });
-}
-
-export async function listTemplateUsage(
-  ctx: ForwardContext,
+async function listUsage<T extends { credits: number | null }>(
+  ctx: ForwardContext, path: string,
   opts: { startMs: number; endMs: number; identityId?: string; templateId?: string },
-) {
-  return forwardRequest<UsageEnvelope<TemplateUsageRow>>(ctx, 'GET', '/usage/templates', undefined, {
-    start_time: Math.floor(opts.startMs),
-    end_time: Math.floor(opts.endMs),
-    ...(opts.identityId ? { identity_id: opts.identityId } : {}),
-    ...(opts.templateId ? { template_id: opts.templateId } : {}),
-  });
+): Promise<UsageEnvelope<T>> {
+  const hour = 3_600_000;
+  if (![opts.startMs, opts.endMs].every(v => Number.isFinite(v) && v % hour === 0)
+    || opts.endMs < opts.startMs || opts.endMs - opts.startMs > 744 * hour) {
+    throw new ForwardApiError(400, '用量查询需要整点时间，范围不能超过 744 小时');
+  }
+  const query = { start_at: toUsageHour(opts.startMs), end_at: toUsageHour(opts.endMs), limit: 100,
+    ...(opts.identityId ? { identity_ids: [opts.identityId] } : {}),
+    ...(opts.templateId ? { template_ids: [opts.templateId] } : {}),
+  };
+  if (opts.startMs === opts.endMs) return { data: [], has_more: false, start_at: query.start_at, end_at: query.end_at };
+  const data: T[] = [];
+  const seen = new Set<string>();
+  let after: string | undefined;
+  let page: UsageEnvelope<T>;
+  do {
+    page = await forwardRequest<UsageEnvelope<T>>(ctx, 'GET', path, undefined, { ...query, ...(after ? { after_id: after } : {}) });
+    data.push(...page.data.map(row => ({ ...row, credits: typeof row.credits === 'number' && Number.isFinite(row.credits) ? row.credits : null })));
+    if (!page.has_more) break;
+    if (!page.last_id || seen.has(page.last_id)) throw new ForwardApiError(502, '用量分页游标没有推进');
+    after = page.last_id;
+    seen.add(after);
+  } while (page.has_more);
+  return { ...page, data, has_more: false };
+}
+export function listIdentityUsage(ctx: ForwardContext, opts: { startMs: number; endMs: number; identityId?: string }) {
+  return listUsage<IdentityUsageRow>(ctx, '/usage/identities', opts);
+}
+export function listTemplateUsage(ctx: ForwardContext, opts: { startMs: number; endMs: number; identityId?: string; templateId?: string }) {
+  return listUsage<TemplateUsageRow>(ctx, '/usage/templates', opts);
 }
 
 export async function createSession(
@@ -1152,6 +1181,7 @@ export async function streamEvents(
   lastEventId?: string,
 ) {
   const params = new URLSearchParams({
+    authMode: ctx.authMode || 'pat',
     environment: ctx.environment,
   });
   // Connect directly to Express server (port 3001) for SSE to bypass Vite proxy buffering

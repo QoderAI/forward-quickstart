@@ -20,12 +20,12 @@ export function isValidVoiceServerEvent(value: unknown, conversationId: string):
   const event = value as Partial<VoiceServerEvent>;
   const validWorkId = event.work_id === undefined || (typeof event.work_id === 'string' && !!event.work_id);
   const validAnnouncementId = event.announcement_id === undefined || (typeof event.announcement_id === 'string' && !!event.announcement_id);
-  return event.version === VERSION && typeof event.type === 'string' && !!event.type && typeof event.event_id === 'string' && !!event.event_id && Number.isInteger(event.sequence) && Number(event.sequence) > 0 && event.conversation_id === conversationId && typeof event.timestamp === 'string' && !!event.timestamp && validWorkId && validAnnouncementId && !!event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload);
+  return event.version === VERSION && typeof event.type === 'string' && !!event.type && typeof event.event_id === 'string' && !!event.event_id && Number.isSafeInteger(event.sequence) && Number(event.sequence) >= 0 && event.conversation_id === conversationId && typeof event.timestamp === 'string' && !!event.timestamp && validWorkId && validAnnouncementId && !!event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload);
 }
 
 interface VoiceConnectionOptions {
   conversationId: string;
-  getCredentials: () => Promise<{ pat: string; environment: 'cn-prod' | 'global-prod' }>;
+  getCredentials: () => Promise<{ pat: string; environment: 'cn-prod' | 'global-prod'; authMode?: 'pat' | 'service-account' }>;
   beforeReconnect?: () => Promise<void>;
   onEvent?: (event: VoiceServerEvent) => void;
   onState?: (state: VoiceConnectionState) => void;
@@ -48,7 +48,7 @@ export class VoiceConnection {
   private replaced = false;
   private retryOnClose = false;
   private requestedRetryAfterMs = 0;
-  private lastSequence = 0;
+  private lastSequence = -1;
   private seen = new Set<string>();
   private graceful = false;
   private pendingClose: {
@@ -81,7 +81,7 @@ export class VoiceConnection {
   private async open(reconnecting: boolean) {
     const generation = ++this.generation;
     this.attemptActive = true;
-    this.lastSequence = 0;
+    this.lastSequence = -1;
     this.retryOnClose = false;
     this.requestedRetryAfterMs = 0;
     this.stopHeartbeat();

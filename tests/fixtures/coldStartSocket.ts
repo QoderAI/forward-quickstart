@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { createServer as createNetServer, createConnection, type Socket } from 'node:net';
 import { randomBytes } from 'node:crypto';
 import { WebSocketServer } from 'ws';
+import { readyPayload, voiceEvent } from '../../server/src/testing/realtime.js';
 
 // Cold-start scenario for the Vercel voice entry: an upgrade reaches the entry
 // before its dynamically imported proxy has attached. Run as a subprocess so
@@ -16,7 +17,7 @@ async function main() {
       socket.close(1011, 'unexpected upstream request');
       throw new Error(`unexpected upstream request: ${request.url}`);
     }
-    socket.send('ready');
+    socket.send(JSON.stringify(voiceEvent('conv_coldstart', 1, 'voice.ready', readyPayload)));
   });
   upstreamServer.listen(0, '127.0.0.1'); await once(upstreamServer, 'listening');
   process.env.VERCEL = '1';

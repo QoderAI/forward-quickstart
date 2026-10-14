@@ -71,21 +71,23 @@ export function formatCount(value: number | null | undefined): string {
 export function formatDuration(seconds: number | null | undefined): string {
   if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return DASH;
   const whole = Math.floor(seconds);
-  if (whole < 60) return `${whole}s`;
+  if (seconds < 60) return `${Number(seconds.toFixed(3))}s`;
   if (whole < 3600) return `${Math.floor(whole / 60)}m ${whole % 60}s`;
   return `${Math.floor(whole / 3600)}h ${Math.floor((whole % 3600) / 60)}m`;
 }
 
 // ─── Time window ──────────────────────────────────────────────────
-// The usage endpoints reject any span over 31 days with
-// 400 "time range must not exceed 31 days" (verified live), so every window this
-// module produces is clamped below that ceiling before it can reach the API.
-
+// Usage uses whole hours in Asia/Shanghai, including in the Global region.
 export const MAX_WINDOW_DAYS = 31;
-const DAY_MS = 24 * 60 * 60 * 1000;
-// Stay a whisker under the limit: the server compares against a hard 31 days and
-// an exactly-31-day span is needlessly close to the boundary.
-const MAX_WINDOW_MS = MAX_WINDOW_DAYS * DAY_MS - 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const SHANGHAI_OFFSET_MS = 8 * HOUR_MS;
+const MAX_WINDOW_MS = MAX_WINDOW_DAYS * DAY_MS;
+
+/** API-local hourly timestamp, without a timezone suffix. */
+export function toUsageHour(ms: number): string {
+  return new Date(ms + SHANGHAI_OFFSET_MS).toISOString().slice(0, 19);
+}
 
 export type WindowPreset = 'last7' | 'last30' | 'thisMonth';
 
@@ -109,14 +111,15 @@ export interface CreditWindow {
  * freezing the clock.
  */
 export function resolveWindow(preset: WindowPreset, now: number = Date.now()): CreditWindow {
+  const endMs = Math.floor(now / HOUR_MS) * HOUR_MS;
   let startMs: number;
   if (preset === 'thisMonth') {
-    const d = new Date(now);
-    startMs = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+    const local = new Date(endMs + SHANGHAI_OFFSET_MS);
+    startMs = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), 1) - SHANGHAI_OFFSET_MS;
   } else {
-    startMs = now - (preset === 'last7' ? 7 : 30) * DAY_MS;
+    startMs = endMs - (preset === 'last7' ? 7 : 30) * DAY_MS;
   }
-  return clampWindow({ startMs, endMs: now });
+  return clampWindow({ startMs, endMs });
 }
 
 /** Pull `startMs` forward if the span would exceed the API's 31-day ceiling. */
@@ -127,8 +130,8 @@ export function clampWindow(window: CreditWindow): CreditWindow {
   return { startMs, endMs };
 }
 
-/** RFC 3339 form for the ListSessions created_at[gte]/[lte] filters, which take
- *  timestamp strings rather than the usage endpoints' Unix millis. */
+/** RFC 3339 form for the ListSessions created_at[gte]/[lt] filters, which take
+ *  RFC 3339 timestamps rather than Usage local-hour strings. */
 export function toRfc3339(ms: number): string {
   return new Date(ms).toISOString();
 }
@@ -139,17 +142,14 @@ export function toRfc3339(ms: number): string {
 // That costs 0 extra requests, where per-day querying would cost up to 31.
 
 export interface DailyCredits {
-  /** Local calendar day, YYYY-MM-DD. */
+  /** Asia/Shanghai calendar day, YYYY-MM-DD. */
   date: string;
   credits: number;
   sessions: number;
 }
 
-function localDayKey(ms: number): string {
-  const d = new Date(ms);
-  const m = `${d.getMonth() + 1}`.padStart(2, '0');
-  const day = `${d.getDate()}`.padStart(2, '0');
-  return `${d.getFullYear()}-${m}-${day}`;
+function usageDayKey(ms: number): string {
+  return new Date(ms + SHANGHAI_OFFSET_MS).toISOString().slice(0, 10);
 }
 
 /**
@@ -158,11 +158,12 @@ function localDayKey(ms: number): string {
  * spending by silently compressing quiet days out of the axis.
  */
 export function dailyCreditSeries(sessions: CreditSession[], window?: CreditWindow): DailyCredits[] {
+  if (window && window.startMs >= window.endMs) return [];
   const buckets = new Map<string, { credits: number; sessions: number }>();
   for (const session of sessions) {
     const ms = new Date(session.created_at).getTime();
-    if (!Number.isFinite(ms)) continue;
-    const key = localDayKey(ms);
+    if (!Number.isFinite(ms) || (window && (ms < window.startMs || ms >= window.endMs))) continue;
+    const key = usageDayKey(ms);
     const bucket = buckets.get(key) ?? { credits: 0, sessions: 0 };
     bucket.credits += sessionCredits(session) ?? 0;
     bucket.sessions += 1;
@@ -171,25 +172,16 @@ export function dailyCreditSeries(sessions: CreditSession[], window?: CreditWind
 
   const keys = [...buckets.keys()].sort();
   // Prefer the requested window as the axis; fall back to the observed range.
-  const firstMs = window ? window.startMs : keys.length ? new Date(`${keys[0]}T00:00:00`).getTime() : NaN;
-  const lastMs = window ? window.endMs : keys.length ? new Date(`${keys[keys.length - 1]}T00:00:00`).getTime() : NaN;
+  const firstMs = window ? window.startMs : keys.length ? new Date(`${keys[0]}T00:00:00+08:00`).getTime() : NaN;
+  const lastMs = window ? window.endMs - 1 : keys.length ? new Date(`${keys[keys.length - 1]}T00:00:00+08:00`).getTime() : NaN;
   if (!Number.isFinite(firstMs) || !Number.isFinite(lastMs)) return [];
 
   const out: DailyCredits[] = [];
-  const cursor = new Date(firstMs);
-  cursor.setHours(0, 0, 0, 0);
-  const end = new Date(lastMs);
-  end.setHours(0, 0, 0, 0);
-  // Guard against a pathological window producing an unbounded loop.
-  for (let i = 0; cursor.getTime() <= end.getTime() && i <= MAX_WINDOW_DAYS + 1; i += 1) {
-    const key = localDayKey(cursor.getTime());
+  const startDay = Math.floor((firstMs + SHANGHAI_OFFSET_MS) / DAY_MS) * DAY_MS - SHANGHAI_OFFSET_MS;
+  for (let cursor = startDay, i = 0; cursor <= lastMs && i <= MAX_WINDOW_DAYS + 1; cursor += DAY_MS, i += 1) {
+    const key = usageDayKey(cursor);
     const bucket = buckets.get(key);
-    out.push({
-      date: key,
-      credits: roundCredits(bucket?.credits ?? 0),
-      sessions: bucket?.sessions ?? 0,
-    });
-    cursor.setDate(cursor.getDate() + 1);
+    out.push({ date: key, credits: roundCredits(bucket?.credits ?? 0), sessions: bucket?.sessions ?? 0 });
   }
   return out;
 }

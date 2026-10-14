@@ -137,7 +137,7 @@ export function useVoiceSession(options: VoiceSessionOptions) {
     connection.current?.disconnect();
     const next = new VoiceConnection({
       conversationId: id,
-      getCredentials: async () => ({ pat: options.ctx.pat, environment: options.ctx.environment }),
+      getCredentials: async () => ({ pat: options.ctx.pat, environment: options.ctx.environment, authMode: options.ctx.authMode }),
       beforeReconnect: async () => {
         setStage('reconnecting');
         await playback.current?.cancel();

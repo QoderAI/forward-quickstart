@@ -15,6 +15,7 @@ const listen = async (server: ReturnType<typeof createServer>) => {
   return (server.address() as import('node:net').AddressInfo).port;
 };
 const version = 'voice.realtime.v1';
+import { readyPayload } from '../server/src/testing/realtime.js';
 
 test('local build and Vercel exports have the same realtime contract', { timeout: 30000 }, async t => {
   const originalFetch = globalThis.fetch;
@@ -47,13 +48,13 @@ test('local build and Vercel exports have the same realtime contract', { timeout
     let sequence = 0;
     const number = ++connectionNumber;
     const send = (type: string, payload: Record<string, unknown>) => ws.send(JSON.stringify({ version, type, payload, event_id: `evt_${number}_${++sequence}`, sequence, conversation_id: 'conv_parity', timestamp: new Date().toISOString() }));
-    send('voice.ready', { capabilities: { graceful_close: true } });
+    send('voice.ready', readyPayload);
     ws.on('message', data => {
       const event = JSON.parse(data.toString());
       records.push({ kind: 'ws', path: url.pathname, event });
       if (event.type === 'connection.close') send('connection.closed', { request_id: event.payload.request_id, outcome: 'saved_interrupted' });
-      else if (event.type === 'audio.append') send('audio.delta', { delta: event.payload.audio });
-      else if (event.type === 'text.message') send('transcript.final', { text: event.payload.text });
+      else if (event.type === 'audio.append') send('audio.delta', { audio: event.payload.audio });
+      else if (event.type === 'text.message') send('transcript.final', { role: 'user', text: event.payload.text });
     });
   });
   const mockPort = await listen(mock);
@@ -115,8 +116,8 @@ test('local build and Vercel exports have the same realtime contract', { timeout
         });
         sub.after(() => connection.disconnect());
         let ready = once(events, 'voice.ready'); await connection.connect(); await ready;
-        const audio = once(events, 'audio.delta'); assert.equal(connection.send('audio.append', { audio: 'AAAA' }), true);
-        assert.equal((await audio)[0].delta, 'AAAA');
+        const audio = once(events, 'audio.delta'); assert.equal(connection.send('audio.append', { audio: 'AAAAAA==' }), true);
+        assert.equal((await audio)[0].audio, 'AAAAAA==');
         const text = once(events, 'transcript.final'); connection.send('text.message', { text: 'deployment parity' });
         assert.equal((await text)[0].text, 'deployment parity');
         // Simulate the same restart code used for the Vercel duration boundary.

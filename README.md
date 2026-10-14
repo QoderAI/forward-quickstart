@@ -4,6 +4,8 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 
 你可以先通过本项目理解 Forward API 的主流程，再将相关能力集成到自己的应用中。
 
+服务端通过固定版本的 [QCA TypeScript SDK](https://github.com/QoderAI/qoder-cloud-agents-sdk-ts)（`qca-sdk@0.5.0`）调用 QCA。浏览器继续访问同源 API/SSE 和语音中继；SDK 及凭据解析位于 Node 服务端。
+
 ## Demo 体验地址
 
 无需本地部署，直接访问在线 Demo 体验产品能力：
@@ -37,6 +39,7 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 
 - [Forward 概览](./docs/forward-overview.md)：介绍产品概念、CN/Global API 环境、Forward Mode 特性，以及 Forward Mode 与 Build Mode 的区别。
 - [安全说明](./docs/security.md)：介绍 token 使用、日志记录和生产集成相关建议。
+- [SDK 接入说明](./docs/qca-sdk-integration.md)：介绍调用边界、兼容扩展、鉴权和本地验证。
 
 官方文档：
 
@@ -48,7 +51,7 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 
 ```text
 client/   React + Vite + TailwindCSS 前端
-server/   Express API/SSE 代理，以及本地与 Vercel 共用的 Voice WebSocket 中继
+server/   Express API/SSE 入口、QCA SDK 适配，以及 Voice WebSocket 中继
 api/      Vercel API 函数与 Voice WebSocket 服务入口
 tests/    Vercel 入口测试、本地与 Vercel 入口的部署对照测试
 docs/     公开产品说明与安全说明
