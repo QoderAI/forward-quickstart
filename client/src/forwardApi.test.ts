@@ -7,6 +7,7 @@ import {
   deleteCloudVault,
   deleteForwardFile,
   downloadCloudFile,
+  previewCloudFile,
   ForwardApiError,
   getCloudFile,
   getMemoryEntry,
@@ -495,5 +496,27 @@ describe('waitForChannelBinding', () => {
     const channel = await waitForChannelBinding(ctx, 'channel_1', { attempts: 5, intervalMs: 0 });
     expect(channel.binding_status).toBe('expired');
     expect(callCount()).toBe(2);
+  });
+});
+
+
+describe('file previews', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  test('PAT falls back to Cloud only on Forward 404 and passes auth mode', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      calls.push(url);
+      return calls.length === 1 ? new Response(null, { status: 404 }) : new Response('image', { headers: { 'content-type': 'image/png' } });
+    }));
+    const blob = await previewCloudFile({ pat: 'pat', environment: 'cn-prod' }, 'a b');
+    expect(await blob.text()).toBe('image');
+    expect(calls[0]).toContain('/api/forward/files/a%20b/preview?');
+    expect(calls[1]).toContain('/api/cloud/files/a%20b/preview?');
+    expect(calls[1]).toContain('authMode=pat');
+  });
+  test.each([[401, 'pat'], [403, 'pat'], [500, 'pat'], [404, 'service-account']] as const)('does not widen access for %s in %s mode', async (status, authMode) => {
+    const fetch = vi.fn(async () => new Response(null, { status })); vi.stubGlobal('fetch', fetch);
+    await expect(previewCloudFile({ pat: 'token', environment: 'global-prod', authMode }, 'f1')).rejects.toMatchObject({ status });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

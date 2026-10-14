@@ -54,6 +54,25 @@ describe('voice connection contract', () => {
     expect(isValidVoiceServerEvent({ ...event, announcement_id: '' }, 'conv_1')).toBe(false);
   });
 
+  test('accepts SDK sequence zero, deduplicates it and sends SAT mode in proxy auth', async () => {
+    installBrowser();
+    const onEvent = vi.fn();
+    const connection = new VoiceConnection({
+      conversationId: 'conv_1', onEvent,
+      getCredentials: async () => ({ pat: 'forward_sat', environment: 'cn-prod', authMode: 'service-account' }),
+      webSocketFactory: () => new FakeWebSocket() as unknown as WebSocket,
+    });
+    await connection.connect();
+    const socket = FakeWebSocket.instances[0]; socket.emit('open');
+    expect(JSON.parse(socket.send.mock.calls[0][0])).toMatchObject({ type: 'proxy.auth', authMode: 'service-account', pat: 'forward_sat' });
+    const event = { version: 'voice.realtime.v1', type: 'voice.ready', event_id: 'ready-zero', sequence: 0,
+      conversation_id: 'conv_1', timestamp: '2026-10-13T00:00:00Z', payload: {} };
+    socket.emit('message', { data: JSON.stringify(event) });
+    socket.emit('message', { data: JSON.stringify(event) });
+    expect(connection.ready).toBe(true); expect(onEvent).toHaveBeenCalledTimes(1);
+    connection.disconnect();
+  });
+
   test('waits for the matching gateway acknowledgement before graceful close completes', async () => {
     installBrowser();
     vi.stubGlobal('crypto', { randomUUID: () => 'close-request-1' });

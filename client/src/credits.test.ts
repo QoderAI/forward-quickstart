@@ -16,6 +16,7 @@ import {
   sumSessionCredits,
   templateBreakdown,
   toRfc3339,
+  toUsageHour,
 } from './credits';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -122,13 +123,12 @@ describe('resolveWindow / clampWindow', () => {
 
   test('last30 stays inside the API 31-day ceiling', () => {
     const w = resolveWindow('last30', now);
-    expect(w.endMs - w.startMs).toBeLessThan(MAX_WINDOW_DAYS * DAY);
+    expect(w.endMs - w.startMs).toBeLessThanOrEqual(MAX_WINDOW_DAYS * DAY);
   });
 
-  test('thisMonth starts at the first of the month', () => {
+  test('thisMonth starts at Shanghai midnight on the first of the month', () => {
     const w = resolveWindow('thisMonth', now);
-    const start = new Date(w.startMs);
-    expect(start.getDate()).toBe(1);
+    expect(new Date(w.startMs).toISOString()).toBe('2026-07-31T16:00:00.000Z');
     expect(w.endMs).toBe(now);
   });
 
@@ -138,14 +138,14 @@ describe('resolveWindow / clampWindow', () => {
       // Check on a 31-day month, where thisMonth is at its widest.
       const end = new Date('2026-08-31T23:59:59Z').getTime();
       const w = resolveWindow(preset, end);
-      expect(w.endMs - w.startMs).toBeLessThan(MAX_WINDOW_DAYS * DAY);
+      expect(w.endMs - w.startMs).toBeLessThanOrEqual(MAX_WINDOW_DAYS * DAY);
     }
   });
 
   test('an over-wide window is clamped rather than sent and rejected', () => {
     const end = now;
     const w = clampWindow({ startMs: end - 90 * DAY, endMs: end });
-    expect(w.endMs - w.startMs).toBeLessThan(MAX_WINDOW_DAYS * DAY);
+    expect(w.endMs - w.startMs).toBeLessThanOrEqual(MAX_WINDOW_DAYS * DAY);
     expect(w.endMs).toBe(end);
   });
 
@@ -165,7 +165,7 @@ describe('toRfc3339', () => {
 });
 
 describe('dailyCreditSeries', () => {
-  test('buckets sessions by local day and sums their credits', () => {
+  test('buckets sessions by Shanghai day and sums their credits', () => {
     const series = dailyCreditSeries([
       session({ created_at: '2026-08-01T03:00:00Z', usage: { credits: 100 } }),
       session({ created_at: '2026-08-01T09:00:00Z', usage: { credits: 37.5 } }),
@@ -175,11 +175,11 @@ describe('dailyCreditSeries', () => {
   });
 
   test('zero-fills quiet days so the bars keep their true shape', () => {
-    const start = new Date('2026-08-01T00:00:00').getTime();
-    const end = new Date('2026-08-05T23:59:59').getTime();
+    const start = new Date('2026-08-01T00:00:00+08:00').getTime();
+    const end = new Date('2026-08-06T00:00:00+08:00').getTime();
     const series = dailyCreditSeries(
-      [session({ created_at: '2026-08-01T03:00:00', usage: { credits: 50 } }),
-       session({ created_at: '2026-08-05T03:00:00', usage: { credits: 70 } })],
+      [session({ created_at: '2026-08-01T03:00:00+08:00', usage: { credits: 50 } }),
+       session({ created_at: '2026-08-05T03:00:00+08:00', usage: { credits: 70 } })],
       { startMs: start, endMs: end },
     );
     expect(series).toHaveLength(5);
@@ -190,7 +190,7 @@ describe('dailyCreditSeries', () => {
   });
 
   test('sessions with unknown credits still count as activity but add nothing', () => {
-    const series = dailyCreditSeries([session({ created_at: '2026-08-01T03:00:00', usage: {} })]);
+    const series = dailyCreditSeries([session({ created_at: '2026-08-01T03:00:00+08:00', usage: {} })]);
     expect(series[0].sessions).toBe(1);
     expect(series[0].credits).toBe(0);
   });
@@ -355,3 +355,19 @@ describe('modelCallsForMessage', () => {
   });
 });
 
+
+describe('hourly Usage boundaries', () => {
+  test('rounds down to the complete hour in both regions', () => {
+    const w = resolveWindow('last7', Date.parse('2026-10-13T15:47:22Z'));
+    expect(toUsageHour(w.endMs)).toBe('2026-10-13T23:00:00');
+    expect(w.endMs - w.startMs).toBe(168 * 3_600_000);
+  });
+  test('Shanghai month boundary is independent of the browser timezone', () => {
+    const w = resolveWindow('thisMonth', Date.parse('2026-09-30T16:35:00Z'));
+    expect(toUsageHour(w.startMs)).toBe('2026-10-01T00:00:00');
+    expect(w.startMs).toBe(w.endMs);
+  });
+  test('keeps fractional seconds visible', () => {
+    expect(formatDuration(0.125)).toBe('0.125s');
+  });
+});

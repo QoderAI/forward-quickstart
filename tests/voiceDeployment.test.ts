@@ -6,6 +6,8 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { WebSocket, WebSocketServer } from 'ws';
+import { readyPayload, voiceEvent } from '../server/src/testing/realtime.js';
+const readyEvent = JSON.stringify(voiceEvent('conv_deployment', 1, 'voice.ready', readyPayload));
 
 // Set environment variables on the real process.env object and restore them
 // key by key; wholesale process.env assignment would detach later tests'
@@ -64,7 +66,7 @@ test('Vercel entry exports a non-listening server and relays websocket upgrades'
   upstream.on('connection', (socket, request) => {
     assert.equal(request.headers.authorization, 'Bearer deployment-test');
     assert.equal(request.url, '/api/v1/forward/realtime?conversation_id=conv_deployment');
-    socket.send('ready');
+    socket.send(readyEvent);
   });
   upstreamServer.listen(0, '127.0.0.1'); await once(upstreamServer, 'listening');
   const restoreEnv = setEnv({
@@ -91,7 +93,7 @@ test('Vercel entry exports a non-listening server and relays websocket upgrades'
   await once(socket, 'open');
   const message = once(socket, 'message');
   socket.send(JSON.stringify({ type: 'proxy.auth', pat: 'deployment-test', environment: 'cn-prod', conversation_id: 'conv_deployment' }));
-  assert.equal((await message)[0].toString(), 'ready');
+  assert.equal((await message)[0].toString(), readyEvent);
   // Same-origin requests (browser Origin matching the routed Host) are
   // allowed even when the Host is not one of the configured domains.
   const sameOrigin = new WebSocket(`ws://${base}/api/voice/socket`, { headers: { Origin: `https://${base}` } });
@@ -99,7 +101,7 @@ test('Vercel entry exports a non-listening server and relays websocket upgrades'
   await once(sameOrigin, 'open');
   const sameOriginMessage = once(sameOrigin, 'message');
   sameOrigin.send(JSON.stringify({ type: 'proxy.auth', pat: 'deployment-test', environment: 'cn-prod', conversation_id: 'conv_deployment' }));
-  assert.equal((await sameOriginMessage)[0].toString(), 'ready');
+  assert.equal((await sameOriginMessage)[0].toString(), readyEvent);
   // Foreign origins stay rejected.
   const foreign = new WebSocket(`ws://${base}/api/voice/socket`, { headers: { Origin: 'https://foreign.example' } });
   sockets.push(foreign);
