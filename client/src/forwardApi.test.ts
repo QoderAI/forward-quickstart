@@ -61,6 +61,12 @@ describe('listEvents', () => {
         'agent.mcp_tool_result',
         'span.model_request_end',
         'session.status_idle',
+        'session.thread_created',
+        'session.thread_status_running',
+        'session.thread_status_idle',
+        'session.thread_status_rescheduled',
+        'agent.thread_message_sent',
+        'agent.thread_message_received',
       ].join(','),
     });
     expect(requestBody.query).not.toHaveProperty('types[]');

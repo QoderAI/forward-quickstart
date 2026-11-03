@@ -156,6 +156,14 @@ const LIST_EVENT_TYPES = [
   // their cost after a page refresh (the streaming accumulator is gone by then).
   'span.model_request_end',
   'session.status_idle',
+  // Multiagent 协同事件：历史会话也要能还原协调者与子 Agent 的派发/回执/状态过程，
+  // 否则刷新或重开会话后协同可视化会丢失（见 multiagent.ts / multiagentPanel.tsx）。
+  'session.thread_created',
+  'session.thread_status_running',
+  'session.thread_status_idle',
+  'session.thread_status_rescheduled',
+  'agent.thread_message_sent',
+  'agent.thread_message_received',
 ].join(',');
 
 export class ForwardApiError extends Error {
