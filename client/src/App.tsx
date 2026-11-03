@@ -91,6 +91,13 @@ import { VoiceSessionView } from './voice/VoiceSessionView';
 import { useVoiceAvailability } from './voice/useVoiceAvailability';
 import { isVoiceSession } from './voice/voiceSession';
 import { LayerQuizButton } from './layerQuiz';
+import { buildMultiagentView, coordinatorConfig, EMPTY_MULTIAGENT_VIEW } from './multiagent';
+import {
+  MultiagentDispatchCard,
+  MultiagentReplyCard,
+  MultiagentStatusLine,
+  MultiagentTeamPanel,
+} from './multiagentPanel';
 import { PRODUCT_NAME } from './config/product';
 import {
   BUILTIN_TOOLS,
@@ -536,12 +543,14 @@ function eventViewKind(event: ForwardEvent): EventViewKind {
   ) {
     return 'tool_result';
   }
-  // Multiagent thread events — shown as subtle status indicators in the chat
-  // so the user can see delegation progress (e.g. "已委派任务给足球经理专家").
+  // Multiagent thread events — rendered as delegation/reply cards and status
+  // lines so the user can follow coordinator ↔ sub-agent progress
+  // (e.g. "已委派任务给足球经理专家"). See multiagent.ts / multiagentPanel.tsx.
   if (
     event.type === 'session.thread_created' ||
     event.type === 'session.thread_status_running' ||
     event.type === 'session.thread_status_idle' ||
+    event.type === 'session.thread_status_rescheduled' ||
     event.type === 'agent.thread_message_sent' ||
     event.type === 'agent.thread_message_received'
   ) {
@@ -551,30 +560,6 @@ function eventViewKind(event: ForwardEvent): EventViewKind {
   // per-reply credit breakdown but must never render as their own chat bubble.
   if (event.type.startsWith('span.')) return 'hidden';
   return 'hidden';
-}
-
-/** Extract a short human-readable label for a multiagent thread event. */
-function multiagentEventInfo(event: ForwardEvent): string {
-  // Try to pull the agent name from common fields; fall back to generic text.
-  const name =
-    (typeof event.agent_name === 'string' && event.agent_name) ||
-    (typeof event.name === 'string' && event.name) ||
-    textFromUnknown(event.content) ||
-    '';
-  switch (event.type) {
-    case 'session.thread_created':
-      return name ? `已创建子线程：${name}` : '已创建子线程';
-    case 'session.thread_status_running':
-      return name ? `${name} 开始执行` : '子线程运行中';
-    case 'session.thread_status_idle':
-      return name ? `${name} 已完成` : '子线程已完成';
-    case 'agent.thread_message_sent':
-      return name ? `已委派任务给 ${name}` : '已委派任务给子线程';
-    case 'agent.thread_message_received':
-      return name ? `已收到 ${name} 的回复` : '已收到子线程回复';
-    default:
-      return '';
-  }
 }
 
 function getEventValue(event: ForwardEvent, keys: string[]): unknown {
@@ -3876,6 +3861,11 @@ export default function App() {
       setLoadingOlderEvents(false);
       setEventsHasMore(Boolean(page.has_more && olderEventsCursorRef.current));
       setEvents(chronologicalData);
+      // 历史事件里若已出现子线程，就把该会话登记为 multiagent：续流时子线程的
+      // thread_status_idle 不应被当作整会话终止事件（见 isTerminalSessionEvent）。
+      if (chronologicalData.some((e) => e.type === 'session.thread_created')) {
+        multiagentSessionsRef.current.add(sessionId);
+      }
       // Check if session is still active and restart stream if needed
       const session = sessions.find((s) => s.id === sessionId);
       if (session && (session.status === 'running' || session.status === 'processing')) {
@@ -3891,12 +3881,6 @@ export default function App() {
         setEvents((prev) => [...prev, thinkingEvent]);
         // Pass the last event ID to resume stream from the correct position
         const lastEventId = chronologicalData.length > 0 ? chronologicalData[chronologicalData.length - 1].id : undefined;
-        // If the session has ever had multiagent threads (tracked in
-        // multiagentSessionsRef), pass this so child thread_status_idle
-        // doesn't prematurely terminate the stream. NOTE: listEvents uses
-        // LIST_EVENT_TYPES which does NOT include session.thread_created, so
-        // we can't rely on fetched events for this check — the ref is the
-        // source of truth.
         const hasMA = multiagentSessionsRef.current.has(sessionId);
         startStreamRef.current(sessionId, lastEventId, undefined, hasMA);
       }
@@ -4589,6 +4573,14 @@ export default function App() {
   }, []);
 
   const currentTemplate = templates.find((template) => template.id === templateId);
+  // 协调者模板（multiagent.type === 'coordinator'）才启用协同可视化；普通模板给空视图，
+  // 这样单 Agent 会话里平台自带的 thread 状态事件不会渲染成任何多 Agent UI。
+  const coordinator = coordinatorConfig(currentTemplate);
+  const coordinatorName = currentTemplate?.name ?? '协调者';
+  const multiagentView = useMemo(
+    () => (coordinator ? buildMultiagentView(events, coordinatorName) : EMPTY_MULTIAGENT_VIEW),
+    [events, coordinator, coordinatorName],
+  );
   const currentSession = sessions.find((session) => session.id === currentSessionId);
   // Whole-session credit total, shown next to the composer's attachment button.
   // Uses usage.total_credits (NOT usage.credits, which tracks model spend and
@@ -5886,6 +5878,13 @@ export default function App() {
                     onEnded={() => { void refreshSessions(); }}
                   />
                 )}
+                {!voiceViewOpen && coordinator && (
+                  <MultiagentTeamPanel
+                    config={coordinator}
+                    coordinatorName={coordinatorName}
+                    threads={multiagentView.threads}
+                  />
+                )}
                 {!voiceViewOpen && events.length === 0 && sessionLoading && (
                   <div className="flex min-h-0 flex-1 items-center justify-center">
                     <svg className="h-7 w-7 animate-spin text-[#3550FF]" fill="none" viewBox="0 0 24 24">
@@ -6057,13 +6056,15 @@ export default function App() {
                         }
                         if (kind === 'session_error') return <SessionErrorMessage key={event.id} event={event} />;
                         if (kind === 'multiagent_status') {
-                          const info = multiagentEventInfo(event);
-                          if (!info) return null;
-                          return (
-                            <div key={event.id} className="flex items-center justify-center py-1">
-                              <span className="rounded-full bg-[#F4F6FC] px-3 py-1 text-[11px] text-black/40">{info}</span>
-                            </div>
-                          );
+                          const role = multiagentView.roles[event.id];
+                          if (!role) return null;
+                          if (role.role === 'dispatch') {
+                            return <MultiagentDispatchCard key={event.id} name={role.name} text={role.text} at={event.processed_at} />;
+                          }
+                          if (role.role === 'reply') {
+                            return <MultiagentReplyCard key={event.id} name={role.name} text={role.text} at={event.processed_at} />;
+                          }
+                          return <MultiagentStatusLine key={event.id} name={role.name} status={role.status} stopReason={role.stopReason} />;
                         }
                         if (kind === 'user') return <ChatTextMessage key={event.id} event={event} user ctx={ctx} />;
                         // Attribute model-call credits to this reply by position. Skip the
