@@ -2065,7 +2065,9 @@ export default function App() {
   const [currentVoiceConversationId, setCurrentVoiceConversationId] = useState<string | null>(null);
   const [voiceLaunchKey, setVoiceLaunchKey] = useState(0);
   const [events, setEvents] = useState<ForwardEvent[]>([]);
-  const [eventsHasMore, setEventsHasMore] = useState(false);
+  const [olderEventsPage, setOlderEventsPageState] = useState<{ sessionId: string; nextCursor?: string; error?: string } | null>(null);
+  const eventsHasMore = olderEventsPage?.sessionId === currentSessionId && !!olderEventsPage.nextCursor;
+  const hasChatHistory = events.length > 0 || eventsHasMore;
   const [loadingOlderEvents, setLoadingOlderEvents] = useState(false);
   const [input, setInput] = useState('');
   const [showThinking, setShowThinking] = useState<boolean>(() => {
@@ -2245,8 +2247,12 @@ export default function App() {
   const eventHistoryGenerationRef = useRef(0);
   const recentHistoryRef = useRef<{ sessionId: string; id?: string; generation: number } | null>(null);
   const messageWriteRef = useRef(new Set<string>());
-  const olderEventsCursorRef = useRef<{ sessionId: string; cursor: string } | null>(null);
+  const olderEventsPageRef = useRef<typeof olderEventsPage>(null);
   const loadingOlderEventsRef = useRef<string | null>(null);
+  const setOlderEventsPage = useCallback((page: typeof olderEventsPage) => {
+    olderEventsPageRef.current = page;
+    setOlderEventsPageState(page);
+  }, []);
   const pendingHistoryScrollRef = useRef<{
     sessionId: string;
     scrollHeight: number;
@@ -2372,55 +2378,53 @@ export default function App() {
     stopAbort.current?.abort();
   }, []);
 
-  const loadOlderEvents = useCallback(async () => {
+  const loadOlderEvents = useCallback(async (manual = false) => {
     const sessionId = currentSessionIdRef.current;
-    const cursorState = olderEventsCursorRef.current;
+    const pagination = olderEventsPageRef.current;
+    const generation = eventHistoryGenerationRef.current;
     if (
       !ctx ||
-      !sessionId ||
-      cursorState?.sessionId !== sessionId ||
-      !eventsHasMore ||
+      pagination?.sessionId !== sessionId ||
+      !pagination.nextCursor ||
       loadingOlderEventsRef.current === sessionId ||
+      (!manual && pagination.error) ||
       !chatScrollRef.current
     ) return;
 
-    const cursor = cursorState.cursor;
-    const generation = eventHistoryGenerationRef.current;
     loadingOlderEventsRef.current = sessionId;
     setLoadingOlderEvents(true);
-    setError('');
+    const isCurrent = () => currentSessionIdRef.current === sessionId && eventHistoryGenerationRef.current === generation;
     try {
-      const page = await listEvents(ctx, sessionId, { beforeId: cursor });
-      if (page.has_more && (!page.last_id || page.last_id === cursor)) throw new Error('历史分页游标缺失或未推进');
+      const page = await listEvents(ctx, sessionId, { beforeId: pagination.nextCursor });
+      if (!isCurrent()) return;
       const scrollElement = chatScrollRef.current;
-      if (
-        currentSessionIdRef.current !== sessionId ||
-        eventHistoryGenerationRef.current !== generation ||
-        !scrollElement
-      ) return;
-      const chronologicalData = [...page.data].reverse();
-      // Snapshot after the request completes so events streamed while it was in
-      // flight are not mistaken for prepended history in the height adjustment.
-      pendingHistoryScrollRef.current = {
-        sessionId,
-        scrollHeight: scrollElement.scrollHeight,
-        scrollTop: scrollElement.scrollTop,
-      };
-      setEvents((prev) => mergeConversationEvents(prev, chronologicalData, 'older'));
-      const nextCursor = page.last_id || undefined;
-      olderEventsCursorRef.current = nextCursor ? { sessionId, cursor: nextCursor } : null;
-      setEventsHasMore(Boolean(page.has_more && nextCursor && nextCursor !== cursor));
+      if (scrollElement && page.data.length) {
+        pendingHistoryScrollRef.current = {
+          sessionId,
+          scrollHeight: scrollElement.scrollHeight,
+          scrollTop: scrollElement.scrollTop,
+        };
+      }
+      setEvents((prev) => mergeConversationEvents(prev, [...page.data].reverse(), 'older'));
+      setOlderEventsPage({ sessionId, nextCursor: page.has_more ? page.last_id ?? undefined : undefined });
     } catch (err) {
-      if (currentSessionIdRef.current === sessionId) {
-        setError(`加载历史记录失败：${err instanceof Error ? err.message : String(err)}`);
+      if (isCurrent()) {
+        setOlderEventsPage({ ...pagination, error: `加载历史记录失败：${err instanceof Error ? err.message : String(err)}` });
       }
     } finally {
-      if (eventHistoryGenerationRef.current === generation) {
-        if (loadingOlderEventsRef.current === sessionId) loadingOlderEventsRef.current = null;
-        if (currentSessionIdRef.current === sessionId) setLoadingOlderEvents(false);
+      if (isCurrent()) {
+        loadingOlderEventsRef.current = null;
+        setLoadingOlderEvents(false);
       }
     }
-  }, [ctx, eventsHasMore]);
+  }, [ctx, setOlderEventsPage]);
+
+  useEffect(() => {
+    const el = chatScrollRef.current;
+    if (activePanel !== 'chat' || voiceViewOpen || sessionLoading || !olderEventsPage?.nextCursor || !el) return;
+    // If there is nowhere to scroll, the top-of-history scroll event never fires.
+    if (el.scrollHeight <= el.clientHeight) void loadOlderEvents();
+  }, [activePanel, loadOlderEvents, olderEventsPage, sessionLoading, voiceViewOpen]);
 
   // Prepending an older page increases scrollHeight. Restore the same visible
   // message after React commits so loading history never jumps the user upward.
@@ -2439,7 +2443,7 @@ export default function App() {
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     stickToBottomRef.current = distanceFromBottom < 80;
-    if (el.scrollTop < 80) void loadOlderEvents();
+    if (el.scrollTop < 80 && distanceFromBottom > 1) void loadOlderEvents();
   }, [loadOlderEvents]);
 
   // Auto-scroll to bottom on new events only when the user is already at the bottom.
@@ -2590,14 +2594,13 @@ export default function App() {
     const page = await listEvents(ctx, sessionId);
     if (currentSessionIdRef.current !== sessionId || eventHistoryGenerationRef.current !== generation) return;
     // Events are returned in descending order (newest first), reverse to chronological order.
-    olderEventsCursorRef.current = page.last_id ? { sessionId, cursor: page.last_id } : null;
+    setOlderEventsPage({ sessionId, nextCursor: page.has_more ? page.last_id ?? undefined : undefined });
     loadingOlderEventsRef.current = null;
     setLoadingOlderEvents(false);
-    setEventsHasMore(Boolean(page.has_more && olderEventsCursorRef.current));
     recentHistoryRef.current = { sessionId, generation, id: page.data[0]?.id };
     setEvents([...page.data].reverse());
     return { generation, page };
-  }, [ctx]);
+  }, [ctx, setOlderEventsPage]);
 
   const mergeSessionEvents = useCallback(async (sessionId: string, signal?: AbortSignal, fallbackId?: string) => {
     if (!ctx || !sessionId || currentSessionIdRef.current !== sessionId) return;
@@ -2610,13 +2613,12 @@ export default function App() {
     if (recentHistoryRef.current === previous) {
       recentHistoryRef.current = { sessionId, generation, id: page.data[0]?.id ?? knownId };
     }
-    if (olderEventsCursorRef.current?.sessionId !== sessionId && page.has_more && page.last_id) {
-      olderEventsCursorRef.current = { sessionId, cursor: page.last_id };
-      setEventsHasMore(true);
+    if (olderEventsPageRef.current?.sessionId !== sessionId && page.has_more && page.last_id) {
+      setOlderEventsPage({ sessionId, nextCursor: page.last_id });
     }
     setEvents((prev) => mergeIncomingEvents(prev, chronologicalData, 'history'));
     return { ...page, data: chronologicalData };
-  }, [ctx]);
+  }, [ctx, setOlderEventsPage]);
 
   // Template binding pickers use the registry endpoint, matching the console tabs.
   const loadRegisteredResources = useCallback(async (nextType = resourceType) => {
@@ -3732,12 +3734,11 @@ export default function App() {
     stickToBottomRef.current = true;
     currentSessionIdRef.current = sessionId;
     const generation = ++eventHistoryGenerationRef.current;
-    olderEventsCursorRef.current = null;
+    setOlderEventsPage(null);
     pendingHistoryScrollRef.current = null;
     loadingOlderEventsRef.current = null;
     setCurrentSessionId(sessionId);
     setEvents([]);
-    setEventsHasMore(false);
     setLoadingOlderEvents(false);
     setError('');
     setSessionLoading(true);
@@ -3760,10 +3761,9 @@ export default function App() {
       if (currentSessionIdRef.current !== sessionId || eventHistoryGenerationRef.current !== generation) return;
       // Events are returned in descending order (newest first), reverse to chronological order.
       const chronologicalData = [...page.data].reverse();
-      olderEventsCursorRef.current = page.last_id ? { sessionId, cursor: page.last_id } : null;
+      setOlderEventsPage({ sessionId, nextCursor: page.has_more ? page.last_id ?? undefined : undefined });
       loadingOlderEventsRef.current = null;
       setLoadingOlderEvents(false);
-      setEventsHasMore(Boolean(page.has_more && olderEventsCursorRef.current));
       recentHistoryRef.current = { sessionId, generation, id: page.data[0]?.id };
       setEvents(chronologicalData);
       if (chronologicalData.some((event) => event.type === 'session.thread_created')) {
@@ -3786,7 +3786,7 @@ export default function App() {
         setSessionLoading(false);
       }
     }
-  }, [ctx]);
+  }, [ctx, setOlderEventsPage]);
 
   // Delete (archive) sessions and drop them from the local list (issue #15).
   // The Forward API's removal primitive is POST /sessions/{id}/archive —
@@ -5766,7 +5766,7 @@ export default function App() {
                     threads={multiagentView.threads}
                   />
                 )}
-                {!voiceViewOpen && events.length === 0 && sessionLoading && (
+                {!voiceViewOpen && !hasChatHistory && sessionLoading && (
                   <div className="flex min-h-0 flex-1 items-center justify-center">
                     <svg className="h-7 w-7 animate-spin text-[#3550FF]" fill="none" viewBox="0 0 24 24">
                       <circle className="opacity-20" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
@@ -5774,7 +5774,7 @@ export default function App() {
                     </svg>
                   </div>
                 )}
-                {!voiceViewOpen && events.length === 0 && !sessionLoading && (
+                {!voiceViewOpen && !hasChatHistory && !sessionLoading && (
                   <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-8 pb-12 pt-4">
                     <div className="w-full max-w-[680px]">
                       <div className="mb-8 text-center">
@@ -5872,19 +5872,20 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                {!voiceViewOpen && events.length > 0 && (
+                {!voiceViewOpen && hasChatHistory && (
                   <div ref={chatScrollRef} onScroll={handleChatScroll} className="min-h-0 flex-1 overflow-y-auto px-8">
                     <div className="mx-auto flex max-w-[860px] flex-col py-6">
-                    {eventsHasMore && olderEventsCursorRef.current?.sessionId === currentSessionId && (
-                      <div className="mb-4 flex justify-center">
+                    {eventsHasMore && (
+                      <div className="mb-4 flex flex-col items-center gap-2">
                         <button
                           type="button"
-                          onClick={() => void loadOlderEvents()}
+                          onClick={() => void loadOlderEvents(true)}
                           disabled={loadingOlderEvents}
                           className="rounded-full border border-[#DDE2F2] bg-white px-4 py-2 text-xs text-black/50 transition hover:border-[#3550FF] hover:text-[#3550FF] disabled:opacity-50"
                         >
                           {loadingOlderEvents ? '正在加载历史记录...' : '加载更早记录'}
                         </button>
+                        {olderEventsPage.error && <p role="alert" className="break-words text-center text-xs text-red-700">{olderEventsPage.error}</p>}
                       </div>
                     )}
                     <div className="space-y-4 pb-8">
@@ -5951,7 +5952,7 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                {!voiceViewOpen && events.length > 0 && (
+                {!voiceViewOpen && hasChatHistory && (
                   <div className="shrink-0 px-8 pb-6 pt-2">
                     <div className="mx-auto max-w-[860px]">
                       <div className="rounded-2xl border border-[#E5E7EB] bg-white px-4 py-3 shadow-[0_1px_3px_rgba(0,0,0,0.04)] transition focus-within:border-[#3550FF] focus-within:shadow-[0_0_0_3px_rgba(53,80,255,0.06)]">
