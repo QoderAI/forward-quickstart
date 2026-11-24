@@ -140,7 +140,10 @@ function validateResources(body: Record<string, unknown>): string | null {
       if (!p.startsWith('/')) return 'body.resources[].mount_path 必须是绝对路径';
       if (p.includes('..')) return 'body.resources[].mount_path 不能包含 ..';
       if (p.includes('//')) return 'body.resources[].mount_path 不是规范路径（含连续斜杠）';
-      if (/[\u0000-\u001F\u007F]/.test(p)) return 'body.resources[].mount_path 不能包含控制字符';
+      for (let index = 0; index < p.length; index++) {
+        const code = p.charCodeAt(index);
+        if (code <= 0x1f || code === 0x7f) return 'body.resources[].mount_path 不能包含控制字符';
+      }
     }
   }
   return null;
@@ -248,6 +251,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
   // custom_id 精确查找：input 为原始输入，committed 值由「查询」按钮提交，避免逐键请求
   const [taskCustomIdInput, setTaskCustomIdInput] = useState('');
   const [taskCustomId, setTaskCustomId] = useState('');
+  const taskRequestRef = useRef(0);
 
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current !== null) {
@@ -319,47 +323,55 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
     }
   }, [ctx, cancelTarget]);
 
-  // 子任务明细加载：详情弹窗打开 / 筛选变化时取第一页，也供「刷新」「加载更多」复用
-  const loadTasks = useCallback(async (opts?: { append?: boolean; afterId?: string }) => {
-    if (!ctx || !detailBatch) return;
+  const loadTasks = async (batchId: string, status: 'all' | BatchTaskStatus, customId: string, afterId?: string) => {
+    if (!ctx) return;
+    const request = ++taskRequestRef.current;
     setTasksLoading(true);
     setTasksError('');
+    if (!afterId) {
+      setTasks([]);
+      setTasksHasMore(false);
+    }
     try {
-      const page = await listBatchTasks(ctx, detailBatch.id, {
-        ...(taskStatusFilter !== 'all' ? { status: taskStatusFilter } : {}),
-        ...(taskCustomId ? { customId: taskCustomId } : {}),
-        ...(opts?.afterId ? { afterId: opts.afterId } : {}),
+      const page = await listBatchTasks(ctx, batchId, {
+        ...(status !== 'all' ? { status } : {}),
+        ...(customId ? { customId } : {}),
+        ...(afterId ? { afterId } : {}),
       });
-      setTasks((prev) => (opts?.append ? [...prev, ...(page.data ?? [])] : (page.data ?? [])));
+      if (request !== taskRequestRef.current) return;
+      setTasks((prev) => afterId ? [...prev, ...(page.data ?? [])] : page.data ?? []);
       setTasksHasMore(!!page.has_more);
     } catch (err) {
+      if (request !== taskRequestRef.current) return;
       const msg = err instanceof Error ? err.message : String(err);
       setTasksError(`子任务加载失败：${msg}`);
-      if (!opts?.append) {
-        setTasks([]);
-        setTasksHasMore(false);
-      }
     } finally {
-      setTasksLoading(false);
+      if (request === taskRequestRef.current) setTasksLoading(false);
     }
-  }, [ctx, detailBatch, taskStatusFilter, taskCustomId]);
+  };
 
-  // 切换详情对象时重置子任务筛选与数据
-  useEffect(() => {
-    setTasks([]);
-    setTasksHasMore(false);
-    setTasksError('');
+  useEffect(() => () => { taskRequestRef.current += 1; }, []);
+
+  const openBatchDetail = (batch: ForwardBatch) => {
+    setDownloadError('');
+    setDetailBatch(batch);
     setTaskStatusFilter('all');
     setTaskCustomIdInput('');
     setTaskCustomId('');
-  }, [detailBatch?.id]);
+    void loadTasks(batch.id, 'all', '');
+  };
 
-  // 详情打开或筛选变化时加载第一页
-  useEffect(() => {
-    if (!ctx || !detailBatch) return;
-    void loadTasks();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ctx, detailBatch?.id, taskStatusFilter, taskCustomId]);
+  const closeBatchDetail = useCallback(() => {
+    taskRequestRef.current += 1;
+    setDetailBatch(null);
+  }, []);
+
+  const searchTasks = (batchId: string) => {
+    const customId = taskCustomIdInput.trim();
+    if (customId === taskCustomId) return;
+    setTaskCustomId(customId);
+    void loadTasks(batchId, taskStatusFilter, customId);
+  };
 
   // 再次执行：复用原输入文件与参数（含无视闲时窗口设置）新建一个 Batch（仅 completed/cancelled 可用）
   const handleRerun = useCallback(async (batch: ForwardBatch) => {
@@ -374,7 +386,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
         ...(batch.metadata && Object.keys(batch.metadata).length > 0 ? { metadata: batch.metadata } : {}),
       });
       setBatches((prev) => [fresh, ...prev]);
-      setDetailBatch(null);
+      closeBatchDetail();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('batch_already_processing') || msg.includes('409')) {
@@ -389,7 +401,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
     } finally {
       setRerunningId(null);
     }
-  }, [ctx, rerunningId]);
+  }, [closeBatchDetail, ctx, rerunningId]);
 
   const handleDownloadOutput = useCallback(async (batch: ForwardBatch) => {
     if (!ctx) return;
@@ -494,7 +506,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <button
-                        onClick={() => { setDownloadError(''); setDetailBatch(batch); }}
+                        onClick={() => openBatchDetail(batch)}
                         className="truncate font-mono text-[13px] font-medium text-black/75 hover:text-[#3550FF]"
                         title="查看详情"
                       >
@@ -519,7 +531,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
                     <button
-                      onClick={() => { setDownloadError(''); setDetailBatch(batch); }}
+                      onClick={() => openBatchDetail(batch)}
                       className="rounded-lg border border-[#E5E7EB] bg-white px-3 py-1.5 text-xs font-medium text-black/60 transition hover:bg-gray-50"
                     >
                       详情
@@ -589,7 +601,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
       </div>
 
       {/* 详情弹窗 */}
-      <Modal open={!!detailBatch} onClose={() => setDetailBatch(null)} title="Batch 详情">
+      <Modal open={!!detailBatch} onClose={closeBatchDetail} title="Batch 详情">
         {detailBatch && (() => {
           const b = detailBatch;
           const c = b.request_counts;
@@ -679,7 +691,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
                 <div className="mb-2 flex items-center justify-between">
                   <span className="text-[11px] font-medium text-black/40">子任务明细</span>
                   <button
-                    onClick={() => void loadTasks()}
+                    onClick={() => void loadTasks(b.id, taskStatusFilter, taskCustomId)}
                     disabled={tasksLoading}
                     className="text-[11px] font-medium text-[#3550FF] hover:underline disabled:opacity-40"
                   >
@@ -689,7 +701,11 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
                 <div className="mb-2 flex items-center gap-1.5">
                   <select
                     value={taskStatusFilter}
-                    onChange={(e) => setTaskStatusFilter(e.target.value as typeof taskStatusFilter)}
+                    onChange={(e) => {
+                      const status = e.target.value as typeof taskStatusFilter;
+                      setTaskStatusFilter(status);
+                      void loadTasks(b.id, status, taskCustomId);
+                    }}
                     className="h-7 shrink-0 rounded-lg border border-[#E5E7EB] bg-white px-1.5 text-[11px] text-black/60 outline-none transition focus:border-[#3550FF]"
                   >
                     <option value="all">全部状态</option>
@@ -700,12 +716,12 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
                   <input
                     value={taskCustomIdInput}
                     onChange={(e) => setTaskCustomIdInput(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === 'Enter') setTaskCustomId(taskCustomIdInput.trim()); }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') searchTasks(b.id); }}
                     placeholder="按 custom_id 精确查找"
                     className="h-7 min-w-0 flex-1 rounded-lg border border-[#E5E7EB] bg-white px-2 text-[11px] outline-none transition focus:border-[#3550FF]"
                   />
                   <button
-                    onClick={() => setTaskCustomId(taskCustomIdInput.trim())}
+                    onClick={() => searchTasks(b.id)}
                     className="h-7 shrink-0 rounded-lg bg-[#F4F6FC] px-2.5 text-[11px] font-medium text-black/55 transition hover:bg-[#E8EBF5]"
                   >
                     查询
@@ -755,7 +771,7 @@ export function BatchPanel({ ctx, identityId, templates, defaultTemplateId, getM
                   {tasksHasMore && tasks.length > 0 && (
                     <div className="flex justify-center">
                       <button
-                        onClick={() => void loadTasks({ append: true, afterId: tasks[tasks.length - 1]?.custom_id })}
+                        onClick={() => void loadTasks(b.id, taskStatusFilter, taskCustomId, tasks[tasks.length - 1].custom_id)}
                         disabled={tasksLoading}
                         className="rounded-full border border-[#DDE2F2] bg-white px-3 py-1 text-[11px] text-black/60 transition hover:border-[#3550FF] hover:text-[#3550FF] disabled:opacity-50"
                       >
@@ -956,7 +972,7 @@ function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, getM
   const step1Ready = step1Lines.length > 0 &&
     (mode === 'form' ? formLines.every((l) => l.custom_id) : true);
 
-  const goStep2 = useCallback(async () => {
+  const goStep2 = async () => {
     if (!ctx || step1Lines.length === 0) return;
     setError('');
     setFinalLines(step1Lines);
@@ -976,8 +992,7 @@ function BatchCreateWizard({ ctx, identityId, templates, defaultTemplateId, getM
     } finally {
       setUploading(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ctx, step1Lines, mode, fileName]);
+  };
 
   const retryUpload = useCallback(async () => {
     if (!ctx || finalLines.length === 0) return;

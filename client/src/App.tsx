@@ -1614,19 +1614,20 @@ const SentFileAttachment = memo(function SentFileAttachment({
   path: string;
   fileId?: string;
 }) {
-  const [resolvedId, setResolvedId] = useState<string | undefined>(fileId);
+  const [lookup, setLookup] = useState<{ ctx: ForwardContext; sessionId: string; path: string; id: string }>();
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
+  const resolvedId = fileId || (lookup && lookup.ctx === ctx && lookup.sessionId === sessionId && lookup.path === path
+    ? lookup.id : undefined);
 
   useEffect(() => {
-    if (fileId) { setResolvedId(fileId); return; }
-    if (!ctx || !sessionId) return;
+    if (fileId || !ctx || !sessionId) return;
     let cancelled = false;
     listSessionResources(ctx, sessionId)
       .then((page) => {
         if (cancelled) return;
         const hit = (page.data || []).find((r) => r.type === 'file' && r.mount_path === path);
-        if (hit?.file_id) setResolvedId(hit.file_id);
+        if (hit?.file_id) setLookup({ ctx, sessionId, path, id: hit.file_id });
       })
       .catch(() => { /* id resolution is best-effort; the chip stays inert */ });
     return () => { cancelled = true; };
