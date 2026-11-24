@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import App from './App';
@@ -24,6 +24,7 @@ import {
   uploadCloudSkill,
   waitForChannelBinding,
   type ForwardChannel,
+  startSessionPolling,
   type ForwardContext,
 } from './forwardApi';
 
@@ -46,6 +47,99 @@ describe('login credential privacy', () => {
       expect(html).toContain('aria-pressed="false"');
     });
   }
+});
+
+describe('session polling', () => {
+  let page: EventTarget & { visibilityState: string };
+  let controller: AbortController;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    page = Object.assign(new EventTarget(), { visibilityState: 'visible' });
+    controller = new AbortController();
+    vi.stubGlobal('document', page);
+    vi.stubGlobal('window', globalThis);
+  });
+
+  afterEach(() => {
+    controller.abort();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  test('polls every five seconds and stops on abort', async () => {
+    const sync = vi.fn(async () => {});
+    startSessionPolling(sync, controller.signal, vi.fn());
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(sync).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sync).toHaveBeenCalledTimes(1);
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test('pauses hidden pages and synchronizes immediately on return', async () => {
+    page.visibilityState = 'hidden';
+    const sync = vi.fn(async () => {});
+    startSessionPolling(sync, controller.signal, vi.fn());
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(sync).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    page.visibilityState = 'visible';
+    page.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sync).toHaveBeenCalledTimes(1);
+    page.visibilityState = 'hidden';
+    page.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    page.visibilityState = 'visible';
+    page.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sync).toHaveBeenCalledTimes(3);
+  });
+
+  test('does not overlap slow requests, including visibility changes', async () => {
+    let complete!: () => void;
+    const sync = vi.fn(() => new Promise<void>(resolve => { complete = resolve; }));
+    startSessionPolling(sync, controller.signal, vi.fn());
+    await vi.advanceTimersByTimeAsync(15000);
+    page.dispatchEvent(new Event('visibilitychange'));
+    expect(sync).toHaveBeenCalledTimes(1);
+    complete();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sync).toHaveBeenCalledTimes(2);
+    complete();
+  });
+
+  test('reports failures and continues polling', async () => {
+    const error = new Error('temporary failure');
+    const sync = vi.fn().mockRejectedValueOnce(error).mockResolvedValue(undefined);
+    const onError = vi.fn();
+    startSessionPolling(sync, controller.signal, onError);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(sync).toHaveBeenCalledTimes(2);
+    expect(onError).toHaveBeenCalledExactlyOnceWith(error);
+  });
+
+  test('removes visibility listeners and ignores late errors after stopping', async () => {
+    let reject!: (error: Error) => void;
+    const sync = vi.fn(() => new Promise<void>((_resolve, fail) => { reject = fail; }));
+    const onError = vi.fn();
+    const stop = startSessionPolling(sync, controller.signal, onError);
+    await vi.advanceTimersByTimeAsync(5000);
+    stop();
+    reject(new Error('late failure'));
+    page.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
 
 describe('listEvents', () => {

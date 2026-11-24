@@ -1152,6 +1152,49 @@ export function eventText(event: ForwardEvent): string {
   return '';
 }
 
+export function startSessionPolling(
+  sync: () => Promise<void>,
+  signal: AbortSignal,
+  onError: (error: unknown) => void,
+) {
+  let timer: number | undefined;
+  let inFlight = false;
+  let stopped = signal.aborted;
+  const poll = async () => {
+    if (stopped || inFlight || document.visibilityState === 'hidden') return;
+    inFlight = true;
+    try { await sync(); }
+    catch (error) { if (!stopped) onError(error); }
+    finally { inFlight = false; }
+  };
+  const clearTimer = () => {
+    window.clearInterval(timer);
+    timer = undefined;
+  };
+  const startTimer = () => {
+    if (!stopped && document.visibilityState !== 'hidden') {
+      timer = window.setInterval(() => { void poll(); }, 5000);
+    }
+  };
+  const onVisibilityChange = () => {
+    clearTimer();
+    startTimer();
+    void poll();
+  };
+  const stop = () => {
+    stopped = true;
+    clearTimer();
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+    signal.removeEventListener('abort', stop);
+  };
+  if (!stopped) {
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    signal.addEventListener('abort', stop, { once: true });
+    startTimer();
+  }
+  return stop;
+}
+
 export async function streamEvents(
   ctx: ForwardContext,
   sessionId: string,

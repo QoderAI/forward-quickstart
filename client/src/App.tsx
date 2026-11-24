@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import {
   cancelSession,
   createCloudEnvironment,
@@ -39,6 +39,7 @@ import {
   sendQuestionAnswer,
   sendCustomToolResult,
   streamEvents,
+  startSessionPolling,
   listSchedules,
   createSchedule,
   updateSchedule,
@@ -82,8 +83,6 @@ import {
 import { renderMarkdown } from './markdown';
 import { ChatImage } from './chatImage';
 import { loadArtifactPreview } from './artifactPreview';
-import { BatchPanel } from './batchPanel';
-import { UsagePanel } from './usagePanel';
 import type { RealtimeVoice } from './voice/voiceApi';
 import { VoiceEntryButton } from './voice/VoiceEntryButton';
 import { channelBindingModes } from './channelBinding';
@@ -136,6 +135,9 @@ import {
   splitAttachmentMarkers,
 } from './attachments';
 import { formatCredits, modelCallsForMessage, type ModelCall } from './credits';
+
+const BatchPanel = lazy(() => import('./batchPanel').then(module => ({ default: module.BatchPanel })));
+const UsagePanel = lazy(() => import('./usagePanel').then(module => ({ default: module.UsagePanel })));
 
 // Helpers for the multiagent roster form state.
 const AUTH_KEY = 'forward_quickstart_auth';
@@ -3953,7 +3955,6 @@ export default function App() {
     if (!ctx) return;
     streamAbort.current?.abort();
     const controller = new AbortController();
-    let pollTimer: number | undefined;
     // Track whether this session has spawned child threads (multiagent mode).
     // In multiagent mode, child thread_status_idle must NOT terminate the SSE
     // stream — only session.status_idle signals session-level completion.
@@ -4005,12 +4006,6 @@ export default function App() {
         streamFlushTimer = null;
       }
     };
-    const stopPolling = () => {
-      if (pollTimer !== undefined) {
-        window.clearInterval(pollTimer);
-        pollTimer = undefined;
-      }
-    };
     const finishStream = () => {
       // Flush any pending streaming text so the user sees the latest content
       // before the stream terminates.
@@ -4042,11 +4037,9 @@ export default function App() {
       stopPolling();
       setStreaming(false);
     }, { once: true });
-    pollTimer = window.setInterval(() => {
-      void syncLatestEvents().catch((err) => {
-        if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err));
-      });
-    }, 1500);
+    const stopPolling = startSessionPolling(syncLatestEvents, controller.signal, (err) => {
+      setError(err instanceof Error ? err.message : String(err));
+    });
     streamAbort.current = controller;
     setStreaming(true);
     void streamEvents(
@@ -5243,7 +5236,9 @@ export default function App() {
     </div>
   </div>
 ) : activePanel === 'batches' ? (
-  <BatchPanel ctx={ctx} identityId={identity?.id || ''} templates={templates} defaultTemplateId={templateId || templates[0]?.id} getModelLabel={getModelLabel} />
+  <Suspense fallback={<div role="status" className="p-6 text-sm text-black/50">正在加载批处理…</div>}>
+    <BatchPanel ctx={ctx} identityId={identity?.id || ''} templates={templates} defaultTemplateId={templateId || templates[0]?.id} getModelLabel={getModelLabel} />
+  </Suspense>
 ) : activePanel === 'templates' ? (
             <div className="h-full overflow-y-auto bg-[#FAFBFF]">
               <div className="flex max-w-[1440px] flex-col gap-4 p-6">
@@ -5454,7 +5449,9 @@ export default function App() {
               </div>
             </div>
           ) : activePanel === 'usage' ? (
-            <UsagePanel ctx={ctx} identityId={identity?.id ?? ''} displayName={displayName} getModelLabel={getModelLabel} />
+            <Suspense fallback={<div role="status" className="p-6 text-sm text-black/50">正在加载用量…</div>}>
+              <UsagePanel ctx={ctx} identityId={identity?.id ?? ''} displayName={displayName} getModelLabel={getModelLabel} />
+            </Suspense>
           ) : isResourcePanel(activePanel) ? (
             <div className="h-full overflow-y-auto bg-[#FAFBFF]">
               <div className="flex max-w-[1440px] flex-col gap-5 p-6">
@@ -5972,6 +5969,8 @@ export default function App() {
                               onToggleToolCalls={toggleShowToolCalls}
                             />
                             <button
+                              title="发送消息"
+                              aria-label="发送消息"
                               onClick={() => void send()}
                               disabled={!canSendMessage}
                               className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
@@ -6180,8 +6179,11 @@ export default function App() {
                               onToggleToolCalls={toggleShowToolCalls}
                             />
                             <button
+                              title={stopping ? '正在停止回复' : canStopCurrentTurn ? '停止回复' : '发送消息'}
+                              aria-label={stopping ? '正在停止回复' : canStopCurrentTurn ? '停止回复' : '发送消息'}
+                              aria-busy={stopping}
                               onClick={() => ((canStopCurrentTurn || stopping) ? void stop() : void send())}
-                              disabled={!(canStopCurrentTurn || stopping) && !canSendMessage}
+                              disabled={stopping || (!canStopCurrentTurn && !canSendMessage)}
                               className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
                                 (canStopCurrentTurn || stopping)
                                   ? 'bg-red-500 text-white hover:bg-red-600'
