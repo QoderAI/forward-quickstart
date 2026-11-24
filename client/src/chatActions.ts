@@ -1,4 +1,5 @@
 import { getSession, type ForwardContext, type ForwardEvent } from './forwardApi';
+import { isTurnTerminal, stopReason, turnEventState } from './conversationTurns';
 
 export async function waitForSessionStop(ctx: ForwardContext, sessionId: string, signal: AbortSignal) {
   const deadline = new AbortController();
@@ -77,15 +78,15 @@ function evaluatedPermission(event: ForwardEvent): string | undefined {
   return undefined;
 }
 
-function stopReasonForEvent(event: ForwardEvent): Record<string, unknown> | undefined {
-  if (event.type !== 'session.status_idle') return undefined;
-  return asRecord(event.stop_reason) ?? asRecord(asRecord(event.content)?.stop_reason);
+function currentActionEvents(events: ForwardEvent[]) {
+  const turn = events.slice(Math.max(0, events.findLastIndex(event => event.type === 'user.message')));
+  return turn.some(event => isTurnTerminal(turnEventState(event))) ? [] : turn;
 }
 
 function requiresActionIds(event: ForwardEvent): string[] {
-  const stopReason = stopReasonForEvent(event);
-  if (stopReason?.type !== 'requires_action' || !Array.isArray(stopReason.event_ids)) return [];
-  return stopReason.event_ids.filter((id): id is string => typeof id === 'string');
+  const reason = event.type === 'session.status_idle' ? stopReason(event) : undefined;
+  if (reason?.type !== 'requires_action' || !Array.isArray(reason.event_ids)) return [];
+  return reason.event_ids.filter((id): id is string => typeof id === 'string');
 }
 
 function isQuestionToolName(name: string): boolean {
@@ -132,7 +133,8 @@ function questionInfo(event: ForwardEvent): PendingQuestion | null {
   return null;
 }
 
-export function derivePendingToolApprovals(events: ForwardEvent[]): PendingToolApproval[] {
+export function derivePendingToolApprovals(history: ForwardEvent[]): PendingToolApproval[] {
+  const events = currentActionEvents(history);
   const resolved = new Set(
     events
       .filter((event) => event.type === 'user.tool_confirmation')
@@ -142,25 +144,22 @@ export function derivePendingToolApprovals(events: ForwardEvent[]): PendingToolA
   const byId = new Map(events.map((event) => [event.id, event]));
   const pending: PendingToolApproval[] = [];
   const seen = new Set<string>();
-  for (const event of events) {
-    for (const id of requiresActionIds(event)) {
-      if (seen.has(id) || resolved.has(id)) continue;
-      seen.add(id);
-      const toolEvent = byId.get(id);
-      if (!toolEvent || questionInfo(toolEvent)) continue;
-      // Client-side custom tools wait for user.custom_tool_result, not confirmation.
-      if (toolEvent.type === 'agent.custom_tool_use') continue;
-      const permission = evaluatedPermission(toolEvent);
-      if (permission === 'allow' || permission === 'deny') continue;
-      pending.push({ toolUseId: id, toolName: normalizedToolName(toolEvent), input: toolInput(toolEvent) });
-    }
+  const idle = events.findLast(event => event.type === 'session.status_idle' || event.type === 'session.status_running');
+  for (const id of idle ? requiresActionIds(idle) : []) {
+    if (seen.has(id) || resolved.has(id)) continue;
+    seen.add(id);
+    const toolEvent = byId.get(id);
+    if (!toolEvent || !['agent.tool_use', 'agent.mcp_tool_use'].includes(toolEvent.type)) continue;
+    const permission = evaluatedPermission(toolEvent);
+    if (permission === 'allow' || permission === 'deny') continue;
+    pending.push({ toolUseId: id, toolName: normalizedToolName(toolEvent), input: toolInput(toolEvent) });
   }
   return pending;
 }
 
-export function derivePendingQuestion(events: ForwardEvent[]): PendingQuestion | null {
+export function derivePendingQuestion(history: ForwardEvent[]): PendingQuestion | null {
+  const events = currentActionEvents(history);
   const resolved = new Set<string>();
-  const terminatedTurns = new Set<string>();
   for (const event of events) {
     if (event.type === 'user.question_answer' && typeof event.question_use_id === 'string') {
       resolved.add(event.question_use_id);
@@ -168,19 +167,12 @@ export function derivePendingQuestion(events: ForwardEvent[]): PendingQuestion |
     if (event.type === 'user.custom_tool_result' && typeof event.custom_tool_use_id === 'string') {
       resolved.add(event.custom_tool_use_id);
     }
-    const stopReason = stopReasonForEvent(event);
-    if (stopReason && stopReason.type !== 'requires_action' && typeof event.turn_id === 'string') {
-      terminatedTurns.add(event.turn_id);
-    }
   }
+  const boundary = events.findLastIndex(event => event.type === 'session.status_running' || event.type === 'session.status_idle');
+  const ids = boundary >= 0 ? requiresActionIds(events[boundary]) : [];
   for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    const info = questionInfo(event);
-    if (
-      info
-      && !resolved.has(info.questionUseId)
-      && !(typeof event.turn_id === 'string' && terminatedTurns.has(event.turn_id))
-    ) return info;
+    const info = questionInfo(events[index]);
+    if (info && !resolved.has(info.questionUseId) && (index > boundary || ids.includes(info.questionUseId))) return info;
   }
   return null;
 }

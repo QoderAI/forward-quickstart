@@ -9,6 +9,7 @@ import {
   updateTemplate,
   forwardRequest,
   getSession,
+  cancelSession,
   streamEvents,
   listTemplates,
   listResources,
@@ -36,6 +37,7 @@ import {
   getTeamsCallbackUrl,
   listResourceCatalog,
   listEvents,
+  listRecentEvents,
   listMemoryEntries,
   updateCloudEnvironment,
   updateCloudSkill,
@@ -46,6 +48,22 @@ import {
   startSessionPolling,
   type ForwardContext,
 } from './forwardApi';
+
+describe('cancelSession', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  test('distinguishes accepted cancellation from no active turn by HTTP status', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(Response.json({ status: 'canceling' }, { status: 202 }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+    vi.stubGlobal('fetch', fetch);
+    const ctx = { pat: 'test-token', environment: 'cn-prod' as const };
+    const signal = new AbortController().signal;
+    expect(await cancelSession(ctx, 'session', signal)).toBe(true);
+    expect(await cancelSession(ctx, 'session', signal)).toBe(false);
+    expect(fetch.mock.calls[0][1].signal).toBe(signal);
+  });
+});
 
 describe('login credential privacy', () => {
   afterEach(() => vi.unstubAllGlobals());
@@ -162,30 +180,21 @@ describe('session polling', () => {
 });
 
 describe('listEvents', () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
+  afterEach(() => vi.unstubAllGlobals());
 
-  test('passes event type filters using the supported types query parameter', async () => {
-    let requestBody: { query?: Record<string, unknown> } = {};
-    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      requestBody = JSON.parse(String(init?.body));
-      return new Response(JSON.stringify({ data: [], has_more: false }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }));
-
-    const ctx: ForwardContext = { pat: 'pat_test', environment: 'cn-prod' };
-    await listEvents(ctx, 'sess_123');
-
-    expect(requestBody.query).toEqual({
+  test('loads the latest page in descending order with a comma-separated type filter', async () => {
+    const { requests } = stubPages([{ data: [], has_more: false }]);
+    await listEvents(apiContext, 'sess /?');
+    expect(requests[0]).toMatchObject({ method: 'GET', path: '/sessions/sess%20%2F%3F/events' });
+    expect(requests[0].query).toEqual({
       limit: 100,
       order: 'desc',
-      types: [
+      type: [
         'user.message',
+        'user.interrupt',
         'user.tool_confirmation',
         'user.question_answer',
+        'user.tool_result',
         'user.custom_tool_result',
         'agent.message',
         'agent.thinking',
@@ -196,43 +205,129 @@ describe('listEvents', () => {
         'agent.tool_result',
         'agent.custom_tool_result',
         'agent.mcp_tool_result',
+        'agent.artifact_delivered',
         'span.model_request_end',
+        'session.status_running',
         'session.status_idle',
+        'session.status_terminated',
+        'session.completed',
+        'session.cancelled',
+        'session.canceled',
+        'session.error',
+        'session.updated',
+        'session.usage',
         'session.thread_created',
         'session.thread_status_running',
         'session.thread_status_idle',
         'session.thread_status_rescheduled',
+        'session.thread_status_terminated',
         'agent.thread_message_sent',
         'agent.thread_message_received',
       ].join(','),
     });
-    expect(requestBody.query).not.toHaveProperty('types[]');
   });
 
-  test('uses the previous page last id to load older events', async () => {
-    let requestBody: { query?: Record<string, unknown> } = {};
-    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      requestBody = JSON.parse(String(init?.body));
-      return new Response(JSON.stringify({
-        data: [{ id: 'evt_older', type: 'user.message', session_id: 'sess_123' }],
-        last_id: 'evt_older',
-        has_more: false,
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }));
+  test.each([
+    [{ beforeId: 'cursor' }, 'before_id', 'desc', 'after_id'],
+    [{ afterId: 'cursor' }, 'after_id', 'asc', 'before_id'],
+  ] as const)('pairs %j with %s and %s order', async (opts, cursor, order, otherCursor) => {
+    const page = { data: [], first_id: null, last_id: null, has_more: false };
+    const { requests } = stubPages([page]);
+    expect(await listEvents(apiContext, 'sess', opts)).toEqual(page);
+    expect(requests[0].query).toMatchObject({ [cursor]: 'cursor', limit: 100, order });
+    expect(requests[0].query).not.toHaveProperty(otherCursor);
+  });
 
-    const ctx: ForwardContext = { pat: 'pat_test', environment: 'cn-prod' };
-    const page = await listEvents(ctx, 'sess_123', { afterId: 'evt_cursor' });
+  test('rejects simultaneous before and after cursors without making a request', async () => {
+    const { fetch } = stubPages([]);
+    await expect(listEvents(apiContext, 'sess', { afterId: 'newer', beforeId: 'older' }))
+      .rejects.toMatchObject({ status: 400, code: 'invalid_pagination' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
 
-    expect(requestBody.query).toMatchObject({
-      after_id: 'evt_cursor',
-      limit: 100,
-      order: 'desc',
+describe('listRecentEvents', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const eventPage = (ids: string[], has_more: boolean) => ({
+    data: ids.map(id => ({ id, type: 'agent.message', session_id: 'sess' })),
+    first_id: ids[0] ?? null,
+    last_id: ids.at(-1) ?? null,
+    has_more,
+  });
+
+  test.each([undefined, 'known'])('returns the whole latest page without paging for knownId=%s', async knownId => {
+    const latest = eventPage(['new', 'known', 'old'], true);
+    const { fetch, requests } = stubPages([latest]);
+    expect(await listRecentEvents(apiContext, 'sess', knownId)).toEqual(latest);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(requests[0].query).toMatchObject({ order: 'desc' });
+    expect(requests[0].query).not.toHaveProperty('before_id');
+  });
+
+  test('recovers a gap of more than 100 events in API order and keeps the boundary page cursor', async () => {
+    const ids = Array.from({ length: 201 }, (_, index) => `evt_${201 - index}`);
+    const latest = eventPage(ids.slice(0, 100), true);
+    const middle = eventPage(ids.slice(99, 199), true); // Duplicate at the page boundary.
+    const oldest = eventPage([...ids.slice(199), 'known', 'older-than-known'], true);
+    const { fetch, requests } = stubPages([latest, middle, oldest]);
+    const page = await listRecentEvents(apiContext, 'sess', 'known');
+    expect(page.data.map(event => event.id)).toEqual([...ids, 'known', 'older-than-known']);
+    expect(page).toMatchObject({ first_id: ids[0], last_id: 'older-than-known', has_more: true });
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(requests.slice(1).map(({ query }) => query)).toEqual([
+      expect.objectContaining({ before_id: latest.last_id, order: 'desc' }),
+      expect.objectContaining({ before_id: middle.last_id, order: 'desc' }),
+    ]);
+    for (const { query } of requests) expect(query).not.toHaveProperty('after_id');
+  });
+
+  test('returns all reachable history when the known event was deleted, even if the final page is empty', async () => {
+    const latest = eventPage(['new', 'newer-cursor'], true);
+    const older = eventPage(['old', 'oldest'], true);
+    const { fetch, requests } = stubPages([latest, older, eventPage([], false)]);
+    const page = await listRecentEvents(apiContext, 'sess', 'deleted');
+    expect(page).toEqual({ data: [...latest.data, ...older.data], first_id: 'new', last_id: 'oldest', has_more: false });
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(requests.map(({ query }) => query.before_id)).toEqual([undefined, 'newer-cursor', 'oldest']);
+  });
+
+  test.each([
+    [{ data: [], has_more: true }],
+    [eventPage(['new'], true), { ...eventPage(['old'], true), last_id: null }],
+  ])('rejects has_more without last_id instead of guessing a cursor', async (...pages) => {
+    const { fetch } = stubPages(pages);
+    await expect(listRecentEvents(apiContext, 'sess', 'known')).rejects.toMatchObject({
+      status: 502, code: 'invalid_pagination_cursor', message: expect.stringContaining('has_more=true 但缺少分页游标 last_id'),
     });
-    expect(page.last_id).toBe('evt_older');
-    expect(page.has_more).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(pages.length);
+  });
+
+  test.each([['a', 'a'], ['a', 'b', 'a']])('rejects repeated or cyclic cursors: %s', async (...cursors) => {
+    const { fetch } = stubPages(cursors.map(cursor => eventPage([cursor], true)));
+    await expect(listRecentEvents(apiContext, 'sess', 'known')).rejects.toMatchObject({
+      status: 502, code: 'invalid_pagination_cursor', message: expect.stringContaining('last_id 没有推进'),
+    });
+    expect(fetch).toHaveBeenCalledTimes(cursors.length);
+  });
+
+  test('forwards the signal to every page fetch and aborts a pending older-page request', async () => {
+    const controller = new AbortController();
+    const fetch = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>()
+      .mockResolvedValueOnce(jsonResponse(eventPage(['new'], true)))
+      .mockImplementationOnce((_url, init) => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      }));
+    vi.stubGlobal('fetch', fetch);
+    const pending = listRecentEvents(apiContext, 'sess', 'known', { signal: controller.signal });
+    const failure = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    controller.abort();
+    await failure;
+    for (const [, init] of fetch.mock.calls) {
+      expect(init?.signal).toBe(controller.signal);
+      expect(JSON.parse(String(init?.body))).not.toHaveProperty('signal');
+    }
   });
 });
 
@@ -823,6 +918,19 @@ describe('SSE frames and lifecycle', () => {
     expect(stream.cancel).toHaveBeenCalledTimes(1);
     expect(stream.release).toHaveBeenCalledTimes(1);
     expect(stream.body.locked).toBe(false);
+  });
+
+  test('does not promote a same-ID delta or an inherited cursor to a complete-event cursor', async () => {
+    const wire = 'id: partial\ndata: {"id":"partial","type":"event_start"}\n\n'
+      + 'id: partial\ndata: {"id":"partial","type":"event_delta"}\n\n'
+      + 'data: {"id":"no-explicit-cursor","type":"session.usage"}\n\n'
+      + 'id: partial\ndata: {"id":"partial","type":"agent.message"}\n\n';
+    stubSse([sseBytes(wire)]);
+    const onCompleteEventCursor = vi.fn();
+    const onEvent = vi.fn();
+    await streamEvents(apiContext, 'sess', onEvent, undefined, 'prior', { onCompleteEventCursor });
+    expect(onEvent).toHaveBeenCalledTimes(4);
+    expect(onCompleteEventCursor).toHaveBeenCalledExactlyOnceWith('partial', { id: 'partial', type: 'agent.message' });
   });
 
   test('parses lone-CR frames correctly at every possible chunk boundary', async () => {

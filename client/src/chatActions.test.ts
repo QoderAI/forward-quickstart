@@ -23,6 +23,17 @@ describe('derivePendingToolApprovals', () => {
     ]);
   });
 
+  test('does not retain a pending approval after a new message or terminal event without turn IDs', () => {
+    const events = [
+      event('u1', 'user.message'),
+      event('tool_1', 'agent.tool_use', { name: 'Read', evaluated_permission: 'ask' }),
+      event('idle', 'session.status_idle', { stop_reason: { type: 'requires_action', event_ids: ['tool_1'] } }),
+    ];
+    expect(derivePendingToolApprovals(events)).toHaveLength(1);
+    expect(derivePendingToolApprovals([...events, event('u2', 'user.message')])).toEqual([]);
+    expect(derivePendingToolApprovals([...events, event('end', 'session.error')])).toEqual([]);
+  });
+
   test('removes an approval after a confirmation event arrives', () => {
     const events = [
       event('tool_1', 'agent.tool_use', { name: 'Edit', evaluated_permission: 'ask' }),
@@ -68,6 +79,14 @@ describe('derivePendingQuestion', () => {
         stop_reason: { type: 'cancelled' },
       }),
     ])).toBeNull();
+  });
+
+  test('clears an older question when a later pause refers to a different action', () => {
+    const ask = event('ask_1', 'agent.ask_user_question', { questions });
+    const firstPause = event('wait_1', 'session.status_idle', { stop_reason: { type: 'requires_action', event_ids: ['ask_1'] } });
+    const secondPause = event('wait_2', 'session.status_idle', { stop_reason: { type: 'requires_action', event_ids: ['tool_2'] } });
+    expect(derivePendingQuestion([ask, firstPause])?.questionUseId).toBe('ask_1');
+    expect(derivePendingQuestion([ask, firstPause, secondPause])).toBeNull();
   });
 
   test('encodes custom-tool answers for the model', () => {

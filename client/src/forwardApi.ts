@@ -141,8 +141,10 @@ export interface Page<T> {
 
 const LIST_EVENT_TYPES = [
   'user.message',
+  'user.interrupt',
   'user.tool_confirmation',
   'user.question_answer',
+  'user.tool_result',
   'user.custom_tool_result',
   'agent.message',
   'agent.thinking',
@@ -153,16 +155,26 @@ const LIST_EVENT_TYPES = [
   'agent.tool_result',
   'agent.custom_tool_result',
   'agent.mcp_tool_result',
+  'agent.artifact_delivered',
   // Per-call credit spend. Needed in listEvents so historical replies still show
   // their cost after a page refresh (the streaming accumulator is gone by then).
   'span.model_request_end',
+  'session.status_running',
   'session.status_idle',
+  'session.status_terminated',
+  'session.completed',
+  'session.cancelled',
+  'session.canceled',
+  'session.error',
+  'session.updated',
+  'session.usage',
   // Multiagent 协同事件：历史会话也要能还原协调者与子 Agent 的派发/回执/状态过程，
   // 否则刷新或重开会话后协同可视化会丢失（见 multiagent.ts / multiagentPanel.tsx）。
   'session.thread_created',
   'session.thread_status_running',
   'session.thread_status_idle',
   'session.thread_status_rescheduled',
+  'session.thread_status_terminated',
   'agent.thread_message_sent',
   'agent.thread_message_received',
 ].join(',');
@@ -242,6 +254,13 @@ export async function forwardRequest<T>(
   query?: Record<string, unknown>,
   options: ForwardRequestOptions = {},
 ): Promise<T> {
+  const response = await forwardResponse<T>(ctx, method, path, body, query, options);
+  return response.data;
+}
+
+async function forwardResponse<T>(
+  ctx: ForwardContext, method: string, path: string, body?: unknown, query?: Record<string, unknown>, options: ForwardRequestOptions = {},
+): Promise<{ data: T; status: number }> {
   const res = await fetch('/api/forward/request', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -262,7 +281,7 @@ export async function forwardRequest<T>(
 
   const text = await res.text();
   if (!res.ok) throw parseForwardError(res.status, text, res.headers);
-  return (text ? parseJson(text) : null) as T;
+  return { data: (text ? parseJson(text) : null) as T, status: res.status };
 }
 
 async function cloudRequest<T>(
@@ -1076,12 +1095,9 @@ export async function archiveSession(ctx: ForwardContext, sessionId: string) {
   return forwardRequest<ForwardSession>(ctx, 'POST', `/sessions/${encodeURIComponent(sessionId)}/archive`);
 }
 
-export async function cancelSession(ctx: ForwardContext, sessionId: string) {
-  return forwardRequest<{ id: string; type: string; status: string }>(
-    ctx,
-    'POST',
-    `/sessions/${encodeURIComponent(sessionId)}/cancel`,
-  );
+export async function cancelSession(ctx: ForwardContext, sessionId: string, signal?: AbortSignal) {
+  const response = await forwardResponse<unknown>(ctx, 'POST', `/sessions/${encodeURIComponent(sessionId)}/cancel`, undefined, undefined, { signal });
+  return response.status === 202;
 }
 
 export async function sendUserMessage(ctx: ForwardContext, sessionId: string, text: string) {
@@ -1163,23 +1179,82 @@ export async function sendCustomToolResult(
   );
 }
 
+/** Defaults to newest first; afterId scans forward, beforeId scans older history. */
 export async function listEvents(
   ctx: ForwardContext,
   sessionId: string,
-  opts: { afterId?: string } = {},
-) {
-  return forwardRequest<Page<ForwardEvent>>(
-    ctx,
-    'GET',
-    `/sessions/${encodeURIComponent(sessionId)}/events`,
-    undefined,
-    {
-      limit: 100,
-      order: 'desc',
-      types: LIST_EVENT_TYPES,
-      ...(opts.afterId ? { after_id: opts.afterId } : {}),
-    },
-  );
+  opts: { afterId?: string; beforeId?: string; signal?: AbortSignal } = {},
+): Promise<Page<ForwardEvent>> {
+  const { afterId, beforeId, signal } = opts;
+  if (afterId && beforeId) {
+    throw new ForwardApiError(400, 'after_id 和 before_id 不能同时使用', undefined, 'invalid_pagination');
+  }
+  const path = `/sessions/${encodeURIComponent(sessionId)}/events`;
+  const page = await forwardRequest<Page<ForwardEvent>>(ctx, 'GET', path, undefined, {
+    limit: 100,
+    order: afterId ? 'asc' : 'desc',
+    type: LIST_EVENT_TYPES,
+    ...(afterId ? { after_id: afterId } : {}),
+    ...(beforeId ? { before_id: beforeId } : {}),
+  }, { signal });
+  if (!page || !Array.isArray(page.data) || typeof page.has_more !== 'boolean') {
+    throw new ForwardApiError(502, `${path} 分页响应无效`, undefined, 'invalid_pagination_response');
+  }
+  if (page.has_more) {
+    if (typeof page.last_id !== 'string' || !page.last_id.trim()) {
+      throw new ForwardApiError(502, `${path} has_more=true 但缺少分页游标 last_id`, undefined, 'invalid_pagination_cursor');
+    }
+    if (page.last_id === (afterId || beforeId)) {
+      throw new ForwardApiError(502, `${path} 分页游标 last_id 没有推进`, undefined, 'invalid_pagination_cursor');
+    }
+  }
+  return page;
+}
+
+/** Fetch newest first through the page containing the known event, or to exhaustion. */
+export async function listRecentEvents(
+  ctx: ForwardContext,
+  sessionId: string,
+  knownId: string | undefined,
+  options?: { signal?: AbortSignal },
+): Promise<Page<ForwardEvent>> {
+  const signal = options?.signal;
+  signal?.throwIfAborted();
+  const latest = await listEvents(ctx, sessionId, { signal });
+  signal?.throwIfAborted();
+  if (!knownId || !latest.has_more || latest.data.some(event => event.id === knownId)) return latest;
+
+  const data: ForwardEvent[] = [];
+  const seenIds = new Set<string>();
+  const seenCursors = new Set<string>();
+  let oldest = latest;
+  while (true) {
+    for (const event of oldest.data) {
+      if (seenIds.has(event.id)) continue;
+      seenIds.add(event.id);
+      data.push(event);
+    }
+    if (oldest.has_more) {
+      // listEvents already checks that last_id exists and differs from the input cursor.
+      const beforeId = oldest.last_id!;
+      if (seenCursors.has(beforeId)) {
+        const path = `/sessions/${encodeURIComponent(sessionId)}/events`;
+        throw new ForwardApiError(502, `${path} 分页游标 last_id 没有推进（循环）`, undefined, 'invalid_pagination_cursor');
+      }
+      if (!seenIds.has(knownId)) {
+        seenCursors.add(beforeId);
+        oldest = await listEvents(ctx, sessionId, { beforeId, signal });
+        signal?.throwIfAborted();
+        continue;
+      }
+    }
+    return {
+      data,
+      first_id: latest.first_id ?? data[0]?.id ?? null,
+      last_id: oldest.last_id ?? data.at(-1)?.id ?? null,
+      has_more: oldest.has_more,
+    };
+  }
 }
 
 export function eventText(event: ForwardEvent): string {
@@ -1247,6 +1322,7 @@ export interface StreamEventsOptions {
   includeThinking?: boolean;
   includeToolCalls?: boolean;
   onCursor?: (id: string) => void;
+  onCompleteEventCursor?: (id: string, event: ForwardEvent) => void;
 }
 
 export async function streamEvents(
@@ -1286,6 +1362,7 @@ export async function streamEvents(
   let dataLines: string[] = [];
   let eventType = '';
   let cursor = lastEventId;
+  let hasFrameCursor = false;
   let acknowledgedCursor = lastEventId;
   let ended = false;
   let cancellation: Promise<void> | undefined;
@@ -1298,7 +1375,9 @@ export async function streamEvents(
       const raw = dataLines.join('\n');
       dataLines = [];
       const type = eventType;
+      const frameHasCursor = hasFrameCursor;
       eventType = '';
+      hasFrameCursor = false;
       if (!raw) return;
       if (raw.trim() === '[DONE]') { ended = true; return; }
       const event = parseJson(raw);
@@ -1313,6 +1392,11 @@ export async function streamEvents(
       await onEvent(event as ForwardEvent);
       signal?.throwIfAborted();
       if (cursor !== undefined) await options.onCursor?.(cursor);
+      const parsed = event as ForwardEvent;
+      if (frameHasCursor && cursor !== undefined && typeof parsed.type === 'string'
+          && !/^(?:event_(start|delta)|agent\.(message_(start|delta|stop)|content_block_(start|delta|stop)))$/.test(parsed.type)) {
+        options.onCompleteEventCursor?.(cursor, parsed);
+      }
       acknowledgedCursor = cursor;
       return;
     }
@@ -1323,7 +1407,7 @@ export async function streamEvents(
     if (content.startsWith(' ')) content = content.slice(1);
     if (field === 'data') dataLines.push(content);
     else if (field === 'event') eventType = content;
-    else if (field === 'id' && !content.includes('\0')) cursor = content;
+    else if (field === 'id' && !content.includes('\0')) { cursor = content; hasFrameCursor = true; }
   }
 
   async function consume(text: string) {

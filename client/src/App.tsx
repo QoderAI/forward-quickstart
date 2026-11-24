@@ -1,4 +1,4 @@
-import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { lazy, memo, Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import {
   cancelSession,
   ForwardApiError,
@@ -36,6 +36,7 @@ import {
   archiveTemplate,
   ensureIdentity,
   listEvents,
+  listRecentEvents,
   listResourceCatalog,
   listResources,
   listSessions,
@@ -146,6 +147,7 @@ import {
   splitAttachmentMarkers,
 } from './attachments';
 import { formatCredits, modelCallsForMessage, type ModelCall } from './credits';
+import { commitConversationTurn, conversationCredits, isTurnTerminal, latestTurnState, mergeConversationEvents, projectConversation, stopReason, toolSummary, turnEventState, type ConversationTurn, type ProcessStep, type TurnState } from './conversationTurns';
 
 const BatchPanel = lazy(() => import('./batchPanel').then(module => ({ default: module.BatchPanel })));
 const UsagePanel = lazy(() => import('./usagePanel').then(module => ({ default: module.UsagePanel })));
@@ -525,56 +527,6 @@ function eventThinkingText(event: ForwardEvent) {
   return '';
 }
 
-type EventViewKind =
-  | 'user'
-  | 'agent_message'
-  | 'agent_thinking'
-  | 'tool_use'
-  | 'tool_result'
-  | 'session_error'
-  | 'multiagent_status'
-  | 'hidden';
-
-function eventViewKind(event: ForwardEvent): EventViewKind {
-  if (event.type === 'user.message') return 'user';
-  // session.error must stay visible in the chat: it clears the local thinking
-  // bubble, so hiding it would make the turn end silently with no feedback.
-  if (event.type === 'session.error') return 'session_error';
-  if (event.type === 'agent.message') return 'agent_message';
-  if (event.type === 'agent.thinking') return 'agent_thinking';
-  if (
-    event.type === 'agent.tool_use' ||
-    event.type === 'agent.custom_tool_use' ||
-    event.type === 'agent.mcp_tool_use'
-  ) {
-    return 'tool_use';
-  }
-  if (
-    event.type === 'agent.tool_result' ||
-    event.type === 'agent.custom_tool_result' ||
-    event.type === 'agent.mcp_tool_result'
-  ) {
-    return 'tool_result';
-  }
-  // Multiagent thread events — rendered as delegation/reply cards and status
-  // lines so the user can follow coordinator ↔ sub-agent progress
-  // (e.g. "已委派任务给足球经理专家"). See multiagent.ts / multiagentPanel.tsx.
-  if (
-    event.type === 'session.thread_created' ||
-    event.type === 'session.thread_status_running' ||
-    event.type === 'session.thread_status_idle' ||
-    event.type === 'session.thread_status_rescheduled' ||
-    event.type === 'agent.thread_message_sent' ||
-    event.type === 'agent.thread_message_received'
-  ) {
-    return 'multiagent_status';
-  }
-  // span.* events (e.g. span.model_request_end) are data-only: they feed the
-  // per-reply credit breakdown but must never render as their own chat bubble.
-  if (event.type.startsWith('span.')) return 'hidden';
-  return 'hidden';
-}
-
 function getEventValue(event: ForwardEvent, keys: string[]): unknown {
   for (const key of keys) {
     const value = event[key];
@@ -640,30 +592,6 @@ function toolEventName(event: ForwardEvent) {
   return 'tool';
 }
 
-function toolEventPayload(event: ForwardEvent) {
-  const value = getEventValue(event, [
-    'input',
-    'arguments',
-    'parameters',
-    'output',
-    'result',
-    'content',
-    'error',
-    'reason',
-  ]);
-  return truncateForDisplay(stringifyPayload(value || eventDebugPayload(event)));
-}
-
-function toolEventId(event: ForwardEvent) {
-  const value = getEventValue(event, [
-    'tool_use_id',
-    'custom_tool_use_id',
-    'mcp_tool_use_id',
-    'tool_call_id',
-  ]);
-  return typeof value === 'string' ? value : '';
-}
-
 /**
  * Extract Cloud file ids (file_...) produced by the DeliverArtifacts tool from a
  * tool_result event. The exact field path varies, so we scan the serialized
@@ -689,69 +617,6 @@ function extractArtifactFileIds(event: ForwardEvent): string[] {
 // tool; ImageGen (added to the builtin toolset later) returns generated
 // images the same way, so it must trigger the same inline preview.
 const ARTIFACT_TOOL_NAMES = new Set(['DeliverArtifacts', 'ImageGen']);
-
-function toolResultMatchesUse(resultEvent: ForwardEvent, useEvent: ForwardEvent) {
-  if (eventViewKind(resultEvent) !== 'tool_result') return false;
-  if (resultEvent.session_id !== useEvent.session_id) return false;
-
-  const resultId = toolEventId(resultEvent);
-  const useId = toolEventId(useEvent) || useEvent.id;
-  if (resultId && useId && resultId === useId) return true;
-
-  return Boolean(
-    resultEvent.turn_id &&
-    useEvent.turn_id &&
-    resultEvent.turn_id === useEvent.turn_id &&
-    toolEventName(resultEvent) === toolEventName(useEvent),
-  );
-}
-
-function isSameTurnOrUnknown(event: ForwardEvent, target: ForwardEvent) {
-  return (
-    event.session_id === target.session_id &&
-    (!event.turn_id || !target.turn_id || event.turn_id === target.turn_id)
-  );
-}
-
-function isTerminalEvent(event: ForwardEvent) {
-  return (
-    event.type === 'agent.message' ||
-    event.type === 'session.status_idle' ||
-    event.type === 'session.error' ||
-    event.type === 'session.completed' ||
-    event.type === 'session.cancelled' ||
-    event.type === 'session.canceled'
-  );
-}
-
-function isToolUsePending(events: ForwardEvent[], event: ForwardEvent, index: number) {
-  for (const item of events.slice(index + 1)) {
-    if (!isSameTurnOrUnknown(item, event)) continue;
-    if (toolResultMatchesUse(item, event)) return false;
-    if (
-      eventViewKind(item) === 'tool_result' &&
-      (!toolEventId(item) || toolEventName(item) === 'tool')
-    ) {
-      return false;
-    }
-    if (isTerminalEvent(item)) return false;
-    if (eventViewKind(item) === 'user') return false;
-  }
-  return true;
-}
-
-function toolDisplayNameForEvent(events: ForwardEvent[], event: ForwardEvent, index: number) {
-  const ownName = toolEventName(event);
-  if (eventViewKind(event) !== 'tool_result' || ownName !== 'tool') return ownName;
-
-  for (let i = index - 1; i >= 0; i -= 1) {
-    const item = events[i];
-    if (!isSameTurnOrUnknown(item, event)) continue;
-    if (eventViewKind(item) !== 'tool_use') continue;
-    if (toolResultMatchesUse(event, item) || !toolEventId(event)) return toolEventName(item);
-  }
-  return ownName;
-}
 
 function eventDisplay(event: ForwardEvent) {
   const role = roleForEvent(event.type);
@@ -785,36 +650,7 @@ function eventDisplay(event: ForwardEvent) {
 }
 
 function isLocalThinkingEvent(event: ForwardEvent) {
-  return event.id.startsWith('local-') && event.type === 'agent.thinking';
-}
-
-function shouldClearLocalThinking(event: ForwardEvent) {
-  if (event.id.startsWith('local-')) return false;
-  if (event.type.startsWith('agent.')) return true;
-  return isTerminalSessionEvent(event);
-}
-
-function isTerminalSessionEvent(event: ForwardEvent, hasMultiagentThreads = false) {
-  if (
-    event.type === 'session.error' ||
-    event.type === 'session.completed' ||
-    event.type === 'session.cancelled' ||
-    event.type === 'session.canceled' ||
-    event.type === 'session.status_terminated'
-  ) return true;
-  // session.status_idle with stop_reason "requires_action" means agent is waiting
-  // for tool confirmation - don't treat as terminal
-  if (event.type === 'session.status_idle') {
-    const stopReason = (event as unknown as { stop_reason?: { type?: string } }).stop_reason;
-    if (stopReason?.type === 'requires_action') return false;
-    return true;
-  }
-  // thread_status_idle is a thread-level terminal event for non-multiagent sessions.
-  // In multiagent mode, child threads going idle should NOT terminate the stream —
-  // only session.status_idle signals session-level completion. The coordinator is
-  // still processing the child's result and will emit its own events afterwards.
-  if (event.type === 'session.thread_status_idle') return !hasMultiagentThreads;
-  return false;
+  return event.id.startsWith('local-') && !event.stream_event_id && event.type === 'agent.thinking';
 }
 
 function lastRemoteEventId(events: ForwardEvent[]) {
@@ -825,187 +661,15 @@ function lastRemoteEventId(events: ForwardEvent[]) {
   return '';
 }
 
-function shouldClearLocalThinkingForEvent(event: ForwardEvent, localEvent: ForwardEvent) {
-  if (!shouldClearLocalThinking(event)) return false;
-  if (
-    localEvent.turn_id &&
-    event.turn_id &&
-    localEvent.turn_id !== event.turn_id
-  ) {
-    return false;
-  }
-  return true;
-}
-
-function eventSortKey(event: ForwardEvent): string {
-  return event.processed_at || event.created_at || '';
-}
-
-function sortEventsForView(events: ForwardEvent[]): ForwardEvent[] {
-  // Merge paths append incoming events, so a late poll can deliver an older
-  // turn's canonical events AFTER a newer local message was pushed — which used
-  // to render the new question above the previous turn. Order remote events by
-  // server timestamps (stable sort keeps ties in arrival order), and keep local
-  // placeholders (in-flight user message / thinking bubble / streaming text)
-  // pinned to the tail: they always belong to the newest turn, and client/server
-  // clock skew makes their created_at incomparable with server timestamps.
-  // Remote events that don't carry a server timestamp yet (e.g. straight from
-  // the POST /events response) are also pinned until a poll backfills it.
-  const remote = events.filter((event) => !event.id.startsWith('local-') && eventSortKey(event));
-  const local = events.filter((event) => event.id.startsWith('local-') || !eventSortKey(event));
-  remote.sort((a, b) => {
-    const ka = eventSortKey(a);
-    const kb = eventSortKey(b);
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
-  });
-  return [...remote, ...local];
-}
-
-/**
- * Compute text similarity using character bigrams (Jaccard index).
- * Works for both Chinese and English text without needing word segmentation.
- * Returns a value between 0 (completely different) and 1 (identical).
- */
-function textSimilarity(a: string, b: string): number {
-  if (a.length < 20 || b.length < 20) return 0;
-  const bigramsA = new Set<string>();
-  for (let i = 0; i < a.length - 1; i += 1) bigramsA.add(a.slice(i, i + 2));
-  const bigramsB = new Set<string>();
-  for (let i = 0; i < b.length - 1; i += 1) bigramsB.add(b.slice(i, i + 2));
-  if (bigramsA.size === 0 || bigramsB.size === 0) return 0;
-  let intersection = 0;
-  for (const bg of bigramsA) {
-    if (bigramsB.has(bg)) intersection += 1;
-  }
-  const union = bigramsA.size + bigramsB.size - intersection;
-  return union > 0 ? intersection / union : 0;
-}
-
-/**
- * If the last real agent.message in the events list has >60% text similarity
- * to the incoming event, remove it. The coordinator sometimes outputs the
- * same report twice (first a draft, then a "verified" version) — showing both
- * is redundant and confuses users.
- */
-function deduplicateAgentMessage(events: ForwardEvent[], sessionId: string, newEvent: ForwardEvent): ForwardEvent[] {
-  const newText = eventContentText(newEvent);
-  if (newText.length < 50) return events;
-  for (let i = events.length - 1; i >= 0; i -= 1) {
-    const e = events[i];
-    if (e.type === 'agent.message' && e.session_id === sessionId && !e.id.startsWith('local-stream-')) {
-      const prevText = eventContentText(e);
-      if (prevText.length >= 50 && textSimilarity(newText, prevText) > 0.6) {
-        return events.filter((_, idx) => idx !== i);
-      }
-      break; // Only check the last agent.message
-    }
-  }
-  return events;
-}
-
-/**
- * Scan a merged events list and remove earlier agent.message events that
- * are >60% similar to a later agent.message in the same session. Used by
- * mergeSessionEvents to deduplicate after fetching from the API.
- */
-function deduplicateAgentMessageList(events: ForwardEvent[]): ForwardEvent[] {
-  const result: ForwardEvent[] = [];
-  for (const event of events) {
-    if (
-      event.type === 'agent.message' &&
-      !event.id.startsWith('local-stream-') &&
-      eventContentText(event).length >= 50
-    ) {
-      // Check if the last agent.message in result is similar
-      for (let i = result.length - 1; i >= 0; i -= 1) {
-        const prev = result[i];
-        if (
-          prev.type === 'agent.message' &&
-          !prev.id.startsWith('local-stream-') &&
-          prev.session_id === event.session_id
-        ) {
-          const prevText = eventContentText(prev);
-          const newText = eventContentText(event);
-          if (prevText.length >= 50 && textSimilarity(newText, prevText) > 0.6) {
-            result.splice(i, 1); // Remove the previous duplicate
-          }
-          break; // Only check the last agent.message
-        }
-      }
-    }
-    result.push(event);
-  }
-  return result;
-}
-
-function mergeHistoricalEvents(current: ForwardEvent[], older: ForwardEvent[]) {
-  const currentIds = new Set(current.map((event) => event.id));
-  return sortEventsForView([
-    ...older.filter((event) => !currentIds.has(event.id)),
-    ...current,
-  ]);
-}
-
-function mergeIncomingEvents(prev: ForwardEvent[], incoming: ForwardEvent[]) {
-  let next = [...prev];
-  for (const event of incoming) {
-    next = next.filter((item) => item.stream_event_id !== event.id);
-    const existingIndex = next.findIndex((item) => item.id === event.id);
-    if (existingIndex >= 0) {
-      // Already known: only backfill the server timestamp (needed for ordering)
-      // without replacing the stored event — it may carry injected content
-      // (e.g. accumulated thinking text) that the polled copy lacks.
-      const existing = next[existingIndex];
-      if (!existing.processed_at && event.processed_at) {
-        next[existingIndex] = { ...existing, processed_at: event.processed_at };
-      }
-      continue;
-    }
-    if (event.type === 'user.message') {
-      const incomingText = eventContentText(event);
-      const localIndex = next.findIndex((item) => (
-        item.id.startsWith('local-') &&
-        item.type === 'user.message' &&
-        item.session_id === event.session_id &&
-        eventContentText(item) === incomingText
-      ));
-      if (localIndex >= 0) {
-        next[localIndex] = event;
-        const thinkingIndex = next.findIndex((item, index) => (
-          index > localIndex &&
-          isLocalThinkingEvent(item) &&
-          item.session_id === event.session_id
-        ));
-        if (thinkingIndex >= 0 && event.turn_id) {
-          next[thinkingIndex] = { ...next[thinkingIndex], turn_id: event.turn_id };
-        }
-        continue;
-      }
-    }
-    // When a remote agent.thinking event arrives with no content, check if there
-    // is a local thinking event that already has accumulated thinking text.
-    // If so, transfer the content to the remote event instead of losing it.
-    if (event.type === 'agent.thinking' && !eventThinkingText(event)) {
-      const localIdx = next.findIndex((item) => (
-        isLocalThinkingEvent(item) &&
-        item.session_id === event.session_id &&
-        eventThinkingText(item)
-      ));
-      if (localIdx >= 0) {
-        next[localIdx] = { ...event, content: next[localIdx].content };
-        continue;
-      }
-    }
-    if (shouldClearLocalThinking(event)) {
-      next = next.filter((item) => !(
-        isLocalThinkingEvent(item) &&
-        item.session_id === event.session_id &&
-        shouldClearLocalThinkingForEvent(event, item)
-      ));
-    }
-    next = [...next, event];
-  }
-  return sortEventsForView(next);
+function mergeIncomingEvents(prev: ForwardEvent[], incoming: ForwardEvent[], mode: 'stream' | 'history' = 'stream') {
+  const merged = mergeConversationEvents(prev, incoming, mode);
+  let progressed = false;
+  return merged.reverse().filter(event => {
+    if (event.type === 'user.message') progressed = false;
+    else if (isLocalThinkingEvent(event)) return !progressed;
+    else if (event.type.startsWith('agent.') || turnEventState(event)) progressed = true;
+    return true;
+  }).reverse();
 }
 
 function localTurnEvents(sessionId: string, text: string) {
@@ -1114,9 +778,8 @@ function ChatAvatar({ user }: { user?: boolean }) {
 }
 
 const ThinkingMessage = memo(function ThinkingMessage({ event }: { event: ForwardEvent }) {
-  const text = truncateForDisplay(eventThinkingText(event));
-  const payload = truncateForDisplay(stringifyPayload(eventDebugPayload(event)));
-  const isLocalWaiting = event.id.startsWith('local-');
+  const text = truncateForDisplay(eventThinkingText(event), 4000);
+  const isLocalWaiting = isLocalThinkingEvent(event);
 
   if (isLocalWaiting) {
     return (
@@ -1152,9 +815,9 @@ const ThinkingMessage = memo(function ThinkingMessage({ event }: { event: Forwar
           </summary>
           <div className="mt-3 rounded-[18px] bg-white px-5 py-5 shadow-[0_8px_24px_rgba(47,58,128,0.05)]">
             <div className="rounded-xl border border-amber-200 bg-[#FFFCF2] px-4 py-3 text-[13px] leading-5 text-[#4B5563]">
-              {(text || payload)
-                ? <div className="markdown-body whitespace-pre-wrap break-words">{text || payload}</div>
-                : <div className="italic text-black/40">Agent 在此进行了思考。API 不对外公开思考的具体内容，此事件仅作为思考过程的标记。</div>}
+              {text
+                ? <div className="markdown-body whitespace-pre-wrap break-words">{text}</div>
+                : <div className="italic text-black/40">未收到可展示的思考文本。</div>}
             </div>
           </div>
         </details>
@@ -1164,7 +827,7 @@ const ThinkingMessage = memo(function ThinkingMessage({ event }: { event: Forwar
   );
 });
 
-function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fileId: string }) {
+function ArtifactDownloadCard({ ctx, fileId, event }: { ctx: ForwardContext | null; fileId: string; event?: ForwardEvent }) {
   const [meta, setMeta] = useState<CloudFile | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1189,7 +852,9 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
     };
   }, [ctx, fileId]);
 
-  const filename = meta?.filename || fileId;
+  const deliveredName = event?.original_filename ?? event?.name;
+  const filename = (typeof deliveredName === 'string' && deliveredName) || meta?.filename || fileId;
+  const size = meta?.size_bytes ?? (typeof event?.size === 'number' && Number.isFinite(event.size) && event.size >= 0 ? event.size : undefined);
 
   const handleDownload = async () => {
     if (!ctx || loading) return;
@@ -1226,7 +891,7 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
             </svg>
           )}
           下载原图
-          {meta?.size_bytes != null ? ` · ${formatFileSize(meta.size_bytes)}` : ''}
+          {size !== undefined ? ` · ${formatFileSize(size)}` : ''}
         </button>
         {error && <span className="text-[11px] text-red-500">{error}</span>}
       </div>
@@ -1249,7 +914,7 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
       <span className="min-w-0 flex-1">
         <span className="block truncate text-[13px] font-medium text-black/80">{filename}</span>
         <span className="mt-0.5 block truncate font-mono text-[11px] text-black/35">
-          {meta?.size_bytes != null ? `${formatFileSize(meta.size_bytes)} · ` : ''}{fileId}
+          {size !== undefined ? `${formatFileSize(size)} · ` : ''}{fileId}
         </span>
         {error && <span className="mt-0.5 block truncate text-[11px] text-red-500">{error}</span>}
       </span>
@@ -1266,105 +931,85 @@ function ArtifactDownloadCard({ ctx, fileId }: { ctx: ForwardContext | null; fil
   );
 }
 
-const ToolEventMessage = memo(function ToolEventMessage({
-  event,
-  result,
-  pending = false,
-  displayName,
-  ctx,
-}: {
-  event: ForwardEvent;
-  result: boolean;
-  pending?: boolean;
-  displayName?: string;
-  ctx?: ForwardContext | null;
-}) {
-  const name = displayName || toolEventName(event);
-  const payload = toolEventPayload(event);
-  const id = toolEventId(event);
-  const artifactIds = result && ARTIFACT_TOOL_NAMES.has(name) ? extractArtifactFileIds(event) : [];
-  const tone = result
-    ? 'bg-emerald-50 text-emerald-700'
-    : 'bg-orange-50 text-orange-600';
+const TOOL_STEP_LABELS = { running: '运行中', waiting: '待确认', done: '已完成', failed: '失败', denied: '已拒绝', unknown: '结果未记录' };
+const TOOL_ACTIONS = new Map(Object.entries({
+  WebSearch: '搜索网页', WebFetch: '读取网页', Read: '读取文件', Write: '写入文件', Edit: '编辑文件',
+  DeliverArtifacts: '交付文件', ImageGen: '生成图片', AskUserQuestion: '询问用户',
+}));
 
-  return (
-    <div className="flex gap-4">
-      <ChatAvatar />
-      <div className="w-fit max-w-[92%]">
-        <details className="group w-fit max-w-full rounded-[16px] bg-white px-3.5 py-2.5 shadow-[0_8px_24px_rgba(47,58,128,0.05)] open:w-[min(720px,calc(100vw-220px))]">
-          <summary className="flex cursor-pointer list-none items-center gap-2.5 text-[13px]">
-            <span className="text-black/45">
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="m14.7 6.3 3-3a5 5 0 0 1-6.4 6.4l-5.9 5.9a2.1 2.1 0 1 1-3-3l5.9-5.9a5 5 0 0 1 6.4-6.4l-3 3 3 3Z" />
-              </svg>
-            </span>
-            <span className={`rounded-lg px-2.5 py-1 text-xs font-semibold ${tone}`}>
-              {result ? '结果' : '调用'}
-            </span>
-            <span className="min-w-0 truncate font-mono text-xs text-black/55" title={name}>
-              {name}
-            </span>
-            {pending && !result ? (
-              <span className="ml-auto h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-[#D7DBEA] border-t-[#7A5FF5] group-open:hidden" aria-label="工具执行中" />
-            ) : (
-              <span className="ml-auto text-black/30 group-open:hidden">›</span>
-            )}
-            <span className="ml-auto hidden text-black/30 group-open:inline">⌄</span>
-          </summary>
-          <div className="mt-3">
-            <div className="mb-2 text-[13px] font-semibold text-black/35">
-              {result ? '出参' : '入参'}
-            </div>
-            {id && <div className="mb-2 truncate font-mono text-[11px] text-black/35">ID: {id}</div>}
-            {payload ? (
-              <pre
-                className={`max-h-[420px] overflow-auto whitespace-pre-wrap rounded-xl border p-3.5 font-mono text-[13px] leading-5 ${
-                  result
-                    ? 'border-emerald-200 bg-emerald-50 text-[#111827]'
-                    : 'border-[#DADCE3] bg-[#FAFAFA] text-[#111827]'
-                }`}
-              >
-                {payload}
-              </pre>
-            ) : (
-              <div className="text-xs text-black/35">暂无详情</div>
-            )}
-          </div>
-        </details>
-        {artifactIds.length > 0 && (
-          <div className="mt-2 flex flex-col gap-2">
-            {artifactIds.map((fileId) => (
-              <ArtifactDownloadCard key={fileId} ctx={ctx ?? null} fileId={fileId} />
-            ))}
-          </div>
-        )}
-        {event.created_at && <div className="mt-1 px-1 text-[11px] text-black/30">{displayTime(event.created_at)}</div>}
-      </div>
-    </div>
-  );
-});
-
-// Track user message timestamps for response time calculation
-const _turnTimestamps = new Map<string, number>();
-
-function recordTurnStart(sessionId: string) {
-  _turnTimestamps.set(sessionId, Date.now());
+function stepLabel(step: ProcessStep) {
+  if (step.kind === 'thinking') return 'Agent 思考';
+  if (step.kind === 'narration') return '过程说明';
+  if (step.kind === 'coordination') return '多 Agent 协作';
+  const name = toolEventName(step.event).slice(0, 100);
+  return TOOL_ACTIONS.get(name) || name;
 }
 
-function getResponseTime(event: ForwardEvent): string | null {
-  // Only show response time on the FINAL agent.message, not on synthetic
-  // streaming messages (which have local-stream- prefix IDs)
-  if (event.id.startsWith('local-stream-')) return null;
-  const ts = _turnTimestamps.get(event.session_id);
-  if (!ts) return null;
-  // Use processed_at if available, otherwise use current time
-  const agentTime = event.processed_at ? new Date(event.processed_at).getTime() : Date.now();
-  if (Number.isNaN(agentTime)) return null;
-  const ms = agentTime - ts;
-  if (ms < 0 || ms > 300000) return null; // sanity: 0-5min
-  _turnTimestamps.delete(event.session_id); // consume once
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
+function ToolStep({ step }: { step: Extract<ProcessStep, { kind: 'tool' }> }) {
+  const name = toolEventName(step.event);
+  const summary = toolSummary(name, getEventValue(step.event, ['input', 'arguments', 'parameters']));
+  return (
+    <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[13px]">
+      <span className="font-medium text-slate-700">{stepLabel(step)}</span>
+      {summary && <span className="min-w-0 break-all text-slate-500">{summary}</span>}
+      <span className={`ml-auto whitespace-nowrap text-xs ${step.state === 'failed' || step.state === 'denied' ? 'text-red-700' : step.state === 'waiting' ? 'text-amber-800' : 'text-slate-500'}`}>{TOOL_STEP_LABELS[step.state]}</span>
+    </div>
+  );
+}
+
+const TURN_LABELS: Record<TurnState | 'reconnecting' | 'stopping', string> = {
+  pending: '正在发送', running: '执行中', waiting: '等待你处理', done: '本轮已结束', failed: '本轮失败',
+  stopped: '本轮已停止', terminated: '会话已终止', unknown: '状态未记录', reconnecting: '连接中断，正在同步', stopping: '正在停止',
+};
+
+function TurnElapsed({ elapsedMs, runningSince }: Pick<ConversationTurn, 'elapsedMs' | 'runningSince'>) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (runningSince === undefined) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [runningSince]);
+  if (elapsedMs === undefined) return null;
+  const seconds = Math.floor((elapsedMs + (runningSince === undefined ? 0 : Math.max(0, now - runningSince))) / 1000);
+  return <span className="shrink-0 tabular-nums text-slate-500">已用时 {seconds >= 60 ? `${Math.floor(seconds / 60)} 分 ` : ''}{seconds % 60} 秒</span>;
+}
+
+function TurnProcess({ turn, state, steps, children, actions }: {
+  turn: ConversationTurn;
+  state: keyof typeof TURN_LABELS;
+  steps: ProcessStep[];
+  children: React.ReactNode;
+  actions?: React.ReactNode;
+}) {
+  const [expanded, setExpanded] = useState<boolean>();
+  const [focusWithin, setFocusWithin] = useState(false);
+  const panelId = useId();
+  const active = ['pending', 'running', 'waiting', 'reconnecting', 'stopping'].includes(state);
+  const open = expanded ?? (active || focusWithin);
+  const latest = steps.at(-1);
+  if (!steps.length && !active && !actions && !turn.partial && !['failed', 'stopped', 'terminated'].includes(state)) return null;
+  const tone = state === 'waiting' ? 'bg-amber-50 text-amber-800' : state === 'failed' ? 'bg-red-50 text-red-700' : active ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-600';
+  return (
+    <section aria-label="执行过程" className="overflow-hidden rounded-xl border border-[#E0E5F0] bg-white">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 text-xs">
+        {steps.length ? (
+          <button type="button" aria-controls={panelId} aria-expanded={open} className="rounded text-sm font-semibold text-slate-800 hover:text-[#3550FF] focus-visible:outline-[#3550FF]" onClick={() => setExpanded(!open)}>
+            <span aria-hidden="true" className="mr-2 text-slate-500">{open ? '⌄' : '›'}</span>执行过程
+          </button>
+        ) : <span className="text-sm font-semibold text-slate-800">执行过程</span>}
+        <span role="status" className={`rounded-full px-2 py-0.5 font-medium ${tone}`}>{TURN_LABELS[state]}</span>
+        {turn.partial && <span className="text-slate-500">部分历史</span>}
+        {latest && <span className="min-w-0 flex-1 truncate text-slate-500">{steps.length} 个步骤 · {stepLabel(latest)}</span>}
+        <TurnElapsed elapsedMs={turn.elapsedMs} runningSince={active ? turn.runningSince : undefined} />
+      </div>
+      {steps.length > 0 && (
+        <ol id={panelId} hidden={!open} onFocus={() => setFocusWithin(true)} onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget)) setFocusWithin(false); }} className="space-y-3 border-t border-slate-100 px-4 py-3">
+          {children}
+        </ol>
+      )}
+      {actions && <div className="space-y-3 border-t border-slate-100 px-4 py-3">{actions}</div>}
+    </section>
+  );
 }
 
 
@@ -1718,7 +1363,6 @@ const ChatTextMessage = memo(function ChatTextMessage({ event, user, ctx, credit
     );
   }
 
-  const responseTime = getResponseTime(event);
   // Render markdown live during streaming too. Real-time cost stays bounded by the
   // throttled flush (<=10fps), React.memo (only this message re-renders per flush),
   // and truncateForDisplay (caps huge synchronous renders that could freeze the tab).
@@ -1728,10 +1372,9 @@ const ChatTextMessage = memo(function ChatTextMessage({ event, user, ctx, credit
     <div className="flex justify-start">
       <div className="max-w-[85%] text-[14px] leading-7 text-[#1a1a1a]">
         <div className="markdown-body break-words">{renderMarkdown(truncateForDisplay(item.message))}</div>
-        {(responseTime || showCredits) && (
+        {showCredits && (
           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-black/25">
-            {responseTime && <span>⏱ {responseTime}</span>}
-            {showCredits && <MessageCreditBadge calls={credits!.calls} total={credits!.total!} />}
+            <MessageCreditBadge calls={credits!.calls} total={credits!.total!} />
           </div>
         )}
       </div>
@@ -1759,7 +1402,7 @@ const MessageCreditBadge = memo(function MessageCreditBadge({ calls, total }: { 
     <details className="group inline-block">
       <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-black/35 transition hover:text-black/60">
         <span aria-hidden>⚡</span>
-        <span className="tabular-nums">{formatCredits(total)} Credit</span>
+        <span className="tabular-nums">模型调用 {formatCredits(total)} Credit</span>
         <span className="text-black/30 group-open:hidden">›</span>
         <span className="hidden text-black/30 group-open:inline">⌄</span>
       </summary>
@@ -1838,13 +1481,16 @@ function ToolApprovalPanel({
             <span className="font-mono text-xs font-semibold text-black/70">{approval.toolName}</span>
             <span className="truncate font-mono text-[10px] text-black/30">{approval.toolUseId}</span>
           </div>
-          <pre className="mt-2 max-h-44 overflow-auto whitespace-pre-wrap rounded-lg bg-[#F7F8FC] p-2.5 font-mono text-[11px] leading-5 text-black/65">
-            {JSON.stringify(approval.input, null, 2)}
-          </pre>
+          <details className="mt-2 text-xs text-black/65">
+            <summary className="cursor-pointer">查看工具入参</summary>
+            <pre className="mt-1 max-h-44 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-[#F7F8FC] p-2.5 font-mono text-[11px] leading-5">
+              {JSON.stringify(approval.input, null, 2)}
+            </pre>
+          </details>
           <div className="mt-3 flex justify-end gap-2">
             <button
               type="button"
-              disabled={loadingId === approval.toolUseId}
+              disabled={loadingId !== null}
               onClick={() => onResolve(approval, 'deny')}
               className="rounded-lg border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
             >
@@ -1852,7 +1498,7 @@ function ToolApprovalPanel({
             </button>
             <button
               type="button"
-              disabled={loadingId === approval.toolUseId}
+              disabled={loadingId !== null}
               onClick={() => onResolve(approval, 'allow')}
               className="rounded-lg bg-[#3550FF] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#2a42e0] disabled:opacity-50"
             >
@@ -2424,6 +2070,7 @@ export default function App() {
   const [deletingSessions, setDeletingSessions] = useState(false);
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
+  const [reconnectingSession, setReconnectingSession] = useState('');
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const [showTemplateModal, setShowTemplateModal] = useState(false);
@@ -2443,7 +2090,8 @@ export default function App() {
   const detailRequestRef = useRef(0);
   const [templateSearch, setTemplateSearch] = useState('');
   const [templateActionLoading, setTemplateActionLoading] = useState<string | null>(null);
-  const [chatActionLoading, setChatActionLoading] = useState<string | null>(null);
+  const [chatAction, setChatAction] = useState<{ sessionId: string; id: string } | null>(null);
+  const chatActionLoading = chatAction?.sessionId === currentSessionId ? chatAction.id : null;
   const [viewingResource, setViewingResource] = useState<ForwardResource | null>(null);
   // File resource currently fetching a signed download URL, so the card overlay
   // and the detail modal can both show progress (issue #14).
@@ -2549,6 +2197,8 @@ export default function App() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const eventHistoryGenerationRef = useRef(0);
+  const recentHistoryRef = useRef<{ sessionId: string; id?: string; generation: number } | null>(null);
+  const messageWriteRef = useRef(new Set<string>());
   const olderEventsCursorRef = useRef<{ sessionId: string; cursor: string } | null>(null);
   const loadingOlderEventsRef = useRef<string | null>(null);
   const pendingHistoryScrollRef = useRef<{
@@ -2570,27 +2220,6 @@ export default function App() {
   // Tracks the session currently shown in the chat view ('' = new-conversation
   // screen), so background stream/poll callbacks never paint into another view.
   const currentSessionIdRef = useRef('');
-
-  // Replace an optimistic local session id with the real one returned by the
-  // server, migrating any in-flight streaming accumulators and turn timestamps.
-  const migrateSessionId = useCallback((oldId: string, newId: string) => {
-    currentSessionIdRef.current = newId;
-    const streamText = _streamingTextBySession.get(oldId);
-    const streamMsgId = _streamingMsgIdBySession.get(oldId);
-    const turnTs = _turnTimestamps.get(oldId);
-    if (streamText !== undefined) {
-      _streamingTextBySession.delete(oldId);
-      _streamingTextBySession.set(newId, streamText);
-    }
-    if (streamMsgId !== undefined) {
-      _streamingMsgIdBySession.delete(oldId);
-      _streamingMsgIdBySession.set(newId, streamMsgId);
-    }
-    if (turnTs !== undefined) {
-      _turnTimestamps.delete(oldId);
-      _turnTimestamps.set(newId, turnTs);
-    }
-  }, []);
 
   const ctx = useMemo<ForwardContext | null>(
     () => (pat.trim() ? { pat: pat.trim(), environment: apiEnvironment, authMode } : null),
@@ -2715,7 +2344,8 @@ export default function App() {
     setLoadingOlderEvents(true);
     setError('');
     try {
-      const page = await listEvents(ctx, sessionId, { afterId: cursor });
+      const page = await listEvents(ctx, sessionId, { beforeId: cursor });
+      if (page.has_more && (!page.last_id || page.last_id === cursor)) throw new Error('历史分页游标缺失或未推进');
       const scrollElement = chatScrollRef.current;
       if (
         currentSessionIdRef.current !== sessionId ||
@@ -2730,7 +2360,7 @@ export default function App() {
         scrollHeight: scrollElement.scrollHeight,
         scrollTop: scrollElement.scrollTop,
       };
-      setEvents((prev) => mergeHistoricalEvents(prev, chronologicalData));
+      setEvents((prev) => mergeConversationEvents(prev, chronologicalData, 'older'));
       const nextCursor = page.last_id || undefined;
       olderEventsCursorRef.current = nextCursor ? { sessionId, cursor: nextCursor } : null;
       setEventsHasMore(Boolean(page.has_more && nextCursor && nextCursor !== cursor));
@@ -2918,30 +2548,27 @@ export default function App() {
     loadingOlderEventsRef.current = null;
     setLoadingOlderEvents(false);
     setEventsHasMore(Boolean(page.has_more && olderEventsCursorRef.current));
+    recentHistoryRef.current = { sessionId, generation, id: page.data[0]?.id };
     setEvents([...page.data].reverse());
+    return { generation, page };
   }, [ctx]);
 
-  const mergeSessionEvents = useCallback(async (sessionId: string) => {
-    if (!ctx || !sessionId) return;
-    const page = await listEvents(ctx, sessionId);
-    // Reverse to chronological order before merging
+  const mergeSessionEvents = useCallback(async (sessionId: string, signal?: AbortSignal, fallbackId?: string) => {
+    if (!ctx || !sessionId || currentSessionIdRef.current !== sessionId) return;
+    const generation = eventHistoryGenerationRef.current;
+    const previous = recentHistoryRef.current;
+    const knownId = (previous?.sessionId === sessionId && previous.generation === generation ? previous.id : undefined) ?? fallbackId;
+    const page = await listRecentEvents(ctx, sessionId, knownId, { signal });
+    if (currentSessionIdRef.current !== sessionId || eventHistoryGenerationRef.current !== generation || signal?.aborted) return;
     const chronologicalData = [...page.data].reverse();
-    // Only merge into the view when this session is still the one on screen;
-    // background polling must not repopulate the new-conversation screen.
-    if (currentSessionIdRef.current === sessionId) {
-      setEvents((prev) => {
-        // If real agent.message events exist in the fetched data, remove any
-        // leftover synthetic streaming messages (local-stream-*) from a
-        // prematurely terminated stream.
-        const filtered = prev.filter((event) => event.stream_event_id || !event.id.startsWith('local-stream-') || !chronologicalData.some(
-          (remote) => remote.type === 'agent.message' && (remote.created_at || remote.processed_at || '') >= (event.created_at || ''),
-        ));
-        const merged = mergeIncomingEvents(filtered, chronologicalData);
-        // Deduplicate similar consecutive agent.message events (the
-        // coordinator sometimes outputs the same report twice).
-        return deduplicateAgentMessageList(merged);
-      });
+    if (recentHistoryRef.current === previous) {
+      recentHistoryRef.current = { sessionId, generation, id: page.data[0]?.id ?? knownId };
     }
+    if (olderEventsCursorRef.current?.sessionId !== sessionId && page.has_more && page.last_id) {
+      olderEventsCursorRef.current = { sessionId, cursor: page.last_id };
+      setEventsHasMore(true);
+    }
+    setEvents((prev) => mergeIncomingEvents(prev, chronologicalData, 'history'));
     return { ...page, data: chronologicalData };
   }, [ctx]);
 
@@ -3096,9 +2723,11 @@ export default function App() {
       if (currentRun.session_id) {
         currentSessionIdRef.current = currentRun.session_id;
         setCurrentSessionId(currentRun.session_id);
-        await loadSessionEvents(currentRun.session_id);
-        // Start streaming the session
-        startStreamRef.current(currentRun.session_id);
+        const history = await loadSessionEvents(currentRun.session_id);
+        if (history && history.generation === eventHistoryGenerationRef.current && currentSessionIdRef.current === currentRun.session_id) {
+          const state = latestTurnState([...history.page.data].reverse());
+          if (!isTurnTerminal(state) && state !== 'waiting') startStreamRef.current(currentRun.session_id, history.page.data[0]?.id);
+        }
       }
       await loadSchedules();
     } catch (err) {
@@ -4089,28 +3718,18 @@ export default function App() {
       loadingOlderEventsRef.current = null;
       setLoadingOlderEvents(false);
       setEventsHasMore(Boolean(page.has_more && olderEventsCursorRef.current));
+      recentHistoryRef.current = { sessionId, generation, id: page.data[0]?.id };
       setEvents(chronologicalData);
-      // 历史事件里若已出现子线程，就把该会话登记为 multiagent：续流时子线程的
-      // thread_status_idle 不应被当作整会话终止事件（见 isTerminalSessionEvent）。
-      if (chronologicalData.some((e) => e.type === 'session.thread_created')) {
+      if (chronologicalData.some((event) => event.type === 'session.thread_created')) {
         multiagentSessionsRef.current.add(sessionId);
       }
-      // Check if session is still active and restart stream if needed
-      if (isSessionOngoing(session.status)) {
-        // Add a local thinking event to show loading indicator
-        const thinkingId = `local-thinking-${sessionId}-${Date.now()}`;
-        const thinkingEvent: ForwardEvent = {
-          id: thinkingId,
-          type: 'agent.thinking',
-          session_id: sessionId,
-          created_at: new Date().toISOString(),
-          content: 'AI 正在思考...',
-        };
-        setEvents((prev) => [...prev, thinkingEvent]);
-        // Pass the last event ID to resume stream from the correct position
-        const lastEventId = chronologicalData.length > 0 ? chronologicalData[chronologicalData.length - 1].id : undefined;
-        const hasMA = multiagentSessionsRef.current.has(sessionId);
-        startStreamRef.current(sessionId, lastEventId, undefined, hasMA);
+      const state = latestTurnState(chronologicalData);
+      if (isTurnTerminal(state) || state === 'waiting') {
+        if (isSessionOngoing(session.status)) {
+          setSessions(prev => prev.map(item => item.id === sessionId ? { ...item, status: state === 'terminated' ? 'terminated' : 'idle' } : item));
+        }
+      } else if (isSessionOngoing(session.status) || state === 'running') {
+        startStreamRef.current(sessionId, page.data[0]?.id, undefined, multiagentSessionsRef.current.has(sessionId));
       }
     } catch (err) {
       if (currentSessionIdRef.current === sessionId && eventHistoryGenerationRef.current === generation) {
@@ -4159,7 +3778,7 @@ export default function App() {
       for (const id of done) {
         _streamingTextBySession.delete(id);
         _streamingMsgIdBySession.delete(id);
-        _turnTimestamps.delete(id);
+        _thinkingBySession.delete(id);
       }
       // If the open conversation was deleted, reset to the welcome screen.
       if (done.includes(currentSessionIdRef.current)) {
@@ -4180,7 +3799,7 @@ export default function App() {
   }, [ctx, deletingSessions]);
 
   const startStream = useCallback((sessionId: string, lastEventId?: string, turnStartedAt?: string, initialHasMultiagent?: boolean) => {
-    if (!ctx) return;
+    if (!ctx || currentSessionIdRef.current !== sessionId) return;
     streamAbort.current?.abort();
     const controller = new AbortController();
     // Track whether this session has spawned child threads (multiagent mode).
@@ -4194,8 +3813,12 @@ export default function App() {
     let streamFlushTimer: number | null = null;
     let lastStreamFlush = 0;
     const liveEvents = new Map<string, ForwardEvent>();
+    const completedIds = new Set<string>();
+    const markReconnecting = (active: boolean) => {
+      if (streamAbort.current === controller) setReconnectingSession(active ? sessionId : '');
+    };
     let cursor = lastEventId;
-    let receivedCurrentTurn = false;
+    let replayingDrafts = new Set<string>();
     const flushStreamingText = () => {
       streamFlushTimer = null;
       lastStreamFlush = Date.now();
@@ -4205,8 +3828,10 @@ export default function App() {
       if (liveEvents.size) {
         const drafts = [...liveEvents.values()];
         setEvents((prev) => {
-          const next = prev.filter((event) => !drafts.some((draft) => draft.id === event.id));
-          return sortEventsForView([...next, ...drafts.filter((draft) => !next.some((event) => event.id === draft.stream_event_id))]);
+          const byId = new Map(drafts.map(draft => [draft.id, draft]));
+          const known = new Set(prev.map(event => event.id));
+          return [...prev.map(event => byId.get(event.id) ?? event),
+            ...drafts.filter(draft => !known.has(draft.id) && !known.has(String(draft.stream_event_id)))];
         });
       }
       const text = _streamingTextBySession.get(sessionId);
@@ -4254,39 +3879,35 @@ export default function App() {
       setStreaming(false);
     };
     const syncLatestEvents = async () => {
-      const [page, session] = await Promise.all([
-        mergeSessionEvents(sessionId), getSession(ctx, sessionId, { signal: controller.signal }),
-      ]);
-      if (controller.signal.aborted) return page;
-      if (currentSessionIdRef.current === sessionId) {
-        setSessions((prev) => prev.map((item) => item.id === sessionId ? session : item));
-      }
+      const session = await getSession(ctx, sessionId, { signal: controller.signal });
+      const page = await mergeSessionEvents(sessionId, controller.signal, lastEventId);
+      if (controller.signal.aborted || currentSessionIdRef.current !== sessionId) return page;
+      setSessions((prev) => prev.map((item) => item.id === sessionId ? session : item));
       if (page?.data.some((event) => event.type === 'session.thread_created')) hasMultiagentThreads = true;
-      // A send may be accepted before the new turn becomes visible in GET.
-      const newTurnVisible = !turnStartedAt || receivedCurrentTurn || page?.data.some(
-        (event) => (event.created_at || event.processed_at || '') > turnStartedAt && event.type !== 'user.message',
-      );
-      if (newTurnVisible && (session.status === 'idle' || session.status === 'terminated')) finishStream();
+      const state = latestTurnState(page?.data ?? [], lastEventId, turnStartedAt);
+      if ((session.status === 'idle' || session.status === 'terminated') && (isTurnTerminal(state) || state === 'waiting')) finishStream();
       return page;
     };
     controller.signal.addEventListener('abort', () => {
       cancelStreamFlush();
       stopPolling();
       if (streamAbort.current === controller) setStreaming(false);
+      markReconnecting(false);
     }, { once: true });
     const stopPolling = startSessionPolling(async () => { await syncLatestEvents(); }, controller.signal, (err) => {
       if (!controller.signal.aborted && currentSessionIdRef.current === sessionId) setError(err instanceof Error ? err.message : String(err));
     });
     streamAbort.current = controller;
     setStreaming(true);
-    const onStreamEvent = (event: ForwardEvent) => {
-        if (event.session_id && event.session_id !== sessionId) return;
-        if (event.type.startsWith('agent.') || event.type === 'event_start' || event.type === 'event_delta' || event.type === 'session.status_running') receivedCurrentTurn = true;
+    const onStreamEvent = (frame: ForwardEvent) => {
+        if (typeof frame.type !== 'string' || (frame.session_id && frame.session_id !== sessionId)) return;
+        const event = frame.session_id ? frame : { ...frame, session_id: sessionId };
+        markReconnecting(false);
         if (event.type === 'event_start') {
           const nested = event.event as ForwardEvent | undefined;
-          if (nested?.id && (nested.type === 'agent.message' || nested.type === 'agent.thinking')) {
-            liveEvents.set(nested.id, { ...nested, id: `${nested.type === 'agent.thinking' ? 'stream-thinking' : 'local-stream'}-${nested.id}`, session_id: sessionId,
-              stream_event_id: nested.id, created_at: nested.created_at || event.created_at || new Date().toISOString(), content: [] });
+          if (nested?.id && (!nested.session_id || nested.session_id === sessionId) && !completedIds.has(nested.id) && (nested.type === 'agent.message' || nested.type === 'agent.thinking') && (replayingDrafts.delete(nested.id) || !liveEvents.has(nested.id))) {
+            liveEvents.set(nested.id, { ...nested, id: `local-stream-${nested.id}`, session_id: sessionId,
+              stream_event_id: nested.id, created_at: nested.created_at || event.created_at, content: [] });
           }
           return;
         }
@@ -4297,6 +3918,7 @@ export default function App() {
           if (draft && typeof delta?.content?.text === 'string') {
             const blocks = Array.isArray(draft.content) ? [...draft.content] : [];
             const index = delta.index ?? 0;
+            if (!Number.isInteger(index) || index < 0 || index > 1024) return;
             const previous = blocks[index];
             blocks[index] = { type: delta.content.type, text: (previous?.text ?? '') + delta.content.text };
             liveEvents.set(id, { ...draft, content: blocks });
@@ -4304,61 +3926,38 @@ export default function App() {
           }
           return;
         }
+        if (event.type.startsWith('agent.content_block_') || /^agent\.message_(start|delta|stop)$/.test(event.type)) {
+          if (event.type === 'agent.content_block_delta') {
+            const delta = event.delta as { type?: string; thinking?: string; text?: string } | undefined;
+            if (delta?.type === 'thinking_delta' && delta.thinking) {
+              _thinkingBySession.set(sessionId, (_thinkingBySession.get(sessionId) ?? '') + delta.thinking);
+            }
+            if (delta?.type === 'text_delta' && delta.text) {
+              _streamingTextBySession.set(sessionId, (_streamingTextBySession.get(sessionId) ?? '') + delta.text);
+              if (!_streamingMsgIdBySession.has(sessionId)) _streamingMsgIdBySession.set(sessionId, `local-stream-${sessionId}-${Date.now()}`);
+              scheduleStreamFlush();
+            }
+          }
+          return;
+        }
+        if (event.id && completedIds.has(event.id)) return;
+        if (event.id) completedIds.add(event.id);
+        if (streamFlushTimer != null) {
+          cancelStreamFlush();
+          flushStreamingText();
+        }
         liveEvents.delete(event.id);
-        if (event.type === 'session.usage' || event.type === 'session.updated' || event.type.startsWith('session.status_')) {
+        if (event.type === 'session.updated' || event.type.startsWith('session.status_')) {
           setSessions((prev) => prev.map((session) => session.id !== sessionId ? session : {
             ...session,
             ...(event.type.startsWith('session.status_') ? { status: event.type.slice('session.status_'.length) } : {}),
-            ...(event.type === 'session.usage' && event.usage && typeof event.usage === 'object' ? { usage: event.usage as ForwardSession['usage'] } : {}),
             ...(event.type === 'session.updated' && typeof event.title === 'string' ? { title: event.title } : {}),
           }));
-        }
-        // New turn started — reset accumulators for this session
-        if (event.type === 'session.status_running') {
-          cancelStreamFlush();
-          lastStreamFlush = 0;
-          _thinkingBySession.set(sessionId, '');
-          _streamingTextBySession.delete(sessionId);
-          _streamingMsgIdBySession.delete(sessionId);
-          // Remove old synthetic streaming messages from a previous turn.
-          setEvents((prev) => prev.filter((e) => !e.id.startsWith('local-stream-')));
         }
         // Track child thread creation for multiagent terminal-event gating.
         if (event.type === 'session.thread_created') {
           hasMultiagentThreads = true;
           multiagentSessionsRef.current.add(sessionId);
-        }
-
-        // Accumulate deltas from incremental streaming events.
-        // thinking_delta → accumulate for agent.thinking event injection
-        // text_delta → accumulate for real-time streaming display
-        if (event.type === 'agent.content_block_delta') {
-          const delta = event.delta as { type?: string; thinking?: string; text?: string } | undefined;
-          if (delta?.type === 'thinking_delta' && delta.thinking) {
-            _thinkingBySession.set(sessionId, (_thinkingBySession.get(sessionId) ?? '') + delta.thinking);
-          }
-          if (delta?.type === 'text_delta' && delta.text) {
-            const prev = _streamingTextBySession.get(sessionId) ?? '';
-            const updated = prev + delta.text;
-            _streamingTextBySession.set(sessionId, updated);
-            // Ensure a stable synthetic message id exists, then throttle the flush
-            // so we re-render at most ~10 times/second regardless of delta rate.
-            if (!_streamingMsgIdBySession.get(sessionId)) {
-              _streamingMsgIdBySession.set(sessionId, `local-stream-${sessionId}-${Date.now()}`);
-            }
-            scheduleStreamFlush();
-          }
-          return; // Skip adding delta events to the event list
-        }
-        // Also skip other incremental framing events
-        if (
-          event.type === 'agent.message_start' ||
-          event.type === 'agent.content_block_start' ||
-          event.type === 'agent.content_block_stop' ||
-          event.type === 'agent.message_delta' ||
-          event.type === 'agent.message_stop'
-        ) {
-          return;
         }
 
         // When agent.message arrives, inject accumulated thinking into the
@@ -4378,24 +3977,19 @@ export default function App() {
             setEvents((prev) => {
               // Remove synthetic streaming message if present
               const cleaned = streamMsgId ? prev.filter((e) => e.id !== streamMsgId) : [...prev];
-              // Deduplicate: if the previous agent.message has >60% similar
-              // content, remove it (coordinator sometimes outputs the same
-              // report twice — a draft then a "verified" version).
-              const next = deduplicateAgentMessage(cleaned, sessionId, event);
-              // Find the last agent.thinking event for this session and update it
-              for (let i = next.length - 1; i >= 0; i--) {
-                if (next[i].type === 'agent.thinking' && next[i].session_id === sessionId) {
-                  next[i] = { ...next[i], content: [{ type: 'text', text: thinkingText }] };
+              for (let i = cleaned.length - 1; i >= 0; i--) {
+                if (cleaned[i].type === 'user.message') break;
+                if (cleaned[i].type === 'agent.thinking' && !isLocalThinkingEvent(cleaned[i]) && !eventThinkingText(cleaned[i])) {
+                  cleaned[i] = { ...cleaned[i], content: [{ type: 'text', text: thinkingText }] };
                   break;
                 }
               }
-              return mergeIncomingEvents(next, [event]);
+              return mergeIncomingEvents(cleaned, [event]);
             });
           } else {
             setEvents((prev) => {
               const cleaned = streamMsgId ? prev.filter((e) => e.id !== streamMsgId) : prev;
-              const next = deduplicateAgentMessage(cleaned, sessionId, event);
-              return mergeIncomingEvents(next, [event]);
+              return mergeIncomingEvents(cleaned, [event]);
             });
           }
         } else {
@@ -4418,42 +4012,45 @@ export default function App() {
         // A requires_action pause must be resolved explicitly by the user. Stop
         // this SSE connection and let the approval/question panels drive the
         // corresponding user event; their handlers reconnect the stream.
-        if (event.type === 'session.status_idle') {
-          const stopReason = (event as unknown as { stop_reason?: { type?: string; event_ids?: string[] } }).stop_reason;
-          if (stopReason?.type === 'requires_action') {
-            finishStream();
-            void mergeSessionEvents(sessionId);
-            void refreshSessions();
-            return;
-          }
-        }
-        if (isTerminalSessionEvent(event, hasMultiagentThreads)) {
+        if (isTurnTerminal(turnEventState(event)) || (event.type === 'session.status_idle' && stopReason(event)?.type === 'requires_action')) {
           finishStream();
-          void mergeSessionEvents(sessionId);
+          void mergeSessionEvents(sessionId, undefined, lastEventId).catch(() => undefined);
           void refreshSessions();
         }
       };
     const reconnect = async () => {
       let failures = 0;
       let needsHistorySync = false;
+      let cursorInvalid = false;
       while (!controller.signal.aborted) {
         let retryAfter = 0;
-        const cursorBefore = cursor;
+        let advanced = false;
         try {
           if (needsHistorySync) {
-            await syncLatestEvents();
+            const recovered = await syncLatestEvents();
+            if (cursorInvalid) cursor = recovered?.data.at(-1)?.id;
+            cursorInvalid = false;
             needsHistorySync = false;
             if (controller.signal.aborted) return;
           }
+          const requestedCursor = cursor;
+          replayingDrafts = new Set(liveEvents.keys());
           await streamEvents(ctx, sessionId, onStreamEvent, controller.signal, cursor, {
             eventDeltas: ['agent.message', 'agent.thinking'],
             includeThinking: true, includeToolCalls: true,
-            onCursor: (id) => { cursor = id || undefined; },
+            onCompleteEventCursor: (id, event) => {
+              if (liveEvents.size || _streamingTextBySession.has(sessionId) || (event.session_id && event.session_id !== sessionId)) return;
+              cursor = id || undefined;
+              if (cursor && cursor !== requestedCursor) advanced = true;
+            },
           });
         } catch (err) {
           if (controller.signal.aborted) return;
           if (err instanceof ForwardApiError) {
-            if (err.code === 'invalid_event_cursor' || err.code === 'event_cursor_not_found') cursor = undefined;
+            if (err.code === 'invalid_event_cursor' || err.code === 'event_cursor_not_found') {
+              cursor = undefined;
+              cursorInvalid = true;
+            }
             else if (err.status < 500 && err.status !== 429) throw err;
             if (err.retryAfter) {
               const seconds = Number(err.retryAfter);
@@ -4462,8 +4059,11 @@ export default function App() {
           }
         }
         if (controller.signal.aborted) return;
+        markReconnecting(true);
         try {
-          await syncLatestEvents();
+          const recovered = await syncLatestEvents();
+          if (cursorInvalid) cursor = recovered?.data.at(-1)?.id;
+          cursorInvalid = false;
           needsHistorySync = false;
         } catch (err) {
           if (controller.signal.aborted) return;
@@ -4471,7 +4071,7 @@ export default function App() {
           needsHistorySync = true;
         }
         if (controller.signal.aborted) return;
-        if (cursor !== cursorBefore) failures = 0;
+        if (advanced) failures = 0;
         if (++failures > 3) throw new Error('实时连接中断，已重试三次；会话状态仍在同步，请重新打开对话恢复连接');
         await new Promise<void>((resolve) => {
           const abort = () => { window.clearTimeout(timer); resolve(); };
@@ -4497,8 +4097,10 @@ export default function App() {
     startStreamRef.current = startStream;
   }, [startStream]);
 
+  const conversationTurns = useMemo(() => projectConversation(events, eventsHasMore), [events, eventsHasMore]);
   const pendingToolApprovals = useMemo(() => derivePendingToolApprovals(events), [events]);
   const pendingQuestion = useMemo(() => derivePendingQuestion(events), [events]);
+  const waitingForAction = conversationTurns.at(-1)?.state === 'waiting';
 
   const resumeAfterInteractiveAction = useCallback((sessionId: string, responseEvents: ForwardEvent[]) => {
     const startedAt = new Date().toISOString();
@@ -4515,11 +4117,16 @@ export default function App() {
     approval: PendingToolApproval,
     result: 'allow' | 'deny',
   ) => {
-    if (!ctx || !currentSessionId) return;
-    setChatActionLoading(approval.toolUseId);
+    if (!ctx || !currentSessionId || messageWriteRef.current.has(currentSessionId) || stopAbort.current) return;
+    const generation = eventHistoryGenerationRef.current;
+    const visible = () => currentSessionIdRef.current === currentSessionId && eventHistoryGenerationRef.current === generation;
+    const action = { sessionId: currentSessionId, id: approval.toolUseId };
+    messageWriteRef.current.add(currentSessionId);
+    setChatAction(action);
     setError('');
     try {
       const response = await sendToolConfirmation(ctx, currentSessionId, approval.toolUseId, result);
+      if (!visible()) return;
       const responseEvents = response.data ?? [];
       const hasConfirmation = responseEvents.some(
         (event) => event.type === 'user.tool_confirmation' && event.tool_use_id === approval.toolUseId,
@@ -4536,15 +4143,20 @@ export default function App() {
         },
       ]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (visible()) setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setChatActionLoading(null);
+      messageWriteRef.current.delete(currentSessionId);
+      setChatAction(value => value === action ? null : value);
     }
   }, [ctx, currentSessionId, resumeAfterInteractiveAction]);
 
   const answerPendingQuestion = useCallback(async (answers: string[][], dismissed = false) => {
-    if (!ctx || !currentSessionId || !pendingQuestion) return;
-    setChatActionLoading(pendingQuestion.questionUseId);
+    if (!ctx || !currentSessionId || !pendingQuestion || messageWriteRef.current.has(currentSessionId) || stopAbort.current) return;
+    const generation = eventHistoryGenerationRef.current;
+    const visible = () => currentSessionIdRef.current === currentSessionId && eventHistoryGenerationRef.current === generation;
+    const action = { sessionId: currentSessionId, id: pendingQuestion.questionUseId };
+    messageWriteRef.current.add(currentSessionId);
+    setChatAction(action);
     setError('');
     try {
       const response = pendingQuestion.viaCustomTool
@@ -4561,6 +4173,7 @@ export default function App() {
             answers,
             dismissed,
           );
+      if (!visible()) return;
       const responseEvents = response.data ?? [];
       const resolved = responseEvents.some((event) => (
         pendingQuestion.viaCustomTool
@@ -4580,19 +4193,20 @@ export default function App() {
         },
       ]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (visible()) setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setChatActionLoading(null);
+      messageWriteRef.current.delete(currentSessionId);
+      setChatAction(value => value === action ? null : value);
     }
   }, [ctx, currentSessionId, pendingQuestion, resumeAfterInteractiveAction]);
 
-  const send = useCallback(async () => {
-    const text = input.trim();
+  const send = useCallback(async (quickText?: string) => {
+    const text = (quickText ?? input).trim();
     if (!ctx || !identity || !templateId) return;
     // Block sending only while the on-screen session is processing; starting a
     // brand-new conversation is always allowed even if a background task runs.
-    if (stopping) return;
-    if (currentSessionId && (streaming || isSessionOngoing(sessions.find((session) => session.id === currentSessionId)?.status))) return;
+    if (stopping || waitingForAction || pendingToolApprovals.length || pendingQuestion) return;
+    if (currentSessionId && (currentSessionId.startsWith('local-') || streaming || isSessionOngoing(sessions.find((session) => session.id === currentSessionId)?.status))) return;
     // Wait until every attachment finished uploading (or was removed) —
     // sending with a half-uploaded attachment would confuse the agent.
     if (attachments.some((a) => a.status !== 'done')) return;
@@ -4613,11 +4227,17 @@ export default function App() {
       fileId: attachment.fileId,
     })));
     const turnStartedAt = new Date().toISOString();
+    const writeKey = currentSessionId;
+    if (messageWriteRef.current.has(writeKey)) return;
+    messageWriteRef.current.add(writeKey);
+    const generation = eventHistoryGenerationRef.current;
+    let localUserId = '';
     let localThinkingId = '';
+    let sessionId = currentSessionId;
+    const visible = () => currentSessionIdRef.current === sessionId && eventHistoryGenerationRef.current === generation;
     setInput('');
     setError('');
     try {
-      let sessionId = currentSessionId;
       if (!sessionId) {
         // Optimistically switch to the chat view immediately so the user isn't
         // left waiting on the new-conversation screen while the session is created.
@@ -4642,29 +4262,20 @@ export default function App() {
         setCurrentSessionId(optimisticId);
         sessionId = optimisticId;
 
-        recordTurnStart(sessionId);
         const localEvents = localTurnEvents(sessionId, finalText);
+        localUserId = localEvents.user.id;
         localThinkingId = localEvents.thinking.id;
         stickToBottomRef.current = true;
-        _streamingTextBySession.delete(sessionId);
-        _streamingMsgIdBySession.delete(sessionId);
-        setEvents((prev) => {
-          const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
-          return [...cleaned, localEvents.user, localEvents.thinking];
-        });
-        // Attachment chips are no longer needed in the composer; the message
-        // bubble already carries the mount information.
-        setAttachments((prev) => {
-          for (const a of prev) if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
-          return [];
-        });
+        setEvents([localEvents.user, localEvents.thinking]);
 
         const realSession = await createSession(ctx, identity.id, templateId, sessionTitle(displayText), readyAttachments.map((a) => a.fileId!));
         const oldId = sessionId;
-        migrateSessionId(oldId, realSession.id);
-        setCurrentSessionId(realSession.id);
-        setSessions((prev) => prev.map((s) => (s.id === oldId ? realSession : s)));
-        setEvents((prev) => prev.map((e) => (e.session_id === oldId ? { ...e, session_id: realSession.id } : e)));
+        setSessions((prev) => prev.map((s) => s.id === oldId ? realSession : s));
+        if (visible()) {
+          currentSessionIdRef.current = realSession.id;
+          setCurrentSessionId(realSession.id);
+          setEvents((prev) => prev.map((e) => e.session_id === oldId ? { ...e, session_id: realSession.id } : e));
+        }
         sessionId = realSession.id;
       } else {
         // Existing session: mount each attachment into the agent workspace
@@ -4676,181 +4287,78 @@ export default function App() {
           });
         }
 
-        recordTurnStart(sessionId);
-        const localEvents = localTurnEvents(sessionId, finalText);
-        localThinkingId = localEvents.thinking.id;
-        // Sending a new message should always bring the view back to the bottom.
-        stickToBottomRef.current = true;
-        // Remove old synthetic streaming messages from a previous turn that may
-        // not have been cleaned up (e.g. stream terminated before agent.message
-        // arrived). Also clear the streaming accumulators.
-        _streamingTextBySession.delete(sessionId);
-        _streamingMsgIdBySession.delete(sessionId);
-        setEvents((prev) => {
-          const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
-          return [...cleaned, localEvents.user, localEvents.thinking];
-        });
+        if (visible()) {
+          const localEvents = localTurnEvents(sessionId, finalText);
+          localUserId = localEvents.user.id;
+          localThinkingId = localEvents.thinking.id;
+          stickToBottomRef.current = true;
+          setEvents((prev) => [...prev, localEvents.user, localEvents.thinking]);
+        }
       }
+      _thinkingBySession.delete(sessionId);
+      _streamingTextBySession.delete(sessionId);
+      _streamingMsgIdBySession.delete(sessionId);
       const result = await sendUserMessage(ctx, sessionId, finalText);
-      setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
-      setAttachments((prev) => {
-        // Release the thumbnail object URLs now that the chips are gone; the
-        // sent bubble re-fetches images through the server preview proxy.
-        for (const a of prev) if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
-        return [];
-      });
-      startStream(sessionId, lastRemoteEventId(result.data ?? []), turnStartedAt, multiagentSessionsRef.current.has(sessionId));
-      window.setTimeout(() => {
-        void mergeSessionEvents(sessionId);
-        void refreshSessions();
-      }, 1200);
-      window.setTimeout(() => {
-        void mergeSessionEvents(sessionId);
-        void refreshSessions();
-      }, 3500);
+      if (!visible()) return;
+      const accepted = (result.data ?? []).filter(event => !event.session_id || event.session_id === sessionId)
+        .map(event => event.session_id ? event : { ...event, session_id: sessionId });
+      setEvents((prev) => commitConversationTurn(prev, localUserId, accepted));
+      const sentFiles = new Set(readyAttachments.map(attachment => attachment.localId));
+      setAttachments((prev) => prev.filter(attachment => {
+        if (!sentFiles.has(attachment.localId)) return true;
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+        return false;
+      }));
+      startStream(sessionId, lastRemoteEventId(accepted), turnStartedAt, multiagentSessionsRef.current.has(sessionId));
     } catch (err) {
-      if (localThinkingId) {
-        setEvents((prev) => prev.filter((event) => event.id !== localThinkingId));
+      const inView = visible();
+      if (sessionId.startsWith('local-')) {
+        setSessions((prev) => prev.filter((session) => session.id !== sessionId));
+        if (inView) {
+          currentSessionIdRef.current = '';
+          setCurrentSessionId('');
+        }
       }
-      // Roll back an optimistic new-conversation session so the user can retry.
-      if (currentSessionIdRef.current.startsWith('local-')) {
-        const optimisticId = currentSessionIdRef.current;
-        setSessions((prev) => prev.filter((s) => s.id !== optimisticId));
-        setEvents((prev) => prev.filter((e) => e.session_id !== optimisticId));
-        _turnTimestamps.delete(optimisticId);
-        _streamingTextBySession.delete(optimisticId);
-        _streamingMsgIdBySession.delete(optimisticId);
-        currentSessionIdRef.current = '';
-        setCurrentSessionId('');
+      if (inView) {
+        setEvents((prev) => prev.filter(event => event.id !== localThinkingId && event.id !== localUserId));
+        setError(err instanceof Error ? err.message : String(err));
+        setInput((draft) => draft || text);
       }
-      setError(err instanceof Error ? err.message : String(err));
-      setInput(text);
+    } finally {
+      messageWriteRef.current.delete(writeKey);
     }
-  }, [attachments, ctx, currentSessionId, identity, input, mergeSessionEvents, migrateSessionId, refreshSessions, sessions, startStream, templateId, templates, streaming, stopping]);
+  }, [attachments, ctx, currentSessionId, identity, input, pendingQuestion, pendingToolApprovals.length, sessions, startStream, templateId, templates, streaming, stopping, waitingForAction]);
 
-  const sendQuick = useCallback(async (text: string) => {
-    if (!ctx || !identity || !templateId || !text.trim()) return;
-    if (currentSessionId && (streaming || stopping || isSessionOngoing(sessions.find((session) => session.id === currentSessionId)?.status))) return;
-    const turnStartedAt = new Date().toISOString();
-    let localThinkingId = '';
-    setInput('');
-    setError('');
-    try {
-      let sessionId = currentSessionId;
-      if (!sessionId) {
-        // Optimistically switch to the chat view immediately so the user isn't
-        // left waiting on the new-conversation screen while the session is created.
-        const optimisticId = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        const currentTemplateMeta = templates.find((t) => t.id === templateId);
-        const now = new Date().toISOString();
-        const optimisticSession: ForwardSession = {
-          id: optimisticId,
-          type: 'session',
-          identity_id: identity.id,
-          template_id: templateId,
-          status: 'running',
-          title: sessionTitle(text),
-          template: currentTemplateMeta
-            ? { id: currentTemplateMeta.id, name: currentTemplateMeta.name }
-            : undefined,
-          created_at: now,
-          updated_at: now,
-        };
-        setSessions((prev) => [optimisticSession, ...prev]);
-        currentSessionIdRef.current = optimisticId;
-        setCurrentSessionId(optimisticId);
-        sessionId = optimisticId;
-
-        recordTurnStart(sessionId);
-        const localEvents = localTurnEvents(sessionId, text);
-        localThinkingId = localEvents.thinking.id;
-        stickToBottomRef.current = true;
-        _streamingTextBySession.delete(sessionId);
-        _streamingMsgIdBySession.delete(sessionId);
-        setEvents((prev) => {
-          const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
-          return [...cleaned, localEvents.user, localEvents.thinking];
-        });
-
-        const realSession = await createSession(ctx, identity.id, templateId, sessionTitle(text));
-        const oldId = sessionId;
-        migrateSessionId(oldId, realSession.id);
-        setCurrentSessionId(realSession.id);
-        setSessions((prev) => prev.map((s) => (s.id === oldId ? realSession : s)));
-        setEvents((prev) => prev.map((e) => (e.session_id === oldId ? { ...e, session_id: realSession.id } : e)));
-        sessionId = realSession.id;
-      } else {
-        recordTurnStart(sessionId);
-        const localEvents = localTurnEvents(sessionId, text);
-        localThinkingId = localEvents.thinking.id;
-        // Sending a new message should always bring the view back to the bottom.
-        stickToBottomRef.current = true;
-        // Remove old synthetic streaming messages from a previous turn.
-        _streamingTextBySession.delete(sessionId);
-        _streamingMsgIdBySession.delete(sessionId);
-        setEvents((prev) => {
-          const cleaned = prev.filter((e) => !e.id.startsWith('local-stream-'));
-          return [...cleaned, localEvents.user, localEvents.thinking];
-        });
-      }
-      const result = await sendUserMessage(ctx, sessionId, text);
-      setEvents((prev) => mergeIncomingEvents(prev, result.data ?? []));
-      startStream(sessionId, lastRemoteEventId(result.data ?? []), turnStartedAt, multiagentSessionsRef.current.has(sessionId));
-      window.setTimeout(() => {
-        void mergeSessionEvents(sessionId);
-        void refreshSessions();
-      }, 1200);
-      window.setTimeout(() => {
-        void mergeSessionEvents(sessionId);
-        void refreshSessions();
-      }, 3500);
-    } catch (err) {
-      if (localThinkingId) {
-        setEvents((prev) => prev.filter((event) => event.id !== localThinkingId));
-      }
-      // Roll back an optimistic new-conversation session so the user can retry.
-      if (currentSessionIdRef.current.startsWith('local-')) {
-        const optimisticId = currentSessionIdRef.current;
-        setSessions((prev) => prev.filter((s) => s.id !== optimisticId));
-        setEvents((prev) => prev.filter((e) => e.session_id !== optimisticId));
-        _turnTimestamps.delete(optimisticId);
-        _streamingTextBySession.delete(optimisticId);
-        _streamingMsgIdBySession.delete(optimisticId);
-        currentSessionIdRef.current = '';
-        setCurrentSessionId('');
-      }
-      setError(err instanceof Error ? err.message : String(err));
-      setInput(text);
-    }
-  }, [ctx, currentSessionId, identity, mergeSessionEvents, migrateSessionId, refreshSessions, sessions, startStream, stopping, streaming, templateId, templates]);
 
   const stop = useCallback(async () => {
-    if (!ctx || !currentSessionId || (stopAbort.current && !stopAbort.current.signal.aborted)) return;
+    if (!ctx || !currentSessionId || currentSessionId.startsWith('local-') || messageWriteRef.current.has(currentSessionId) || messageWriteRef.current.has('') || (stopAbort.current && !stopAbort.current.signal.aborted)) return;
     const sessionId = currentSessionId;
+    const generation = eventHistoryGenerationRef.current;
+    const visible = () => currentSessionIdRef.current === sessionId && eventHistoryGenerationRef.current === generation;
     const controller = new AbortController();
     stopAbort.current = controller;
-    streamAbort.current?.abort();
-    setStreaming(false);
     setStopping(true);
     setError('');
     try {
-      await cancelSession(ctx, sessionId);
+      const accepted = await cancelSession(ctx, sessionId, controller.signal);
       controller.signal.throwIfAborted();
-      if (currentSessionIdRef.current !== sessionId) return;
-      setSessions((prev) => prev.map((session) => session.id === sessionId ? { ...session, status: 'canceling' } : session));
-      setEvents((prev) => [
-        ...prev.filter((event) => !(isLocalThinkingEvent(event) && event.session_id === sessionId)),
-        { id: `local-${Date.now()}-cancel`, type: 'session.cancel_requested', session_id: sessionId,
-          created_at: new Date().toISOString(), status: 'canceling', reason: '已请求停止当前对话' },
-      ]);
-      const session = await waitForSessionStop(ctx, sessionId, controller.signal);
+      if (!visible()) return;
+      const session = accepted ? await waitForSessionStop(ctx, sessionId, controller.signal) : await getSession(ctx, sessionId, { signal: controller.signal });
       controller.signal.throwIfAborted();
-      if (currentSessionIdRef.current !== sessionId) return;
-      await mergeSessionEvents(sessionId);
-      controller.signal.throwIfAborted();
-      if (currentSessionIdRef.current === sessionId) setSessions((prev) => prev.map((item) => item.id === sessionId ? session : item));
+      if (!visible()) return;
+      setSessions((prev) => prev.map((item) => item.id === sessionId ? session : item));
+      if (accepted) {
+        await mergeSessionEvents(sessionId, controller.signal);
+        if (!visible() || controller.signal.aborted) return;
+        streamAbort.current?.abort();
+        const at = new Date().toISOString();
+        setEvents((prev) => mergeIncomingEvents(prev, [{ id: `local-stop-${at}`, type: 'local.stop_confirmed', session_id: sessionId, created_at: at }]));
+      } else {
+        setError('没有正在执行的回复可停止。');
+        await mergeSessionEvents(sessionId, controller.signal);
+      }
     } catch (err) {
-      if (!controller.signal.aborted && currentSessionIdRef.current === sessionId) {
+      if (!controller.signal.aborted && visible()) {
         setError(err instanceof Error ? err.message : String(err));
       }
     } finally {
@@ -4900,19 +4408,7 @@ export default function App() {
     [events, coordinator, coordinatorName],
   );
   const currentSession = sessions.find((session) => session.id === currentSessionId);
-  // Whole-session credit total, shown next to the composer's attachment button.
-  // Uses usage.total_credits (NOT usage.credits, which tracks model spend and
-  // reconciles with the per-call span.model_request_end events).
-  //
-  // Caveat from live cn-prod data (37 sessions): total_credits is present on only
-  // 12/37 — older sessions omit it entirely — and its relation to `credits` is not
-  // a clean superset (deltas observed: 0, +0.02, +0.48, +1.39, and once -26.29).
-  // So the badge is intentionally hidden rather than back-filled when the field is
-  // missing: null must never render as a misleading 0.
-  const rawSessionTotal = currentSession?.usage?.total_credits;
-  const currentSessionCredits = typeof rawSessionTotal === 'number' && Number.isFinite(rawSessionTotal)
-    ? rawSessionTotal
-    : null;
+  const currentSessionCredits = conversationCredits(events, currentSession);
   const hasPendingLocalThinking = events.some((event) => isLocalThinkingEvent(event) && event.session_id === currentSessionId);
   const currentSessionStatus = currentSession?.status;
   const isCurrentTurnCanceling = stopping ||
@@ -4928,6 +4424,7 @@ export default function App() {
     identity
     && templateId
     && !attachmentsBusy
+    && !waitingForAction
     && pendingToolApprovals.length === 0
     && !pendingQuestion
     && (input.trim() || attachments.length > 0),
@@ -6314,7 +5811,7 @@ export default function App() {
                         ].map((item) => (
                           <button
                             key={item.text}
-                            onClick={() => void sendQuick(item.text)}
+                            onClick={() => void send(item.text)}
                             disabled={!templateId}
                             className="flex items-start gap-3 rounded-xl border border-[#E5E7EB] bg-white px-4 py-3 text-left transition hover:border-[#B8C3FF] hover:bg-[#FAFBFF] disabled:opacity-40"
                           >
@@ -6345,75 +5842,64 @@ export default function App() {
                       </div>
                     )}
                     <div className="space-y-4 pb-8">
-                      {events.map((event, index) => {
-                        const kind = eventViewKind(event);
-                        if (kind === 'hidden') return null;
-                        if (kind === 'agent_thinking') {
-                          if (!showThinking) return null;
-                          return <ThinkingMessage key={event.id} event={event} />;
+                      {conversationTurns.map((turn, index) => {
+                        const latest = index === conversationTurns.length - 1;
+                        const actions = latest && (pendingToolApprovals.length > 0 || pendingQuestion) ? (
+                          <>
+                            <ToolApprovalPanel approvals={pendingToolApprovals} loadingId={chatActionLoading} onResolve={(approval, result) => void resolveToolApproval(approval, result)} />
+                            {pendingQuestion && (
+                              <QuestionPanel key={pendingQuestion.questionUseId} pending={pendingQuestion} loading={chatActionLoading === pendingQuestion.questionUseId}
+                                onSubmit={(answers) => void answerPendingQuestion(answers)} onDismiss={() => void answerPendingQuestion([], true)} />
+                            )}
+                          </>
+                        ) : undefined;
+                        const state = latest && isCurrentTurnCanceling ? 'stopping'
+                          : !isTurnTerminal(turn.state) && latest && actions ? 'waiting'
+                          : !isTurnTerminal(turn.state) && latest && reconnectingSession === currentSessionId && turn.state !== 'waiting' ? 'reconnecting'
+                          : latest && streaming && turn.state === 'unknown' ? 'running' : turn.state;
+                        const steps = turn.steps.filter(step => step.kind === 'thinking' ? showThinking
+                          : step.kind === 'tool' ? showToolCalls
+                          : step.kind === 'coordination' ? Boolean(multiagentView.roles[step.event.id]) : true);
+                        const files = new Map<string, ForwardEvent | undefined>();
+                        for (const event of turn.events) {
+                          if (event.type === 'agent.artifact_delivered' && typeof event.file_id === 'string') files.set(event.file_id, event);
                         }
-                        if (kind === 'tool_use') {
-                          if (!showToolCalls) return null;
-                          return (
-                            <ToolEventMessage
-                              key={event.id}
-                              event={event}
-                              result={false}
-                              pending={isToolUsePending(events, event, index)}
-                            />
-                          );
+                        for (const { event, result } of turn.tools) {
+                          if (!result || !ARTIFACT_TOOL_NAMES.has(toolEventName(event))) continue;
+                          for (const id of extractArtifactFileIds(result)) if (!files.has(id)) files.set(id, undefined);
                         }
-                        if (kind === 'tool_result') {
-                          if (!showToolCalls) {
-                            // Tool-call display is off, but generated artifacts (images/files)
-                            // are the deliverable, not process detail — keep their preview
-                            // cards visible even when the tool call bubble itself is hidden.
-                            const hiddenName = toolDisplayNameForEvent(events, event, index);
-                            const hiddenArtifactIds = ARTIFACT_TOOL_NAMES.has(hiddenName)
-                              ? extractArtifactFileIds(event)
-                              : [];
-                            if (hiddenArtifactIds.length === 0) return null;
-                            return (
-                              <div key={event.id} className="flex gap-4">
-                                <ChatAvatar />
-                                <div className="flex w-fit max-w-[92%] flex-col gap-2">
-                                  {hiddenArtifactIds.map((fileId) => (
-                                    <ArtifactDownloadCard key={fileId} ctx={ctx} fileId={fileId} />
-                                  ))}
-                                </div>
-                              </div>
-                            );
-                          }
-                          return (
-                            <ToolEventMessage
-                              key={event.id}
-                              event={event}
-                              result
-                              displayName={toolDisplayNameForEvent(events, event, index)}
-                              ctx={ctx}
-                            />
-                          );
-                        }
-                        if (kind === 'session_error') return <SessionErrorMessage key={event.id} event={event} />;
-                        if (kind === 'multiagent_status') {
-                          const role = multiagentView.roles[event.id];
-                          if (!role) return null;
-                          if (role.role === 'dispatch') {
-                            return <MultiagentDispatchCard key={event.id} name={role.name} text={role.text} at={event.processed_at} />;
-                          }
-                          if (role.role === 'reply') {
-                            return <MultiagentReplyCard key={event.id} name={role.name} text={role.text} at={event.processed_at} />;
-                          }
-                          return <MultiagentStatusLine key={event.id} name={role.name} status={role.status} stopReason={role.stopReason} />;
-                        }
-                        if (kind === 'user') return <ChatTextMessage key={event.id} event={event} user ctx={ctx} />;
-                        // Attribute model-call credits to this reply by position. Skip the
-                        // synthetic streaming message — its calls aren't finalized yet, and
-                        // getResponseTime() likewise suppresses meta on local-stream-* ids.
-                        const credits = event.id.startsWith('local-stream-')
-                          ? undefined
-                          : modelCallsForMessage(events, index);
-                        return <ChatTextMessage key={event.id} event={event} credits={credits} />;
+                        return (
+                          <article key={turn.key} className="space-y-4">
+                            {turn.user && <ChatTextMessage event={turn.user} user ctx={ctx} />}
+                            <TurnProcess turn={turn} state={state} steps={steps} actions={actions ?? (latest && state === 'waiting' ? (
+                              <p className="text-sm text-amber-800">{eventsHasMore ? '若待处理事项未显示，请加载更早记录。' : '当前没有可操作的事项，正在等待执行恢复。'}</p>
+                            ) : undefined)}>
+                              {steps.map(step => {
+                                const event = step.event;
+                                let row: React.ReactNode;
+                                if (step.kind === 'thinking') row = <ThinkingMessage event={event} />;
+                                else if (step.kind === 'tool') row = <ToolStep step={step} />;
+                                else if (step.kind === 'narration') row = <ChatTextMessage event={event} />;
+                                else {
+                                  const role = multiagentView.roles[event.id];
+                                  row = role.role === 'dispatch' ? <MultiagentDispatchCard name={role.name} text={role.text} at={event.processed_at} />
+                                    : role.role === 'reply' ? <MultiagentReplyCard name={role.name} text={role.text} at={event.processed_at} />
+                                    : <MultiagentStatusLine name={role.name} status={role.status} stopReason={role.stopReason} />;
+                                }
+                                return <li key={String(event.stream_event_id ?? event.id)} className="border-l-2 border-slate-200 pl-3">{row}</li>;
+                              })}
+                            </TurnProcess>
+                            {turn.answers.map(event => <ChatTextMessage key={String(event.stream_event_id ?? event.id)} event={event}
+                              credits={event.id.startsWith('local-stream-') ? undefined : modelCallsForMessage(turn.events, turn.events.indexOf(event))} />)}
+                            {files.size > 0 && (
+                              <section aria-label="交付产物" className="space-y-2">
+                                <h3 className="text-xs font-semibold text-slate-600">交付产物</h3>
+                                {[...files].map(([fileId, event]) => <ArtifactDownloadCard key={fileId} ctx={ctx} fileId={fileId} event={event} />)}
+                              </section>
+                            )}
+                            {turn.errors.map(event => <SessionErrorMessage key={event.id} event={event} />)}
+                          </article>
+                        );
                       })}
                     </div>
                     </div>
@@ -6422,24 +5908,6 @@ export default function App() {
                 {!voiceViewOpen && events.length > 0 && (
                   <div className="shrink-0 px-8 pb-6 pt-2">
                     <div className="mx-auto max-w-[860px]">
-                      {(pendingToolApprovals.length > 0 || pendingQuestion) && (
-                        <div className="mb-3 space-y-3">
-                          <ToolApprovalPanel
-                            approvals={pendingToolApprovals}
-                            loadingId={chatActionLoading}
-                            onResolve={(approval, result) => void resolveToolApproval(approval, result)}
-                          />
-                          {pendingQuestion && (
-                            <QuestionPanel
-                              key={pendingQuestion.questionUseId}
-                              pending={pendingQuestion}
-                              loading={chatActionLoading === pendingQuestion.questionUseId}
-                              onSubmit={(answers) => void answerPendingQuestion(answers)}
-                              onDismiss={() => void answerPendingQuestion([], true)}
-                            />
-                          )}
-                        </div>
-                      )}
                       <div className="rounded-2xl border border-[#E5E7EB] bg-white px-4 py-3 shadow-[0_1px_3px_rgba(0,0,0,0.04)] transition focus-within:border-[#3550FF] focus-within:shadow-[0_0_0_3px_rgba(53,80,255,0.06)]">
                         <AttachmentChips attachments={attachments} onRemove={removeAttachment} onRetry={retryAttachment} />
                         <textarea
@@ -6468,7 +5936,7 @@ export default function App() {
                             <span>换行</span>
                           </div>
                           <div className="flex items-center gap-1.5">
-                            {currentSessionCredits != null && currentSessionCredits > 0 && (
+                            {currentSessionCredits !== undefined && (
                               <>
                                 <span
                                   title="本会话累计消耗 Credit"
@@ -6477,7 +5945,7 @@ export default function App() {
                                   <svg className="h-3.5 w-3.5 text-black/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
                                     <path strokeLinecap="round" strokeLinejoin="round" d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12l1-8.5Z" />
                                   </svg>
-                                  {formatCredits(currentSessionCredits)}
+                                  会话累计 {formatCredits(currentSessionCredits)} Credit
                                 </span>
                                 <span className="mx-0.5 h-4 w-px bg-black/10" />
                               </>
