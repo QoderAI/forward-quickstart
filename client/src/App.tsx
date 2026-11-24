@@ -950,18 +950,54 @@ function ToolStep({ step }: { step: Extract<ProcessStep, { kind: 'tool' }> }) {
   const input = getEventValue(step.event, ['input', 'arguments', 'parameters']);
   const summary = toolSummary(name, input);
   const details = toolInputDetails(name, input);
+  const text = details?.text;
+  const preview = details?.preview ?? text?.replace(/\r\n?|\n/g, ' ');
+  const multiline = details?.preview === undefined && /[\r\n]/.test(text ?? '');
+  const commandLine = useRef<HTMLDivElement>(null);
+  const commandPreview = useRef<HTMLElement>(null);
+  const [overflowing, setOverflowing] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const detailId = useId();
+  const canExpand = multiline || overflowing;
+
+  useLayoutEffect(() => {
+    const line = commandLine.current;
+    const code = commandPreview.current;
+    if (!line || !code) return;
+    const observer = new ResizeObserver(() => {
+      if (line.clientWidth) setOverflowing(code.scrollWidth > line.clientWidth);
+    });
+    observer.observe(line);
+    return () => observer.disconnect();
+  }, [preview]);
+
   return (
     <div className="min-w-0 text-[13px]">
-      <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+      <div className={`flex min-w-0 gap-x-2 gap-y-0.5 ${details ? 'items-center' : 'flex-wrap items-baseline'}`}>
         <span className="font-medium text-slate-700">{stepLabel(step)}</span>
+        {details && (
+          <div ref={commandLine} className="flex min-w-0 flex-1 items-center gap-1">
+            <code ref={commandPreview} className="min-w-0 overflow-hidden text-ellipsis whitespace-pre font-mono text-xs text-slate-600">{preview}</code>
+            {canExpand && (
+              <button type="button" aria-label={expanded ? '收起详情' : details.label} title={expanded ? '收起详情' : details.label} aria-expanded={expanded} aria-controls={detailId} onClick={() => setExpanded(!expanded)} className="shrink-0 cursor-pointer rounded p-1 text-slate-600 hover:bg-slate-100 focus-visible:outline-[#3550FF]">
+                <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className={`size-3.5 ${expanded ? 'rotate-180' : ''}`}>
+                  <path d="m4 6 4 4 4-4" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+            )}
+          </div>
+        )}
         {summary && <span className="min-w-0 break-all text-slate-500">{summary}</span>}
-        <span className={`ml-auto whitespace-nowrap text-xs ${step.state === 'failed' || step.state === 'denied' ? 'text-red-700' : step.state === 'waiting' ? 'text-amber-800' : 'text-slate-500'}`}>{TOOL_STEP_LABELS[step.state]}</span>
+        {step.state === 'done' ? (
+          <svg role="img" aria-label={TOOL_STEP_LABELS.done} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" className="ml-auto size-4 shrink-0 self-center text-emerald-700">
+            <path d="m3.5 8 3 3 6-6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        ) : (
+          <span className={`ml-auto shrink-0 whitespace-nowrap text-xs ${step.state === 'failed' || step.state === 'denied' ? 'text-red-700' : step.state === 'waiting' ? 'text-amber-800' : 'text-slate-500'}`}>{TOOL_STEP_LABELS[step.state]}</span>
+        )}
       </div>
-      {details && (
-        <details className="mt-1">
-          <summary className="w-fit cursor-pointer text-xs text-slate-600">{details.label}</summary>
-          <pre className="mt-1 whitespace-pre-wrap rounded-md bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700 [overflow-wrap:anywhere]"><code>{details.text}</code></pre>
-        </details>
+      {details && canExpand && (
+        <pre id={detailId} hidden={!expanded} className="mt-1 whitespace-pre-wrap rounded-md bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700 [overflow-wrap:anywhere]"><code>{text}</code></pre>
       )}
     </div>
   );

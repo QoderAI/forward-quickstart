@@ -195,11 +195,12 @@ export function projectConversation(events: ForwardEvent[], hasOlder: boolean): 
   }
   return groups.flatMap((group, i) => {
     const partial = i === 0 && !group.user && hasOlder;
-    if (!group.user && !partial && group.events.every(event =>
-      event.type.startsWith('session.thread_') || event.type === 'session.created' || event.type === 'session.updated'
-      || event.type === 'session.usage' || turnEventState(event) === 'unknown',
-    )) return [];
-    return [projectTurn(group.events, group.user, partial, i < groups.length - 1)];
+    const turn = projectTurn(group.events, group.user, partial, i < groups.length - 1);
+    if (group.user || partial || turn.answers.length || turn.errors.length) return [turn];
+    if (turn.state === 'waiting' || turn.state === 'stopped' || turn.state === 'terminated') return [turn];
+    if (turn.steps.some(step => step.kind !== 'coordination' || !step.event.type.startsWith('session.thread_'))
+      || group.events.some(event => event.type === 'agent.ask_user_question' || event.type === 'agent.artifact_delivered')) return [turn];
+    return [];
   });
 }
 
@@ -314,7 +315,7 @@ export function toolInputDetails(name: string, source: unknown) {
   if (command.trim()) return { label: '查看完整命令', text: command };
   if (tool === 'grep') {
     if (typeof source === 'string' && source.trim()) return { label: '查看完整参数', text: source };
-    if (input && Object.keys(input).length) return { label: '查看完整参数', text: JSON.stringify(input, null, 2) };
+    if (input && Object.keys(input).length) return { label: '查看完整参数', text: JSON.stringify(input, null, 2), preview: JSON.stringify(input) };
   }
 }
 

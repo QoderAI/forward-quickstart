@@ -38,6 +38,41 @@ describe('conversation projection', () => {
     expect(turns[0].answers.map(answer => answer.id)).toEqual(['answer']);
   });
 
+  test.each([
+    { kind: 'session status', bookkeeping: [event('boot-running', 'session.status_running'), idle('boot-done', 'end_turn', 1)] },
+    { kind: 'model usage', bookkeeping: [event('metric', 'span.model_request_end')] },
+    { kind: 'resource metadata', bookkeeping: [event('attached', 'session.resource_attached')] },
+  ])('does not turn startup $kind into an extra coordination card', ({ bookkeeping }) => {
+    const startup = [event('thread', 'session.thread_created', { session_thread_id: 'sthr_child' }), ...bookkeeping];
+    expect(projectConversation(startup, false)).toEqual([]);
+    const message = event('u1', 'user.message');
+    const tool = event('bash', 'agent.tool_use', { name: 'Bash', input: { command: 'ls -l' } });
+    const dispatch = event('dispatch', 'agent.thread_message_sent', { to_session_thread_id: 'sthr_child' });
+    const child = event('child-idle', 'session.thread_status_idle', { session_thread_id: 'sthr_child' });
+    const answer = event('answer', 'agent.message', { content: 'Result' });
+    const live = [...startup, message, event('running', 'session.status_running', at(2)), tool, dispatch, child];
+    expect(projectConversation(live, false)).toMatchObject([
+      { key: 'u1', state: 'running', steps: [{ event: tool }, { event: dispatch }, { event: child }] },
+    ]);
+    expect(projectConversation([...live, answer, idle('done', 'end_turn', 3)], false)).toMatchObject([
+      { key: 'u1', state: 'done', steps: [{ event: tool }, { event: dispatch }, { event: child }], answers: [answer] },
+    ]);
+  });
+
+  test('keeps evidence of real work or interruption without a user anchor', () => {
+    const thread = event('thread', 'session.thread_created');
+    const content = [
+      event('dispatch', 'agent.thread_message_sent'),
+      event('artifact', 'agent.artifact_delivered', { file_id: 'file_1' }),
+      event('question', 'agent.ask_user_question'),
+      idle('wait', 'requires_action', 1, ['tool']),
+      event('terminated', 'session.status_terminated'),
+    ];
+    for (const item of content) {
+      expect(projectConversation([thread, item], false)[0]?.events).toContain(item);
+    }
+  });
+
   test('keeps coordination in a truncated turn and preserves unanchored replies and errors', () => {
     const child = event('child', 'session.thread_status_idle');
     expect(projectConversation([child, event('u2', 'user.message')], true)[0]).toMatchObject({
@@ -204,6 +239,7 @@ describe('reconciling transport and history', () => {
     const input = { pattern: 'first result', path: 'notes.txt', glob: '*.txt', '-n': false, '-C': 0 };
     const details = toolInputDetails('Grep', input);
     expect(details?.label).toBe('查看完整参数');
+    expect(details?.preview).toBe(JSON.stringify(input));
     expect(JSON.parse(details!.text)).toEqual(input);
     expect(toolInputDetails('Bash', { command: '  ' })).toBeUndefined();
     expect(toolInputDetails('Grep', {})).toBeUndefined();
