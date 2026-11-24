@@ -306,6 +306,18 @@ function shortDisplay(value: string) {
   }).replace(/\b(?:bearer\s+\S+|(?:token|password|secret|api[-_]?key)\s*[:=]\s*\S+)/gi, '***').slice(0, 120);
 }
 
+export function toolInputDetails(name: string, source: unknown) {
+  const tool = name.toLowerCase();
+  if (tool !== 'bash' && tool !== 'grep') return;
+  const input = recordOf(source);
+  const command = typeof input?.command === 'string' ? input.command : typeof source === 'string' && tool === 'bash' ? source : '';
+  if (command.trim()) return { label: '查看完整命令', text: command };
+  if (tool === 'grep') {
+    if (typeof source === 'string' && source.trim()) return { label: '查看完整参数', text: source };
+    if (input && Object.keys(input).length) return { label: '查看完整参数', text: JSON.stringify(input, null, 2) };
+  }
+}
+
 export function toolSummary(name: string, source: unknown): string {
   const input = recordOf(source);
   if (!input) return '';

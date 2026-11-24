@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import type { ForwardEvent } from './forwardApi';
-import { commitConversationTurn, conversationCredits, latestTurnState, mergeConversationEvents, projectConversation, toolSummary } from './conversationTurns';
+import { commitConversationTurn, conversationCredits, latestTurnState, mergeConversationEvents, projectConversation, toolInputDetails, toolSummary } from './conversationTurns';
 
 function event(id: string, type: string, extra: Partial<ForwardEvent> = {}): ForwardEvent {
   return { id, type, session_id: 'session', ...extra };
@@ -191,6 +191,23 @@ describe('reconciling transport and history', () => {
     expect(conversationCredits(usage)).toBe(0);
     expect(conversationCredits(usage, { usage: { total_credits: 7 }, updated_at: at(4).created_at })).toBe(7);
     expect(conversationCredits([], { usage: { total_credits: 0 } })).toBe(0);
+  });
+
+  test('keeps the complete Bash or Grep command including whitespace and newlines', () => {
+    const command = `  ls -l\n${'  '.repeat(70)}grep 'first result' notes.txt\n`;
+    expect(toolInputDetails('Bash', { command })).toEqual({ label: '查看完整命令', text: command });
+    expect(toolInputDetails('bash', command)?.text).toBe(command);
+    expect(toolInputDetails('grep', { command })?.text).toBe(command);
+  });
+
+  test('shows Grep parameters without inventing a command and does not show other tools’ raw inputs', () => {
+    const input = { pattern: 'first result', path: 'notes.txt', glob: '*.txt', '-n': false, '-C': 0 };
+    const details = toolInputDetails('Grep', input);
+    expect(details?.label).toBe('查看完整参数');
+    expect(JSON.parse(details!.text)).toEqual(input);
+    expect(toolInputDetails('Bash', { command: '  ' })).toBeUndefined();
+    expect(toolInputDetails('Grep', {})).toBeUndefined();
+    expect(toolInputDetails('Read', { file_path: '/workspace/a.txt' })).toBeUndefined();
   });
 
   test('summarizes only safe fields and strips link credentials and tokens', () => {

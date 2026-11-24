@@ -147,7 +147,7 @@ import {
   splitAttachmentMarkers,
 } from './attachments';
 import { formatCredits, modelCallsForMessage, type ModelCall } from './credits';
-import { commitConversationTurn, conversationCredits, isTurnTerminal, latestTurnState, mergeConversationEvents, projectConversation, stopReason, toolSummary, turnEventState, type ConversationTurn, type ProcessStep, type TurnState } from './conversationTurns';
+import { commitConversationTurn, conversationCredits, isTurnTerminal, latestTurnState, mergeConversationEvents, projectConversation, stopReason, toolInputDetails, toolSummary, turnEventState, type ConversationTurn, type ProcessStep, type TurnState } from './conversationTurns';
 
 const BatchPanel = lazy(() => import('./batchPanel').then(module => ({ default: module.BatchPanel })));
 const UsagePanel = lazy(() => import('./usagePanel').then(module => ({ default: module.UsagePanel })));
@@ -947,12 +947,22 @@ function stepLabel(step: ProcessStep) {
 
 function ToolStep({ step }: { step: Extract<ProcessStep, { kind: 'tool' }> }) {
   const name = toolEventName(step.event);
-  const summary = toolSummary(name, getEventValue(step.event, ['input', 'arguments', 'parameters']));
+  const input = getEventValue(step.event, ['input', 'arguments', 'parameters']);
+  const summary = toolSummary(name, input);
+  const details = toolInputDetails(name, input);
   return (
-    <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[13px]">
-      <span className="font-medium text-slate-700">{stepLabel(step)}</span>
-      {summary && <span className="min-w-0 break-all text-slate-500">{summary}</span>}
-      <span className={`ml-auto whitespace-nowrap text-xs ${step.state === 'failed' || step.state === 'denied' ? 'text-red-700' : step.state === 'waiting' ? 'text-amber-800' : 'text-slate-500'}`}>{TOOL_STEP_LABELS[step.state]}</span>
+    <div className="min-w-0 text-[13px]">
+      <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="font-medium text-slate-700">{stepLabel(step)}</span>
+        {summary && <span className="min-w-0 break-all text-slate-500">{summary}</span>}
+        <span className={`ml-auto whitespace-nowrap text-xs ${step.state === 'failed' || step.state === 'denied' ? 'text-red-700' : step.state === 'waiting' ? 'text-amber-800' : 'text-slate-500'}`}>{TOOL_STEP_LABELS[step.state]}</span>
+      </div>
+      {details && (
+        <details className="mt-1">
+          <summary className="w-fit cursor-pointer text-xs text-slate-600">{details.label}</summary>
+          <pre className="mt-1 whitespace-pre-wrap rounded-md bg-slate-50 px-3 py-2 font-mono text-xs text-slate-700 [overflow-wrap:anywhere]"><code>{details.text}</code></pre>
+        </details>
+      )}
     </div>
   );
 }
