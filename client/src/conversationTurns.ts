@@ -193,7 +193,14 @@ export function projectConversation(events: ForwardEvent[], hasOlder: boolean): 
     }
     groups.at(-1)!.events.push(event);
   }
-  return groups.map((group, i) => projectTurn(group.events, group.user, i === 0 && !group.user && hasOlder, i < groups.length - 1));
+  return groups.flatMap((group, i) => {
+    const partial = i === 0 && !group.user && hasOlder;
+    if (!group.user && !partial && group.events.every(event =>
+      event.type.startsWith('session.thread_') || event.type === 'session.created' || event.type === 'session.updated'
+      || event.type === 'session.usage' || turnEventState(event) === 'unknown',
+    )) return [];
+    return [projectTurn(group.events, group.user, partial, i < groups.length - 1)];
+  });
 }
 
 export function mergeConversationEvents(current: ForwardEvent[], incoming: ForwardEvent[], mode: 'stream' | 'older' | 'history' = 'stream'): ForwardEvent[] {

@@ -15,6 +15,39 @@ function idle(id: string, type: string, seconds: number, eventIds: string[] = []
 }
 
 describe('conversation projection', () => {
+  test('omits session initialization before the first user message', () => {
+    const startup = [
+      event('created', 'session.thread_created'),
+      event('thread-idle', 'session.thread_status_idle'),
+      event('idle', 'session.status_idle'),
+      event('usage', 'session.usage', { total_credits: 0 }),
+    ];
+    expect(projectConversation(startup, false)).toEqual([]);
+
+    const turns = projectConversation([
+      ...startup,
+      event('u1', 'user.message'),
+      event('running', 'session.status_running', at(1)),
+      event('dispatch', 'agent.thread_message_sent'),
+      event('child', 'session.thread_status_idle'),
+      event('answer', 'agent.message', { content: 'Result' }),
+      idle('done', 'end_turn', 3),
+    ], false);
+    expect(turns.map(turn => turn.key)).toEqual(['u1']);
+    expect(turns[0].steps.map(step => step.event.id)).toEqual(['dispatch', 'child']);
+    expect(turns[0].answers.map(answer => answer.id)).toEqual(['answer']);
+  });
+
+  test('keeps coordination in a truncated turn and preserves unanchored replies and errors', () => {
+    const child = event('child', 'session.thread_status_idle');
+    expect(projectConversation([child, event('u2', 'user.message')], true)[0]).toMatchObject({
+      partial: true, steps: [{ event: { id: 'child' } }],
+    });
+    expect(projectConversation([
+      child, event('answer', 'agent.message'), event('error', 'session.error'),
+    ], false)[0]).toMatchObject({ answers: [{ id: 'answer' }], errors: [{ id: 'error' }] });
+  });
+
   test('keeps a pause, continuation, and child completion inside the same turn', () => {
     const events = [
       event('u1', 'user.message'),
