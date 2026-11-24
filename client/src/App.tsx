@@ -1,6 +1,14 @@
 import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import {
   cancelSession,
+  ForwardApiError,
+  getSession,
+  getTemplate,
+  getSchedule,
+  getChannel,
+  getCloudEnvironment,
+  getCloudSkill,
+  getCloudVault,
   createCloudEnvironment,
   createCloudVault,
   createSession,
@@ -113,6 +121,8 @@ import {
 import {
   buildTemplateBindings,
   buildTemplateModel,
+  buildTemplateUpdate,
+  buildEnvironmentUpdate,
   isTemplateCreatableModel,
   parseTemplateBindingIds,
   parseTemplateModel,
@@ -122,6 +132,7 @@ import {
   derivePendingQuestion,
   derivePendingToolApprovals,
   encodeQuestionAnswers,
+  waitForSessionStop,
   type PendingQuestion,
   type PendingToolApproval,
 } from './chatActions';
@@ -476,7 +487,7 @@ function normalizeEventMessage(message: string) {
 
 function isSessionOngoing(status?: string) {
   const normalized = status?.replace(/^status_/, '');
-  return normalized === 'running' || normalized === 'processing' || normalized === 'canceling' || normalized === 'cancelling';
+  return normalized === 'running' || normalized === 'rescheduling' || normalized === 'processing' || normalized === 'canceling' || normalized === 'cancelling';
 }
 
 function textFromUnknown(value: unknown, depth = 0): string {
@@ -938,6 +949,7 @@ function mergeHistoricalEvents(current: ForwardEvent[], older: ForwardEvent[]) {
 function mergeIncomingEvents(prev: ForwardEvent[], incoming: ForwardEvent[]) {
   let next = [...prev];
   for (const event of incoming) {
+    next = next.filter((item) => item.stream_event_id !== event.id);
     const existingIndex = next.findIndex((item) => item.id === event.id);
     if (existingIndex >= 0) {
       // Already known: only backfill the server timestamp (needed for ordering)
@@ -2350,6 +2362,11 @@ export default function App() {
   const [resources, setResources] = useState<ForwardResource[]>([]);
   const [resourceOptionsByType, setResourceOptionsByType] = useState<Record<ForwardResourceType, ForwardResource[]>>(emptyResourceOptions);
   const [sessions, setSessions] = useState<ForwardSession[]>([]);
+  const [sessionsHasMore, setSessionsHasMore] = useState(false);
+  const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
+  const sessionPageRef = useRef<{ templateId: string; afterId?: string; page?: string; expanded: boolean } | null>(null);
+  const sessionListGenerationRef = useRef(0);
+  const sessionLoadMoreRef = useRef(false);
   const [currentSessionId, setCurrentSessionId] = useState('');
   const [selectedVoice, setSelectedVoice] = useState<RealtimeVoice>('longanqian');
   const [voiceViewOpen, setVoiceViewOpen] = useState(false);
@@ -2421,6 +2438,9 @@ export default function App() {
   const [showDevModeConfirm, setShowDevModeConfirm] = useState(false);
   const [viewingTemplate, setViewingTemplate] = useState<ForwardTemplate | null>(null);
   const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+  const editingTemplateRef = useRef<ForwardTemplate | null>(null);
+  const initialTemplateInputRef = useRef<ReturnType<typeof buildTemplateInput> | null>(null);
+  const detailRequestRef = useRef(0);
   const [templateSearch, setTemplateSearch] = useState('');
   const [templateActionLoading, setTemplateActionLoading] = useState<string | null>(null);
   const [chatActionLoading, setChatActionLoading] = useState<string | null>(null);
@@ -2483,6 +2503,7 @@ export default function App() {
   const [chanShowTools, setChanShowTools] = useState(false);
   const [chanShowThinking, setChanShowThinking] = useState(false);
   const [editingChannelItem, setEditingChannelItem] = useState<ForwardChannel | null>(null);
+  const editingChannelOriginalRef = useRef<ForwardChannel | null>(null);
   const [deleteChannelId, setDeleteChannelId] = useState<string | null>(null);
   const [qrSession, setQrSession] = useState<ForwardQrSession | null>(null);
   const [qrPolling, setQrPolling] = useState(false);
@@ -2503,16 +2524,12 @@ export default function App() {
       const res = await listCloudModels(context);
       const models = res.data ?? [];
       setCloudModels(models);
-      const nextModelId = pickTemplateCreatableModelId(models, templateModel);
-      if (nextModelId !== templateModel) {
-        setTemplateModel(nextModelId);
-      }
     } catch (err) {
       setModelsError(err instanceof Error ? err.message : String(err));
     } finally {
       setModelsLoading(false);
     }
-  }, [templateModel]);
+  }, []);
 
   useEffect(() => {
     if (!showTemplateModal || editingTemplateId || cloudModels.length === 0) return;
@@ -2544,6 +2561,7 @@ export default function App() {
   const stickToBottomRef = useRef(true);
   const startStreamRef = useRef<(sessionId: string, lastEventId?: string, turnStartedAt?: string, initialHasMultiagent?: boolean) => void>(() => {});
   const streamAbort = useRef<AbortController | null>(null);
+  const stopAbort = useRef<AbortController | null>(null);
   // Tracks sessions that have multiagent child threads (session.thread_created
   // seen at any point). Used to pass hasMultiagentThreads to startStream when a
   // follow-up message is sent, so session.thread_status_idle from a lingering
@@ -2674,7 +2692,10 @@ export default function App() {
     pickAttachments(list.files);
   }, [pickAttachments]);
 
-  useEffect(() => () => streamAbort.current?.abort(), []);
+  useEffect(() => () => {
+    streamAbort.current?.abort();
+    stopAbort.current?.abort();
+  }, []);
 
   const loadOlderEvents = useCallback(async () => {
     const sessionId = currentSessionIdRef.current;
@@ -2810,13 +2831,53 @@ export default function App() {
   }, [currentSessionId]);
 
   const refreshSessions = useCallback(async (nextIdentity = identity, nextTemplateId?: string) => {
-    if (!ctx || !nextIdentity) return [];
+    if (!ctx || !nextIdentity || (sessionLoadMoreRef.current && sessionPageRef.current?.templateId === (nextTemplateId ?? templateIdRef.current))) return [];
     const tplId = nextTemplateId ?? templateIdRef.current;
+    const generation = ++sessionListGenerationRef.current;
     const page = await listSessions(ctx, nextIdentity.id, tplId || undefined);
-    setSessions(page.data);
-    // Never auto-select a session here: background polling calls this while the
-    // user may be sitting on the new-conversation screen (currentSessionId === '').
+    if (generation !== sessionListGenerationRef.current || tplId !== templateIdRef.current) return [];
+    const expanded = sessionPageRef.current?.templateId === tplId && sessionPageRef.current.expanded;
+    setSessions((prev) => expanded && page.has_more
+      ? [...page.data, ...prev.filter((item) => !page.data.some((fresh) => fresh.id === item.id))]
+      : page.data);
+    if (!expanded || !page.has_more) {
+      sessionPageRef.current = {
+        templateId: tplId,
+        ...(page.next_page ? { page: page.next_page } : { afterId: page.last_id || undefined }),
+        expanded: false,
+      };
+      setSessionsHasMore(page.has_more);
+    }
     return page.data;
+  }, [ctx, identity]);
+
+  const loadMoreSessions = useCallback(async () => {
+    const cursor = sessionPageRef.current;
+    if (!ctx || !identity || !cursor || sessionLoadMoreRef.current) return;
+    if (!cursor.page && !cursor.afterId) {
+      setError('会话列表返回了更多数据标记，但缺少分页游标');
+      return;
+    }
+    const generation = sessionListGenerationRef.current;
+    sessionLoadMoreRef.current = true;
+    setLoadingMoreSessions(true);
+    setError('');
+    try {
+      const page = await listSessions(ctx, identity.id, cursor.templateId || undefined, cursor);
+      if (generation !== sessionListGenerationRef.current || cursor.templateId !== templateIdRef.current) return;
+      const next: { page?: string; afterId?: string } = page.next_page ? { page: page.next_page } : { afterId: page.last_id || undefined };
+      if (page.has_more && ((!next.page && !next.afterId) || (next.page === cursor.page && next.afterId === cursor.afterId))) {
+        throw new Error('会话列表分页游标未推进，请稍后重试');
+      }
+      setSessions((prev) => [...prev, ...page.data.filter((item) => !prev.some((existing) => existing.id === item.id))]);
+      sessionPageRef.current = { templateId: cursor.templateId, ...next, expanded: true };
+      setSessionsHasMore(page.has_more);
+    } catch (err) {
+      if (generation === sessionListGenerationRef.current) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      sessionLoadMoreRef.current = false;
+      setLoadingMoreSessions(false);
+    }
   }, [ctx, identity]);
 
   // Switch the active template. Every entry point that changes the template
@@ -2828,8 +2889,14 @@ export default function App() {
     // polling stops calling refreshSessions and streaming state is cleared for
     // the new template.
     streamAbort.current?.abort();
+    stopAbort.current?.abort();
     setStreaming(false);
     setStopping(false);
+    templateIdRef.current = nextTemplateId;
+    sessionListGenerationRef.current += 1;
+    sessionPageRef.current = null;
+    setSessions([]);
+    setSessionsHasMore(false);
     setTemplateId(nextTemplateId);
     currentSessionIdRef.current = '';
     setCurrentSessionId('');
@@ -2866,12 +2933,9 @@ export default function App() {
         // If real agent.message events exist in the fetched data, remove any
         // leftover synthetic streaming messages (local-stream-*) from a
         // prematurely terminated stream.
-        const hasRealMessage = chronologicalData.some(
-          (e) => e.type === 'agent.message' && !e.id.startsWith('local-stream-'),
-        );
-        const filtered = hasRealMessage
-          ? prev.filter((e) => !e.id.startsWith('local-stream-'))
-          : prev;
+        const filtered = prev.filter((event) => event.stream_event_id || !event.id.startsWith('local-stream-') || !chronologicalData.some(
+          (remote) => remote.type === 'agent.message' && (remote.created_at || remote.processed_at || '') >= (event.created_at || ''),
+        ));
         const merged = mergeIncomingEvents(filtered, chronologicalData);
         // Deduplicate similar consecutive agent.message events (the
         // coordinator sometimes outputs the same report twice).
@@ -2923,6 +2987,31 @@ export default function App() {
     }
   }, [ctx, identity]);
 
+  const openEditSchedule = useCallback(async (schedule: ForwardSchedule) => {
+    if (!ctx) return;
+    const request = ++detailRequestRef.current;
+    setLoading(true);
+    setError('');
+    try {
+      const fresh = await getSchedule(ctx, schedule.id);
+      if (request !== detailRequestRef.current) return;
+      setEditingSchedule(fresh);
+      setSchedName(fresh.name);
+      setSchedDesc(fresh.description || '');
+      setSchedTemplateId(fresh.template_id);
+      setSchedTriggerType(fresh.trigger_policy.type as 'cron' | 'once' | 'interval' | 'manual');
+      setSchedExpression(fresh.trigger_policy.expression || '');
+      setSchedTimezone(fresh.trigger_policy.timezone || 'Asia/Shanghai');
+      const content = fresh.initial_events?.[0]?.content;
+      setSchedMessage(typeof content === 'string' ? content : Array.isArray(content) ? content.map((block) => block.text || '').join('') : '');
+      setShowScheduleModal(true);
+    } catch (err) {
+      if (request === detailRequestRef.current) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (request === detailRequestRef.current) setLoading(false);
+    }
+  }, [ctx]);
+
   const handleCreateSchedule = useCallback(async () => {
     if (!ctx || !identity || !schedName.trim() || !schedTemplateId || !schedMessage.trim()) return;
     const tpl = templates.find((t) => t.id === schedTemplateId);
@@ -2943,7 +3032,27 @@ export default function App() {
         trigger_policy: triggerPolicy,
       };
       if (editingSchedule) {
-        await updateSchedule(ctx, editingSchedule.id, input);
+        const patch: Partial<CreateScheduleInput> = {};
+        if (input.name !== editingSchedule.name) patch.name = input.name;
+        if (schedDesc.trim() !== (editingSchedule.description || '')) patch.description = schedDesc.trim();
+        if (input.template_id !== editingSchedule.template_id) {
+          patch.template_id = input.template_id;
+          patch.environment_id = input.environment_id;
+        }
+        const policy = editingSchedule.trigger_policy;
+        if (schedTriggerType !== policy.type || schedExpression !== (policy.expression || '') || schedTimezone !== (policy.timezone || 'Asia/Shanghai')) {
+          patch.trigger_policy = input.trigger_policy;
+        }
+        const first = editingSchedule.initial_events?.[0];
+        const content = first?.content;
+        const originalText = typeof content === 'string' ? content : Array.isArray(content) ? content.map((block) => block.text || '').join('') : '';
+        if (schedMessage.trim() !== originalText) {
+          patch.initial_events = [
+            { ...first, type: first?.type || 'user.message', content: schedMessage.trim() },
+            ...(editingSchedule.initial_events?.slice(1) || []),
+          ] as CreateScheduleInput['initial_events'];
+        }
+        if (Object.keys(patch).length) await updateSchedule(ctx, editingSchedule.id, patch);
       } else {
         await createSchedule(ctx, input);
       }
@@ -3295,26 +3404,52 @@ export default function App() {
     }
   }, [ctx, loadChannels]);
 
+  const openEditChannel = useCallback(async (channel: ForwardChannel) => {
+    if (!ctx) return;
+    const request = ++detailRequestRef.current;
+    setLoading(true);
+    setError('');
+    try {
+      const fresh = await getChannel(ctx, channel.id);
+      if (request !== detailRequestRef.current) return;
+      stopQrPolling();
+      setQrSession(null);
+      setChanAppKey('');
+      setChanAppSecret('');
+      setChanTenantId('');
+      setChanMode(CHANNEL_TYPES.find((item) => item.value === fresh.channel_type)?.qrSupport ? 'qr' : 'manual');
+      editingChannelOriginalRef.current = fresh;
+      setEditingChannelItem(fresh);
+    } catch (err) {
+      if (request === detailRequestRef.current) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (request === detailRequestRef.current) setLoading(false);
+    }
+  }, [ctx, stopQrPolling]);
+
   const handleUpdateChannelItem = useCallback(async () => {
     if (!ctx || !editingChannelItem) return;
     setLoading(true);
     setError('');
     try {
-      const updatePayload: Record<string, unknown> = {
-        name: editingChannelItem.name,
-        template_id: editingChannelItem.template_id,
-        enabled: editingChannelItem.enabled,
-        channel_config: editingChannelItem.channel_config,
-      };
+      const original = editingChannelOriginalRef.current;
+      if (!original || original.id !== editingChannelItem.id) throw new Error('渠道详情尚未就绪，请重新打开配置');
+      const updatePayload: Record<string, unknown> = {};
+      if (editingChannelItem.name !== original.name) updatePayload.name = editingChannelItem.name;
+      if (editingChannelItem.template_id !== original.template_id) updatePayload.template_id = editingChannelItem.template_id;
+      if (editingChannelItem.enabled !== original.enabled) updatePayload.enabled = editingChannelItem.enabled;
+      if (JSON.stringify(editingChannelItem.channel_config?.response_options) !== JSON.stringify(original.channel_config?.response_options)) {
+        updatePayload.channel_config = { response_options: editingChannelItem.channel_config?.response_options };
+      }
       // If manual mode and credentials provided, include them
       if (chanMode === 'manual' && chanAppKey.trim()) {
         const credentials = buildChannelCredentials(editingChannelItem.channel_type, chanAppKey.trim(), chanAppSecret.trim(), chanTenantId.trim());
         updatePayload.channel_config = {
-          ...editingChannelItem.channel_config,
+          ...(updatePayload.channel_config as Record<string, unknown> | undefined),
           credentials,
         };
       }
-      await updateChannel(ctx, editingChannelItem.id, updatePayload);
+      if (Object.keys(updatePayload).length) await updateChannel(ctx, editingChannelItem.id, updatePayload);
       stopQrPolling();
       setEditingChannelItem(null);
       setQrSession(null);
@@ -3333,7 +3468,24 @@ export default function App() {
     await Promise.all(TEMPLATE_RESOURCE_TYPES.map((type) => loadRegisteredResources(type)));
   }, [loadRegisteredResources]);
 
+  const openTemplateDetails = useCallback(async (template: ForwardTemplate) => {
+    if (!ctx) return;
+    const request = ++detailRequestRef.current;
+    setLoading(true);
+    setError('');
+    try {
+      const fresh = await getTemplate(ctx, template.id);
+      if (request === detailRequestRef.current) setViewingTemplate(fresh);
+    } catch (err) {
+      if (request === detailRequestRef.current) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (request === detailRequestRef.current) setLoading(false);
+    }
+  }, [ctx]);
+
   const openTemplateModal = useCallback(() => {
+    editingTemplateRef.current = null;
+    initialTemplateInputRef.current = null;
     setEditingTemplateId(null);
     setTemplateName('');
     setTemplateDescription('');
@@ -3360,7 +3512,23 @@ export default function App() {
     if (ctx) { void loadModels(ctx); void listTemplates(ctx).then(page => setTemplates(page.data)).catch(() => undefined); }
   }, [cloudModels, ctx, loadModels, loadTemplateResourceOptions]);
 
-  const openEditTemplateModal = useCallback((template: ForwardTemplate) => {
+  const openEditTemplateModal = useCallback(async (item: ForwardTemplate) => {
+    if (!ctx) return;
+    const request = ++detailRequestRef.current;
+    setLoading(true);
+    setError('');
+    let template: ForwardTemplate;
+    try {
+      template = await getTemplate(ctx, item.id);
+      if (request !== detailRequestRef.current) return;
+    } catch (err) {
+      if (request === detailRequestRef.current) setError(err instanceof Error ? err.message : String(err));
+      return;
+    } finally {
+      if (request === detailRequestRef.current) setLoading(false);
+    }
+    editingTemplateRef.current = template;
+    initialTemplateInputRef.current = null;
     setEditingTemplateId(template.id);
     setTemplateName(template.name || '');
     setTemplateDescription(template.description || '');
@@ -3371,13 +3539,8 @@ export default function App() {
     setTemplateSystem(template.system || '');
     setEnvironmentId(template.environment_id || '');
     // Skills → skill IDs
-    setSkillIdsText(extractSkillInfo(template.skills).map((s) => s.id).filter(Boolean).join('\n'));
-    // Files → file IDs (object keys)
-    setFileIdsText(
-      template.files && typeof template.files === 'object'
-        ? Object.keys(template.files as Record<string, unknown>).join('\n')
-        : '',
-    );
+    setSkillIdsText(extractSkillInfo(template.skills).filter((s) => s.enabled).map((s) => s.id).filter(Boolean).join('\n'));
+    setFileIdsText(parseTemplateBindingIds(template.files).join('\n'));
     // Vaults
     setVaultIdsText(parseTemplateBindingIds(template.vaults ?? template.vault_ids).join('\n'));
     // Environment variables → KEY=value lines
@@ -3486,10 +3649,17 @@ export default function App() {
       const templateExists = lastTemplateId && templatePage.data.some((t) => t.id === lastTemplateId);
       const nextTemplateId = templateExists ? lastTemplateId! : (templatePage.data[0]?.id ?? '');
 
+      templateIdRef.current = nextTemplateId;
       setTemplateId(nextTemplateId);
       void listResourceCatalog(loginCtx, resourceType).then((page) => setResources(page.data)).catch(() => undefined);
       if (nextTemplateId) {
         const sessionPage = await listSessions(loginCtx, nextIdentity.id, nextTemplateId);
+        sessionPageRef.current = {
+          templateId: nextTemplateId,
+          ...(sessionPage.next_page ? { page: sessionPage.next_page } : { afterId: sessionPage.last_id || undefined }),
+          expanded: false,
+        };
+        setSessionsHasMore(sessionPage.has_more);
         setSessions(sessionPage.data);
         // Don't auto-select a session - show empty chat welcome screen
         currentSessionIdRef.current = '';
@@ -3610,7 +3780,50 @@ export default function App() {
     }
   }, [ctx, downloadingFileResourceId]);
 
-  const openEditModal = useCallback((resource: ForwardResource) => {
+  const readResourceDetail = useCallback(async (resource: ForwardResource): Promise<ForwardResource> => {
+    if (!ctx) return resource;
+    const spec = resource.type === 'environment' ? await getCloudEnvironment(ctx, resource.id)
+      : resource.type === 'skill' ? await getCloudSkill(ctx, resource.id)
+      : resource.type === 'vault' ? await getCloudVault(ctx, resource.id)
+      : resource.type === 'file' ? await getCloudFile(ctx, resource.id)
+      : resource.resource_spec;
+    const record = spec as Record<string, unknown> | undefined;
+    return {
+      ...resource,
+      name: String(record?.display_title ?? record?.display_name ?? record?.name ?? resource.name ?? ''),
+      description: typeof record?.description === 'string' ? record.description : '',
+      resource_spec: record,
+    };
+  }, [ctx]);
+
+  const openResourceDetails = useCallback(async (resource: ForwardResource) => {
+    const request = ++detailRequestRef.current;
+    setLoading(true);
+    setError('');
+    try {
+      const fresh = await readResourceDetail(resource);
+      if (request === detailRequestRef.current) setViewingResource(fresh);
+    } catch (err) {
+      if (request === detailRequestRef.current) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (request === detailRequestRef.current) setLoading(false);
+    }
+  }, [readResourceDetail]);
+
+  const openEditModal = useCallback(async (item: ForwardResource) => {
+    const request = ++detailRequestRef.current;
+    setLoading(true);
+    setError('');
+    let resource: ForwardResource;
+    try {
+      resource = await readResourceDetail(item);
+      if (request !== detailRequestRef.current) return;
+    } catch (err) {
+      if (request === detailRequestRef.current) setError(err instanceof Error ? err.message : String(err));
+      return;
+    } finally {
+      if (request === detailRequestRef.current) setLoading(false);
+    }
     setEditingResource(resource);
     setEditName(resource.name || specString(resource, 'display_title', 'display_name', 'name') || '');
     setEditDesc(resource.description || specString(resource, 'description') || '');
@@ -3632,7 +3845,7 @@ export default function App() {
         .then((res) => setVaultCredentials(res.data || []))
         .catch(() => setVaultCredentials([]));
     }
-  }, [ctx]);
+  }, [ctx, readResourceDetail]);
 
   const handleSaveEdit = useCallback(async () => {
     if (!ctx || !editingResource) return;
@@ -3643,17 +3856,14 @@ export default function App() {
       const desc = editDesc.trim();
       switch (editingResource.type) {
         case 'environment':
-          await updateCloudEnvironment(ctx, editingResource.id, {
-            ...(name ? { name } : {}),
+          await updateCloudEnvironment(ctx, editingResource.id, buildEnvironmentUpdate(editingResource, {
+            name,
             description: desc,
-            config: { type: 'cloud', networking: { type: editNetworking } },
-          });
+            networking: editNetworking,
+          }));
           break;
         case 'skill':
-          await updateCloudSkill(ctx, editingResource.id, {
-            ...(name ? { name } : {}),
-            description: desc,
-          });
+          await updateCloudSkill(ctx, editingResource.id, { description: desc });
           break;
         default:
           throw new Error('暂不支持编辑此类型资源');
@@ -3716,7 +3926,7 @@ export default function App() {
       ),
       system: templateSystem,
       environment_id: environmentId,
-      vault_ids: buildTemplateBindings(splitTokens(vaultIdsText)),
+      vaults: buildTemplateBindings(splitTokens(vaultIdsText)),
       skills: splitTokens(skillIdsText).map((skillId) => ({ type: 'custom', skill_id: skillId })),
       files: buildTemplateBindings(fileIds),
       environment_variables: parseEnvironmentVariables(envVarsText),
@@ -3746,6 +3956,12 @@ export default function App() {
     toolsJson,
     vaultIdsText,
   ]);
+
+  useEffect(() => {
+    if (showTemplateModal && editingTemplateId && !initialTemplateInputRef.current) {
+      initialTemplateInputRef.current = buildTemplateInput();
+    }
+  }, [showTemplateModal, editingTemplateId, buildTemplateInput]);
 
   // Whether the tools config includes an agent_toolset_20260401 entry — the
   // hard prerequisite for multiagent. Drives the UI gate in the editor.
@@ -3784,7 +4000,12 @@ export default function App() {
     setLoading(true);
     setError('');
     try {
-      const updated = await updateTemplate(ctx, editingTemplateId, buildTemplateInput());
+      const original = editingTemplateRef.current;
+      const initial = initialTemplateInputRef.current;
+      if (!original || !initial) throw new Error('模板详情尚未就绪，请重新打开编辑');
+      const patch = buildTemplateUpdate(original, initial, buildTemplateInput());
+      if (!multiagentEnabled && original.multiagent?.agents.length) patch.multiagent = null;
+      const updated = Object.keys(patch).length ? await updateTemplate(ctx, editingTemplateId, patch) : original;
       setTemplates((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -3792,7 +4013,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [buildTemplateInput, ctx, editingTemplateId]);
+  }, [buildTemplateInput, ctx, editingTemplateId, multiagentEnabled]);
 
   const handleCloneTemplate = useCallback(async (template: ForwardTemplate) => {
     if (!ctx) return;
@@ -3846,17 +4067,20 @@ export default function App() {
     setError('');
     setSessionLoading(true);
     streamAbort.current?.abort();
-    const selected = sessions.find((session) => session.id === sessionId);
-    if (selected && isVoiceSession(selected)) {
-      setCurrentVoiceConversationId(selected.metadata.conversation_id);
-      setVoiceViewOpen(true);
-      setVoiceLaunchKey((value) => value + 1);
-      setSessionLoading(false);
-      return;
-    }
+    stopAbort.current?.abort();
+    setStopping(false);
     setVoiceViewOpen(false);
     setCurrentVoiceConversationId(null);
     try {
+      const session = await getSession(ctx!, sessionId);
+      if (currentSessionIdRef.current !== sessionId || eventHistoryGenerationRef.current !== generation) return;
+      setSessions((prev) => prev.map((item) => item.id === sessionId ? session : item));
+      if (isVoiceSession(session)) {
+        setCurrentVoiceConversationId(session.metadata.conversation_id);
+        setVoiceViewOpen(true);
+        setVoiceLaunchKey((value) => value + 1);
+        return;
+      }
       const page = await listEvents(ctx!, sessionId);
       if (currentSessionIdRef.current !== sessionId || eventHistoryGenerationRef.current !== generation) return;
       // Events are returned in descending order (newest first), reverse to chronological order.
@@ -3872,8 +4096,7 @@ export default function App() {
         multiagentSessionsRef.current.add(sessionId);
       }
       // Check if session is still active and restart stream if needed
-      const session = sessions.find((s) => s.id === sessionId);
-      if (session && (session.status === 'running' || session.status === 'processing')) {
+      if (isSessionOngoing(session.status)) {
         // Add a local thinking event to show loading indicator
         const thinkingId = `local-thinking-${sessionId}-${Date.now()}`;
         const thinkingEvent: ForwardEvent = {
@@ -3890,12 +4113,15 @@ export default function App() {
         startStreamRef.current(sessionId, lastEventId, undefined, hasMA);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (currentSessionIdRef.current === sessionId && eventHistoryGenerationRef.current === generation) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      // Only clear the spinner if the user hasn't switched to another session meanwhile.
-      if (currentSessionIdRef.current === sessionId) setSessionLoading(false);
+      if (currentSessionIdRef.current === sessionId && eventHistoryGenerationRef.current === generation) {
+        setSessionLoading(false);
+      }
     }
-  }, [ctx, sessions]);
+  }, [ctx]);
 
   // Delete (archive) sessions and drop them from the local list (issue #15).
   // The Forward API's removal primitive is POST /sessions/{id}/archive —
@@ -3912,10 +4138,11 @@ export default function App() {
           if (!id.startsWith('local-')) await archiveSession(ctx, id);
           done.push(id);
         } catch (err) {
-          // 409 session_archived means it is already gone — treat as deleted.
-          const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes('session_archived') || msg.includes('409')) done.push(id);
-          else throw err;
+          if (err instanceof ForwardApiError && err.status === 409) {
+            const session = await getSession(ctx, id);
+            if (session.archived_at) done.push(id);
+            else throw err;
+          } else throw err;
         }
       }
     } catch (err) {
@@ -3966,12 +4193,22 @@ export default function App() {
     const FLUSH_INTERVAL_MS = 100;
     let streamFlushTimer: number | null = null;
     let lastStreamFlush = 0;
+    const liveEvents = new Map<string, ForwardEvent>();
+    let cursor = lastEventId;
+    let receivedCurrentTurn = false;
     const flushStreamingText = () => {
       streamFlushTimer = null;
       lastStreamFlush = Date.now();
       // Don't paint into the view if the user has navigated away from this session
       // (e.g. opened the new-conversation screen while this stream keeps running).
-      if (currentSessionIdRef.current !== sessionId) return;
+      if (currentSessionIdRef.current !== sessionId || controller.signal.aborted) return;
+      if (liveEvents.size) {
+        const drafts = [...liveEvents.values()];
+        setEvents((prev) => {
+          const next = prev.filter((event) => !drafts.some((draft) => draft.id === event.id));
+          return sortEventsForView([...next, ...drafts.filter((draft) => !next.some((event) => event.id === draft.stream_event_id))]);
+        });
+      }
       const text = _streamingTextBySession.get(sessionId);
       const msgId = _streamingMsgIdBySession.get(sessionId);
       if (text == null || !msgId) return;
@@ -4017,36 +4254,65 @@ export default function App() {
       setStreaming(false);
     };
     const syncLatestEvents = async () => {
-      const page = await mergeSessionEvents(sessionId);
-      await refreshSessions();
-      // Only check events from the CURRENT turn to avoid old session.status_idle
-      // from a previous turn prematurely closing the SSE connection
-      const newEvents = turnStartedAt
-        ? (page?.data ?? []).filter((e) => (e.created_at || e.processed_at || '') > turnStartedAt)
-        : (page?.data ?? []);
-      // Update multiagent tracking from polled events (thread_created may arrive
-      // via polling rather than SSE).
-      if (newEvents.some((e) => e.type === 'session.thread_created')) {
-        hasMultiagentThreads = true;
+      const [page, session] = await Promise.all([
+        mergeSessionEvents(sessionId), getSession(ctx, sessionId, { signal: controller.signal }),
+      ]);
+      if (controller.signal.aborted) return page;
+      if (currentSessionIdRef.current === sessionId) {
+        setSessions((prev) => prev.map((item) => item.id === sessionId ? session : item));
       }
-      if (newEvents.some((e) => isTerminalSessionEvent(e, hasMultiagentThreads))) {
-        finishStream();
-      }
+      if (page?.data.some((event) => event.type === 'session.thread_created')) hasMultiagentThreads = true;
+      // A send may be accepted before the new turn becomes visible in GET.
+      const newTurnVisible = !turnStartedAt || receivedCurrentTurn || page?.data.some(
+        (event) => (event.created_at || event.processed_at || '') > turnStartedAt && event.type !== 'user.message',
+      );
+      if (newTurnVisible && (session.status === 'idle' || session.status === 'terminated')) finishStream();
+      return page;
     };
     controller.signal.addEventListener('abort', () => {
       cancelStreamFlush();
       stopPolling();
-      setStreaming(false);
+      if (streamAbort.current === controller) setStreaming(false);
     }, { once: true });
-    const stopPolling = startSessionPolling(syncLatestEvents, controller.signal, (err) => {
-      setError(err instanceof Error ? err.message : String(err));
+    const stopPolling = startSessionPolling(async () => { await syncLatestEvents(); }, controller.signal, (err) => {
+      if (!controller.signal.aborted && currentSessionIdRef.current === sessionId) setError(err instanceof Error ? err.message : String(err));
     });
     streamAbort.current = controller;
     setStreaming(true);
-    void streamEvents(
-      ctx,
-      sessionId,
-      (event) => {
+    const onStreamEvent = (event: ForwardEvent) => {
+        if (event.session_id && event.session_id !== sessionId) return;
+        if (event.type.startsWith('agent.') || event.type === 'event_start' || event.type === 'event_delta' || event.type === 'session.status_running') receivedCurrentTurn = true;
+        if (event.type === 'event_start') {
+          const nested = event.event as ForwardEvent | undefined;
+          if (nested?.id && (nested.type === 'agent.message' || nested.type === 'agent.thinking')) {
+            liveEvents.set(nested.id, { ...nested, id: `${nested.type === 'agent.thinking' ? 'stream-thinking' : 'local-stream'}-${nested.id}`, session_id: sessionId,
+              stream_event_id: nested.id, created_at: nested.created_at || event.created_at || new Date().toISOString(), content: [] });
+          }
+          return;
+        }
+        if (event.type === 'event_delta') {
+          const delta = event.delta as { index?: number; content?: { type?: string; text?: string } } | undefined;
+          const id = typeof event.event_id === 'string' ? event.event_id : event.id;
+          const draft = liveEvents.get(id);
+          if (draft && typeof delta?.content?.text === 'string') {
+            const blocks = Array.isArray(draft.content) ? [...draft.content] : [];
+            const index = delta.index ?? 0;
+            const previous = blocks[index];
+            blocks[index] = { type: delta.content.type, text: (previous?.text ?? '') + delta.content.text };
+            liveEvents.set(id, { ...draft, content: blocks });
+            scheduleStreamFlush();
+          }
+          return;
+        }
+        liveEvents.delete(event.id);
+        if (event.type === 'session.usage' || event.type === 'session.updated' || event.type.startsWith('session.status_')) {
+          setSessions((prev) => prev.map((session) => session.id !== sessionId ? session : {
+            ...session,
+            ...(event.type.startsWith('session.status_') ? { status: event.type.slice('session.status_'.length) } : {}),
+            ...(event.type === 'session.usage' && event.usage && typeof event.usage === 'object' ? { usage: event.usage as ForwardSession['usage'] } : {}),
+            ...(event.type === 'session.updated' && typeof event.title === 'string' ? { title: event.title } : {}),
+          }));
+        }
         // New turn started — reset accumulators for this session
         if (event.type === 'session.status_running') {
           cancelStreamFlush();
@@ -4166,24 +4432,63 @@ export default function App() {
           void mergeSessionEvents(sessionId);
           void refreshSessions();
         }
-      },
-      controller.signal,
-      lastEventId,
-    ).then(() => {
-      if (!controller.signal.aborted) {
-        void syncLatestEvents().catch((err) => {
-          if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err));
+      };
+    const reconnect = async () => {
+      let failures = 0;
+      let needsHistorySync = false;
+      while (!controller.signal.aborted) {
+        let retryAfter = 0;
+        const cursorBefore = cursor;
+        try {
+          if (needsHistorySync) {
+            await syncLatestEvents();
+            needsHistorySync = false;
+            if (controller.signal.aborted) return;
+          }
+          await streamEvents(ctx, sessionId, onStreamEvent, controller.signal, cursor, {
+            eventDeltas: ['agent.message', 'agent.thinking'],
+            includeThinking: true, includeToolCalls: true,
+            onCursor: (id) => { cursor = id || undefined; },
+          });
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          if (err instanceof ForwardApiError) {
+            if (err.code === 'invalid_event_cursor' || err.code === 'event_cursor_not_found') cursor = undefined;
+            else if (err.status < 500 && err.status !== 429) throw err;
+            if (err.retryAfter) {
+              const seconds = Number(err.retryAfter);
+              retryAfter = Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : Math.max(0, Date.parse(err.retryAfter) - Date.now()) || 0;
+            }
+          }
+        }
+        if (controller.signal.aborted) return;
+        try {
+          await syncLatestEvents();
+          needsHistorySync = false;
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          if (err instanceof ForwardApiError && err.status < 500 && err.status !== 429) throw err;
+          needsHistorySync = true;
+        }
+        if (controller.signal.aborted) return;
+        if (cursor !== cursorBefore) failures = 0;
+        if (++failures > 3) throw new Error('实时连接中断，已重试三次；会话状态仍在同步，请重新打开对话恢复连接');
+        await new Promise<void>((resolve) => {
+          const abort = () => { window.clearTimeout(timer); resolve(); };
+          const timer = window.setTimeout(() => { controller.signal.removeEventListener('abort', abort); resolve(); }, Math.max(retryAfter, 1000 * 2 ** (failures - 1)));
+          controller.signal.addEventListener('abort', abort, { once: true });
+          if (controller.signal.aborted) abort();
         });
       }
-    }).catch((err) => {
-      if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err));
-    }).finally(() => {
-      // Once the SSE stream ends (server closed it on a terminal event, or we aborted
-      // locally), always clear the streaming flag for the current turn so the composer
-      // is never left permanently disabled.
-      if (streamAbort.current === controller) {
-        setStreaming(false);
+    };
+    void reconnect().catch((err) => {
+      if (!controller.signal.aborted && currentSessionIdRef.current === sessionId) {
+        setError(err instanceof Error ? err.message : String(err));
+        if (err instanceof ForwardApiError && (err.status === 401 || err.status === 403)) controller.abort();
       }
+    }).finally(() => {
+      cancelStreamFlush();
+      if (streamAbort.current === controller) setStreaming(false);
     });
   }, [ctx, mergeSessionEvents, refreshSessions]);
   startStreamRef.current = startStream;
@@ -4287,7 +4592,7 @@ export default function App() {
     // Block sending only while the on-screen session is processing; starting a
     // brand-new conversation is always allowed even if a background task runs.
     if (stopping) return;
-    if (streaming && currentSessionId) return;
+    if (currentSessionId && (streaming || isSessionOngoing(sessions.find((session) => session.id === currentSessionId)?.status))) return;
     // Wait until every attachment finished uploading (or was removed) —
     // sending with a half-uploaded attachment would confuse the agent.
     if (attachments.some((a) => a.status !== 'done')) return;
@@ -4421,10 +4726,11 @@ export default function App() {
       setError(err instanceof Error ? err.message : String(err));
       setInput(text);
     }
-  }, [attachments, ctx, currentSessionId, identity, input, mergeSessionEvents, migrateSessionId, refreshSessions, startStream, templateId, templates, streaming, stopping]);
+  }, [attachments, ctx, currentSessionId, identity, input, mergeSessionEvents, migrateSessionId, refreshSessions, sessions, startStream, templateId, templates, streaming, stopping]);
 
   const sendQuick = useCallback(async (text: string) => {
     if (!ctx || !identity || !templateId || !text.trim()) return;
+    if (currentSessionId && (streaming || stopping || isSessionOngoing(sessions.find((session) => session.id === currentSessionId)?.status))) return;
     const turnStartedAt = new Date().toISOString();
     let localThinkingId = '';
     setInput('');
@@ -4516,41 +4822,56 @@ export default function App() {
       setError(err instanceof Error ? err.message : String(err));
       setInput(text);
     }
-  }, [ctx, currentSessionId, identity, mergeSessionEvents, migrateSessionId, refreshSessions, startStream, templateId, templates]);
+  }, [ctx, currentSessionId, identity, mergeSessionEvents, migrateSessionId, refreshSessions, sessions, startStream, stopping, streaming, templateId, templates]);
 
   const stop = useCallback(async () => {
-    if (!ctx || !currentSessionId || stopping) return;
+    if (!ctx || !currentSessionId || (stopAbort.current && !stopAbort.current.signal.aborted)) return;
+    const sessionId = currentSessionId;
+    const controller = new AbortController();
+    stopAbort.current = controller;
     streamAbort.current?.abort();
     setStreaming(false);
     setStopping(true);
     setError('');
     try {
-      const result = await cancelSession(ctx, currentSessionId);
-      setSessions((prev) => prev.map((session) => (
-        session.id === currentSessionId ? { ...session, status: result.status || 'canceling' } : session
-      )));
+      await cancelSession(ctx, sessionId);
+      controller.signal.throwIfAborted();
+      if (currentSessionIdRef.current !== sessionId) return;
+      setSessions((prev) => prev.map((session) => session.id === sessionId ? { ...session, status: 'canceling' } : session));
       setEvents((prev) => [
-        ...prev.filter((event) => !(isLocalThinkingEvent(event) && event.session_id === currentSessionId)),
-        {
-          id: `local-${Date.now()}-cancel`,
-          type: 'session.cancel_requested',
-          session_id: currentSessionId,
-          created_at: new Date().toISOString(),
-          status: result.status || 'canceling',
-          reason: '已请求停止当前对话',
-        },
+        ...prev.filter((event) => !(isLocalThinkingEvent(event) && event.session_id === sessionId)),
+        { id: `local-${Date.now()}-cancel`, type: 'session.cancel_requested', session_id: sessionId,
+          created_at: new Date().toISOString(), status: 'canceling', reason: '已请求停止当前对话' },
       ]);
-      await loadSessionEvents(currentSessionId);
-      await refreshSessions();
+      const session = await waitForSessionStop(ctx, sessionId, controller.signal);
+      controller.signal.throwIfAborted();
+      if (currentSessionIdRef.current !== sessionId) return;
+      await mergeSessionEvents(sessionId);
+      controller.signal.throwIfAborted();
+      if (currentSessionIdRef.current === sessionId) setSessions((prev) => prev.map((item) => item.id === sessionId ? session : item));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (!controller.signal.aborted && currentSessionIdRef.current === sessionId) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setStopping(false);
+      if (stopAbort.current === controller) {
+        stopAbort.current = null;
+        setStopping(false);
+      }
     }
-  }, [ctx, currentSessionId, loadSessionEvents, refreshSessions, stopping]);
+  }, [ctx, currentSessionId, mergeSessionEvents]);
 
   const logout = useCallback(() => {
     streamAbort.current?.abort();
+    stopAbort.current?.abort();
+    detailRequestRef.current += 1;
+    sessionListGenerationRef.current += 1;
+    eventHistoryGenerationRef.current += 1;
+    templateIdRef.current = '';
+    currentSessionIdRef.current = '';
+    sessionPageRef.current = null;
+    setSessionsHasMore(false);
+    setStopping(false);
     localStorage.removeItem(AUTH_KEY);
     setShowCredential(false);
     setPat('');
@@ -4600,7 +4921,7 @@ export default function App() {
   const canStopCurrentTurn = Boolean(
     currentSessionId &&
     !isCurrentTurnCanceling &&
-    (streaming || hasPendingLocalThinking || currentSessionStatus === 'running' || currentSessionStatus === 'processing'),
+    (streaming || hasPendingLocalThinking || currentSessionStatus === 'running' || currentSessionStatus === 'rescheduling' || currentSessionStatus === 'processing'),
   );
   const attachmentsBusy = attachments.some((a) => a.status !== 'done');
   const canSendMessage = Boolean(
@@ -5111,18 +5432,7 @@ export default function App() {
                     {sched.status === 'active' ? '暂停' : '恢复'}
                   </button>
                   <button
-                    onClick={() => {
-                      setEditingSchedule(sched);
-                      setSchedName(sched.name);
-                      setSchedDesc(sched.description || '');
-                      setSchedTemplateId(sched.template_id);
-                      setSchedTriggerType(sched.trigger_policy.type as 'cron' | 'once' | 'interval' | 'manual');
-                      setSchedExpression(sched.trigger_policy.expression || '');
-                      setSchedTimezone(sched.trigger_policy.timezone || 'Asia/Shanghai');
-                      const editRawContent = sched.initial_events?.[0]?.content;
-                      setSchedMessage(typeof editRawContent === 'string' ? editRawContent : Array.isArray(editRawContent) ? editRawContent[0]?.text || '' : '');
-                      setShowScheduleModal(true);
-                    }}
+                    onClick={() => void openEditSchedule(sched)}
                     disabled={isArchived}
                     className="rounded-lg border border-[#E5E7EB] bg-white px-3 py-1.5 text-xs font-medium text-black/60 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40"
                   >
@@ -5202,7 +5512,7 @@ export default function App() {
               </div>
               <div className="mt-4 flex items-center justify-end gap-2">
                 <button
-                  onClick={() => { stopQrPolling(); setQrSession(null); setChanAppKey(''); setChanAppSecret(''); setChanTenantId(''); setChanMode(CHANNEL_TYPES.find((item) => item.value === chan.channel_type)?.qrSupport ? 'qr' : 'manual'); setEditingChannelItem({ ...chan }); }}
+                  onClick={() => void openEditChannel(chan)}
                   className="flex h-7 w-7 items-center justify-center rounded-lg text-black/30 transition hover:bg-[#F4F6FC] hover:text-[#3550FF]"
                   title="配置"
                 >
@@ -5291,7 +5601,7 @@ export default function App() {
                     <button
                       key={template.id}
                       onClick={() => {
-                        setViewingTemplate(template);
+                        void openTemplateDetails(template);
                         void loadRegisteredResources('environment');
                         void loadRegisteredResources('skill');
                       }}
@@ -5502,7 +5812,7 @@ export default function App() {
                   return (
                     <div key={`${resource.type}-${resource.id}-main`} className="group/card relative">
                       <button
-                        onClick={() => setViewingResource(resource)}
+                        onClick={() => void openResourceDetails(resource)}
                         className="w-full rounded-2xl border border-[#DDE2F2] bg-white p-5 text-left transition hover:border-[#B8C3FF] hover:shadow-md"
                       >
                         <div className="flex items-start gap-3">
@@ -5656,7 +5966,7 @@ export default function App() {
                     </svg>
                   </button>
                   <button
-                    onClick={() => { currentSessionIdRef.current = ''; setCurrentSessionId(''); setEvents([]); setSessionLoading(false); setVoiceViewOpen(false); setCurrentVoiceConversationId(null); }}
+                    onClick={() => { streamAbort.current?.abort(); stopAbort.current?.abort(); setStopping(false); setError(''); currentSessionIdRef.current = ''; setCurrentSessionId(''); setEvents([]); setSessionLoading(false); setVoiceViewOpen(false); setCurrentVoiceConversationId(null); }}
                     className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-black/45 transition hover:bg-gray-100 hover:text-black"
                     title="新建对话"
                   >
@@ -5858,6 +6168,16 @@ export default function App() {
                       </>
                     );
                   })()}
+                  {sessionsHasMore && (
+                    <button
+                      type="button"
+                      onClick={() => void loadMoreSessions()}
+                      disabled={loadingMoreSessions}
+                      className="mt-2 w-full rounded-xl border border-gray-200 bg-white py-2 text-xs font-medium text-[#3550FF] disabled:opacity-50"
+                    >
+                      {loadingMoreSessions ? '正在加载对话...' : '加载更多对话'}
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -6574,10 +6894,13 @@ export default function App() {
               <span className="mb-1.5 block text-xs font-medium text-black/50">名称</span>
               <input
                 value={editName}
+                readOnly={editingResource?.type === 'skill'}
+                aria-describedby={editingResource?.type === 'skill' ? 'skill-name-help' : undefined}
                 onChange={(e) => setEditName(e.target.value)}
                 className="h-11 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none transition focus:border-[#3550FF] focus:shadow-[0_0_0_3px_rgba(53,80,255,0.08)]"
                 autoFocus
               />
+              {editingResource?.type === 'skill' && <span id="skill-name-help" className="mt-1 block text-xs text-black/40">技能名称不可修改，此处仅编辑描述。</span>}
             </label>
           )}
 

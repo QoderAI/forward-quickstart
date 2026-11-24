@@ -91,10 +91,30 @@ app.get('/api/forward/sessions/:sessionId/events/stream', async (req, res) => {
   // Streaming has no overall deadline; the SDK bounds opening the HTTP request.
   const scope = requestScope(req, res, 0);
   try {
-    const client = createStreamClient(API_BASE_URLS[environment], token, req.query.authMode);
+    const input = req.query;
+    const invalidQuery = (parameter: string) => { res.status(400).json({ error: { message: `Invalid SSE query parameter: ${parameter}` } }); };
+    // Express 5's default simple parser keeps literal brackets and repeated values.
+    const invalidKey = Object.keys(input).find(key => /^(?:event_deltas|include_thinking|include_tool_calls)(?:$|\[)/.test(key)
+      && !['event_deltas[]', 'include_thinking', 'include_tool_calls'].includes(key));
+    if (invalidKey) return invalidQuery(invalidKey);
+    const query = normalizeQuery({ type: input.type, types: input.types });
+    const rawDeltas = input['event_deltas[]'];
+    const deltas = rawDeltas === undefined ? [] : Array.isArray(rawDeltas) ? rawDeltas : [rawDeltas];
+    if (!deltas.every(value => value === 'agent.message' || value === 'agent.thinking')) return invalidQuery('event_deltas[]');
+    if (rawDeltas !== undefined) query['event_deltas[]'] = deltas;
+    for (const key of ['include_thinking', 'include_tool_calls']) {
+      const value = input[key];
+      if (value === undefined) continue; // Leave unspecified defaults to upstream.
+      if (value !== 'true' && value !== 'false') return invalidQuery(key);
+      query[key] = value === 'true';
+    }
+    const client = createStreamClient(API_BASE_URLS[environment], token, input.authMode);
     const upstream = await sdkResponse(client.sessions.events.streamEvents(sessionId,
       { last_event_id: req.header('Last-Event-ID') },
-      { signal: scope.signal, query: normalizeQuery({ type: req.query.type, types: req.query.types }) },
+      { signal: scope.signal, query,
+        // Only this validated delta subscription enables Beta, never client headers.
+        ...(deltas.includes('agent.thinking') ? { headers: { 'X-Qoder-Beta': 'thinking-event-stream-delta-2026-07-20' } } : {}),
+      },
     ));
     if (!upstream.ok || !upstream.body) { await sendResponse(res, upstream); return; }
     const requestId = upstream.headers.get('x-request-id') || upstream.headers.get('request-id') || upstream.headers.get('x-trace-id');

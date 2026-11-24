@@ -1,4 +1,31 @@
-import type { ForwardEvent } from './forwardApi';
+import { getSession, type ForwardContext, type ForwardEvent } from './forwardApi';
+
+export async function waitForSessionStop(ctx: ForwardContext, sessionId: string, signal: AbortSignal) {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new Error('已请求停止，但尚未确认完成，请刷新会话状态后重试')), 30_000);
+  const combined = AbortSignal.any([signal, deadline.signal]);
+  try {
+    while (true) {
+      combined.throwIfAborted();
+      const session = await getSession(ctx, sessionId, { signal: combined });
+      if (session.status === 'idle' || session.status === 'terminated') return session;
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => {
+          clearTimeout(delay);
+          reject(combined.reason);
+        };
+        const delay = setTimeout(() => {
+          combined.removeEventListener('abort', abort);
+          resolve();
+        }, 1000);
+        combined.addEventListener('abort', abort, { once: true });
+        if (combined.aborted) abort();
+      });
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface PendingToolApproval {
   toolUseId: string;

@@ -15,6 +15,17 @@ test('HTTP proxy integrates the SDK across JSON, upload, preview and SSE routes'
   const envKeys = ['VERCEL', 'CN_PROD_FORWARD_API_BASE_URL', 'GLOBAL_PROD_FORWARD_API_BASE_URL', 'CN_PROD_CLOUD_API_BASE_URL', 'GLOBAL_PROD_CLOUD_API_BASE_URL'];
   const previous = new Map(envKeys.map(key => [key, process.env[key]]));
   const requests: Array<{ path: string; auth?: string; method?: string }> = [];
+  const streamRequests: Array<{ query: URLSearchParams; headers: import('node:http').IncomingHttpHeaders; httpVersion: string }> = [];
+  const thinkingBeta = 'thinking-event-stream-delta-2026-07-20';
+  const streamFrames = [
+    'id: e1\nevent: event_start\ndata: {"type":"event_start","event":{"type":"agent.message"}}\n\n',
+    'id: e1\nevent: event_delta\ndata: {"type":"event_delta","delta":{"content":{"type":"text","text":"你好"}}}\n\n',
+    'data: {"type":"session.thread_status_idle"}\n\n',
+    'id: e1\nevent: event_delta\ndata: {"type":"event_delta","delta":{"content":{"type":"thinking","text":"思考"}}}\n\n',
+    'data: {"type":"session.status_idle","stop_reason":{"type":"requires_action"}}\n\n',
+    'id: e1\nevent: agent.message\ndata: {"type":"agent.message","content":"完成"}\n\n',
+    'data: {"type":"session.status_idle"}\n\n',
+  ].join('');
   let releaseStream!: () => void;
   const streamReleased = new Promise<void>(resolve => { releaseStream = resolve; });
   let upstreamBase = '';
@@ -33,10 +44,23 @@ test('HTTP proxy integrates the SDK across JSON, upload, preview and SSE routes'
       res.end(JSON.stringify({ error: { code: 'forbidden', message: 'denied' } })); return;
     }
     if (path.includes('/events/stream')) {
-      assert.equal(req.headers['last-event-id'], 'resume_1');
-      res.writeHead(200, { 'content-type': 'text/event-stream' });
-      res.write('id: e1\ndata: {"type":"agent.message","content":"你好"}\n\n');
-      res.once('close', releaseStream); return;
+      streamRequests.push({ query: new URL(path, upstreamBase).searchParams, headers: { ...req.headers }, httpVersion: req.httpVersion });
+      if (path.includes('/sessions/quota/')) {
+        res.writeHead(429, { 'x-request-id': 'req_sse_quota', 'retry-after': '17' });
+        res.end(JSON.stringify({ error: { code: 'quota', message: 'retry later' } })); return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'x-request-id': 'req_stream' });
+      if (path.includes('/sessions/s1/')) {
+        assert.equal(req.headers['last-event-id'], 'resume_1');
+        res.write('id: e1\ndata: {"type":"agent.message","content":"你好"}\n\n');
+        res.once('close', releaseStream); return;
+      }
+      const bytes = Buffer.from(streamFrames);
+      for (let i = 0; i < bytes.length && !res.destroyed; i += 7) {
+        res.write(bytes.subarray(i, i + 7));
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      res.end(); return;
     }
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -114,6 +138,82 @@ test('HTTP proxy integrates the SDK across JSON, upload, preview and SSE routes'
       assert.equal(await response.text(), 'image bytes');
     }
   });
+  await t.test('SSE query whitelist preserves repeated bracket deltas and booleans on the real wire', async () => {
+    assert.equal(app.get('query parser'), 'simple');
+    const cases: Array<{ query: Array<[string, string]>; beta?: string; thinking?: boolean }> = [
+      { query: [], beta: thinkingBeta },
+      { query: [['event_deltas[]', 'agent.message']] },
+      { query: [['event_deltas[]', 'agent.message'], ['event_deltas[]', 'agent.message']], beta: thinkingBeta },
+      { query: [['event_deltas[]', 'agent.thinking']], thinking: true },
+      { query: [['event_deltas[]', 'agent.message'], ['event_deltas[]', 'agent.thinking']], beta: thinkingBeta, thinking: true },
+      { query: [['event_deltas[]', 'agent.thinking'], ['event_deltas[]', 'agent.message']], beta: 'arbitrary-beta', thinking: true },
+      { query: [['include_thinking', 'true'], ['include_tool_calls', 'false']], beta: 'arbitrary-beta' },
+      { query: [['event_deltas[]', 'agent.message'], ['include_thinking', 'false'], ['include_tool_calls', 'true']] },
+      { query: [['event_deltas[]', 'agent.thinking'], ['include_thinking', 'false'], ['include_tool_calls', 'false']], thinking: true },
+      { query: [['type', 'agent.message'], ['types', 'agent.message'], ['types', 'session.status_idle']] },
+      { query: [['type', 'agent.thinking'], ['types', 'agent.thinking'], ['event_deltas[]', 'agent.message']], beta: thinkingBeta },
+    ];
+    for (const scenario of cases) {
+      const query = new URLSearchParams([
+        ['environment', 'global-prod'], ['authMode', 'pat'], ['unknown', 'not-forwarded'],
+        ['last_event_id', 'not-a-header'], ['X-Qoder-Beta', 'not-forwarded'], ...scenario.query,
+      ]);
+      const response = await fetch(`${base}/api/forward/sessions/wire/events/stream?${query}`, {
+        headers: {
+          Authorization: 'Bearer sse_pat', 'Last-Event-ID': 'wire_cursor', Accept: 'application/json',
+          'X-Untrusted': 'not-forwarded', Cookie: 'secret=test', 'Idempotency-Key': 'not-forwarded',
+          ...(scenario.beta ? { 'X-Qoder-Beta': scenario.beta } : {}),
+        },
+      });
+      assert.equal(response.status, 200, query.toString());
+      assert.equal(response.headers.get('x-request-id'), 'req_stream');
+      assert.equal(response.headers.get('content-type'), 'text/event-stream');
+      assert.equal(await response.text(), streamFrames); // Same IDs, UTF-8 and frame boundaries split across chunks.
+      const wire = streamRequests.at(-1)!;
+      assert.equal(wire.httpVersion, '1.1');
+      assert.deepEqual([...wire.query], scenario.query);
+      assert.equal(wire.headers.authorization, 'Bearer sse_pat');
+      assert.equal(wire.headers.accept, 'text/event-stream');
+      assert.equal(wire.headers['last-event-id'], 'wire_cursor');
+      assert.equal(wire.headers['x-qoder-beta'], scenario.thinking ? thinkingBeta : undefined);
+      for (const header of ['x-untrusted', 'cookie', 'idempotency-key']) assert.equal(wire.headers[header], undefined);
+      assert.match(requests.at(-1)!.path, /^\/global\/forward\/sessions\/wire\/events\/stream/);
+    }
+    const response = await fetch(`${base}/api/forward/sessions/wire/events/stream`, { headers: { Authorization: 'Bearer sse_pat' } });
+    assert.equal(response.status, 200); assert.equal(await response.text(), streamFrames);
+    assert.deepEqual([...streamRequests.at(-1)!.query], []);
+    assert.equal(streamRequests.at(-1)!.headers['last-event-id'], undefined);
+    assert.equal(streamRequests.at(-1)!.headers['x-qoder-beta'], undefined);
+  });
+  await t.test('SSE rejects invalid delta values, boolean values and malformed parameter shapes before upstream', async () => {
+    const invalid = [
+      'event_deltas[]=', 'event_deltas[]', 'event_deltas[]=agent.tool_call',
+      'event_deltas[]=agent.message,agent.thinking', 'event_deltas[]=AGENT.MESSAGE',
+      'event_deltas[]=agent.message&event_deltas[]=invalid', 'event_deltas[]=agent.message&event_deltas[]=',
+      'event_deltas=agent.message', 'event_deltas[0]=agent.thinking', 'event_deltas[type]=agent.thinking',
+      ...['include_thinking', 'include_tool_calls'].flatMap(key => [
+        `${key}=`, key, `${key}=1`, `${key}=0`, `${key}=TRUE`, `${key}=null`, `${key}=yes`,
+        `${key}=true&${key}=false`, `${key}=true&${key}=true`, `${key}[]=true`, `${key}[value]=false`,
+      ]),
+    ];
+    const before = requests.length;
+    for (const query of invalid) {
+      const response = await fetch(`${base}/api/forward/sessions/wire/events/stream?${query}`, { headers: { Authorization: 'Bearer sse_pat' } });
+      assert.equal(response.status, 400, query);
+      assert.match((await response.json()).error.message, /event_deltas|include_thinking|include_tool_calls/, query);
+    }
+    assert.equal(requests.length, before);
+  });
+  await t.test('SSE upstream errors preserve status, body, request ID and Retry-After without retries', async () => {
+    const before = streamRequests.length;
+    const response = await fetch(`${base}/api/forward/sessions/quota/events/stream?event_deltas[]=agent.thinking`, { headers: { Authorization: 'Bearer sse_pat' } });
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get('x-request-id'), 'req_sse_quota');
+    assert.equal(response.headers.get('retry-after'), '17');
+    assert.deepEqual(await response.json(), { error: { code: 'quota', message: 'retry later' } });
+    assert.equal(streamRequests.length, before + 1);
+    assert.equal(streamRequests.at(-1)!.headers['x-qoder-beta'], thinkingBeta);
+  });
   await t.test('an active SSE stream does not block session writes and disconnect releases upstream', async () => {
     const previousDispatcher = getGlobalDispatcher();
     const ordinaryDispatcher = new Agent({ connections: 1 });
@@ -121,10 +221,17 @@ test('HTTP proxy integrates the SDK across JSON, upload, preview and SSE routes'
     setGlobalDispatcher(ordinaryDispatcher);
     const controller = new AbortController();
     try {
-      const response = await fetch(`${base}/api/forward/sessions/s1/events/stream?environment=cn-prod&authMode=service-account`, {
-        headers: { Authorization: 'Bearer forward_sat', 'Last-Event-ID': 'resume_1' },
+      const response = await fetch(`${base}/api/forward/sessions/s1/events/stream?environment=cn-prod&authMode=service-account&event_deltas[]=agent.message&event_deltas[]=agent.thinking&include_thinking=true&include_tool_calls=false`, {
+        headers: { Authorization: 'Bearer forward_sat', 'Last-Event-ID': 'resume_1', 'X-Qoder-Beta': thinkingBeta },
         signal: controller.signal, dispatcher: browserDispatcher,
       } as RequestInit & { dispatcher: Agent });
+      assert.equal(response.status, 200);
+      assert.equal(streamRequests.at(-1)!.httpVersion, '1.1');
+      assert.deepEqual([...streamRequests.at(-1)!.query], [
+        ['event_deltas[]', 'agent.message'], ['event_deltas[]', 'agent.thinking'],
+        ['include_thinking', 'true'], ['include_tool_calls', 'false'],
+      ]);
+      assert.equal(streamRequests.at(-1)!.headers['x-qoder-beta'], thinkingBeta);
       const reader = response.body!.getReader();
       try {
         assert.match(new TextDecoder().decode((await reader.read()).value), /你好/);

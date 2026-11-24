@@ -85,7 +85,7 @@ export interface CreateTemplateInput {
   skills: unknown[];
   multiagent?: MultiagentConfig | null;
   environment_id: string;
-  vault_ids: TemplateResourceBindings;
+  vaults: TemplateResourceBindings;
   files: TemplateResourceBindings;
   environment_variables: Record<string, unknown>;
 }
@@ -131,8 +131,9 @@ export interface ForwardEvent {
   [key: string]: unknown;
 }
 
-interface Page<T> {
+export interface Page<T> {
   data: T[];
+  next_page?: string | null;
   first_id?: string | null;
   last_id?: string | null;
   has_more: boolean;
@@ -171,18 +172,66 @@ export class ForwardApiError extends Error {
   requestId?: string;
   /** 机器可读错误码，如 batch_already_processing / rate_limit_exceeded / file_expired。 */
   code?: string;
+  type?: string;
+  param?: string | null;
+  /** Preserve both seconds and HTTP-date values without converting or retrying. */
+  retryAfter?: string;
+  raw?: string;
 
-  constructor(status: number, message: string, requestId?: string, code?: string) {
+  constructor(
+    status: number,
+    message: string,
+    requestId?: string,
+    code?: string,
+    details: { type?: string; param?: string | null; retryAfter?: string; raw?: string } = {},
+  ) {
     super(message);
     this.name = 'ForwardApiError';
     this.status = status;
     this.requestId = requestId;
     this.code = code;
+    this.type = details.type;
+    this.param = details.param;
+    this.retryAfter = details.retryAfter;
+    this.raw = details.raw;
   }
+}
+
+function parseJson(raw: string): unknown {
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined;
+}
+
+/** Shared HTTP/SSE error decoding. Keep raw payloads for upstream diagnostics. */
+function parseForwardError(status: number, raw: string, headers: Headers, label = 'Forward API') {
+  const data = asRecord(parseJson(raw));
+  const error = asRecord(data?.error);
+  const string = (value: unknown) => typeof value === 'string' ? value : undefined;
+  const requestId = headers.get('x-request-id') || string(data?.request_id) || string(data?.requestId)
+    || string(error?.request_id) || string(error?.requestId);
+  const code = string(error?.code) || string(data?.code);
+  const type = string(error?.type) || (data?.type !== 'error' ? string(data?.type) : undefined);
+  const param = error?.param !== undefined ? error.param : data?.param;
+  const rawSnippet = raw && !data ? `\n[原始响应] ${raw.slice(0, 500)}` : '';
+  const baseMessage = string(error?.message) || string(data?.message) || string(data?.error)
+    || `${label} error ${status}${rawSnippet}`;
+  const message = `${code ? `[${code}] ` : ''}${baseMessage}`;
+  return new ForwardApiError(
+    status,
+    requestId ? `${message} (request id: ${requestId})` : message,
+    requestId,
+    code,
+    { type, param: param === null ? null : string(param), retryAfter: headers.get('retry-after') ?? undefined, raw },
+  );
 }
 
 export interface ForwardRequestOptions {
   idempotencyKey?: string;
+  signal?: AbortSignal;
 }
 
 export async function forwardRequest<T>(
@@ -196,6 +245,7 @@ export async function forwardRequest<T>(
   const res = await fetch('/api/forward/request', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal: options.signal,
     body: JSON.stringify({
       pat: ctx.pat,
       authMode: ctx.authMode,
@@ -211,39 +261,8 @@ export async function forwardRequest<T>(
   });
 
   const text = await res.text();
-  let data: unknown = null;
-  if (text) {
-    try { data = JSON.parse(text); } catch { data = null; }
-  }
-  const dataRecord = data && typeof data === 'object'
-    ? data as {
-      request_id?: string;
-      requestId?: string;
-      message?: string;
-      error?: { request_id?: string; requestId?: string; message?: string; code?: string };
-    }
-    : null;
-  if (!res.ok) {
-    const requestId = res.headers.get('x-request-id') ||
-      dataRecord?.request_id ||
-      dataRecord?.requestId ||
-      dataRecord?.error?.request_id ||
-      dataRecord?.error?.requestId;
-    // Show raw upstream response when JSON parsing fails, so user can report to API provider
-    const rawSnippet = text && !data ? `\n[原始响应] ${text.slice(0, 500)}` : '';
-    const errCode = dataRecord?.error?.code || '';
-    const baseMessage = dataRecord?.error?.message || dataRecord?.message || `Forward API error ${res.status}${rawSnippet}`;
-    // Prefix the machine-readable code so callers can branch on it both via the
-    // structured `err.code` field and legacy `message.includes(...)` string checks.
-    const message = `${errCode ? `[${errCode}] ` : ''}${baseMessage}`;
-    throw new ForwardApiError(
-      res.status,
-      requestId ? `${message} (request id: ${requestId})` : message,
-      requestId || undefined,
-      errCode || undefined,
-    );
-  }
-  return data as T;
+  if (!res.ok) throw parseForwardError(res.status, text, res.headers);
+  return (text ? parseJson(text) : null) as T;
 }
 
 async function cloudRequest<T>(
@@ -268,19 +287,42 @@ async function cloudRequest<T>(
   });
 
   const text = await res.text();
-  let data: unknown = null;
-  if (text) {
-    try { data = JSON.parse(text); } catch { data = null; }
+  if (!res.ok) throw parseForwardError(res.status, text, res.headers, 'Cloud API');
+  return (text ? parseJson(text) : null) as T;
+}
+
+function paginationCursor<T>(page: Page<T>, path: string): { page: string } | { after_id: string } {
+  if (typeof page.next_page === 'string' && page.next_page) return { page: page.next_page };
+  if (typeof page.last_id === 'string' && page.last_id) return { after_id: page.last_id };
+  throw new ForwardApiError(502, `${path} 分页缺少游标`, undefined, 'invalid_pagination_cursor');
+}
+
+/** Fully collect non-hot lists; never advertise exhaustion after a broken page. */
+async function collectPages<T>(ctx: ForwardContext, path: string, query: Record<string, unknown>): Promise<Page<T>> {
+  const data: T[] = [];
+  const seen = new Set<string>();
+  let cursor: Record<string, string> = {};
+  let firstId: string | null | undefined;
+  while (true) {
+    const page = await forwardRequest<Page<T>>(ctx, 'GET', path, undefined, { ...query, ...cursor });
+    if (!page || !Array.isArray(page.data)) {
+      throw new ForwardApiError(502, `${path} 分页响应无效`, undefined, 'invalid_pagination_response');
+    }
+    if (data.length === 0 && firstId === undefined) firstId = page.first_id;
+    data.push(...page.data);
+    if (!page.next_page && page.has_more === false) {
+      return { ...page, data, first_id: firstId, next_page: null, has_more: false };
+    }
+    if (!page.next_page && page.has_more !== true) {
+      throw new ForwardApiError(502, `${path} 分页响应未确认结束`, undefined, 'invalid_pagination_response');
+    }
+    cursor = paginationCursor(page, path);
+    const value = Object.values(cursor)[0];
+    if (seen.has(value)) {
+      throw new ForwardApiError(502, `${path} 分页游标没有推进`, undefined, 'invalid_pagination_cursor');
+    }
+    seen.add(value);
   }
-  if (!res.ok) {
-    const errObj = data && typeof data === 'object' ? data as Record<string, unknown> : null;
-    const error = errObj?.error as Record<string, unknown> | undefined;
-    // Show raw upstream response when JSON parsing fails, so user can report to API provider
-    const rawSnippet = text && !data ? `\n[原始响应] ${text.slice(0, 500)}` : '';
-    const message = (error?.message as string) || (errObj?.message as string) || `Cloud API error ${res.status}${rawSnippet}`;
-    throw new ForwardApiError(res.status, message);
-  }
-  return data as T;
 }
 
 function canUseCloudFileFallback(ctx: ForwardContext) {
@@ -336,7 +378,7 @@ export async function listCloudModels(ctx: ForwardContext) {
 }
 
 export async function listCloudEnvironments(ctx: ForwardContext) {
-  return forwardRequest<{ data: CloudEnvironment[] }>(ctx, 'GET', '/environments', undefined, {
+  return collectPages<CloudEnvironment>(ctx, '/environments', {
     limit: 50,
   });
 }
@@ -380,7 +422,7 @@ export interface CloudSkill {
 }
 
 export async function listCloudSkills(ctx: ForwardContext) {
-  return forwardRequest<{ data: CloudSkill[] }>(ctx, 'GET', '/skills', undefined, { limit: 50 });
+  return collectPages<CloudSkill>(ctx, '/skills', { limit: 50 });
 }
 
 export async function getCloudSkill(ctx: ForwardContext, skillId: string) {
@@ -407,18 +449,8 @@ export async function uploadCloudSkill(
   });
 
   const text = await uploadRes.text();
-  let data: unknown = null;
-  if (text) {
-    try { data = JSON.parse(text); } catch { data = { error: { message: text } }; }
-  }
-  const dataRecord = data && typeof data === 'object'
-    ? data as { error?: { message?: string } }
-    : null;
-  if (!uploadRes.ok) {
-    const message = dataRecord?.error?.message || `Upload failed: ${uploadRes.status}`;
-    throw new ForwardApiError(uploadRes.status, message);
-  }
-  return data as CloudSkill;
+  if (!uploadRes.ok) throw parseForwardError(uploadRes.status, text, uploadRes.headers, 'Upload');
+  return (text ? parseJson(text) : null) as CloudSkill;
 }
 
 export async function updateCloudSkill(
@@ -455,7 +487,7 @@ export interface CloudFile {
 }
 
 export async function listCloudFiles(ctx: ForwardContext) {
-  return forwardRequest<{ data: CloudFile[] }>(ctx, 'GET', '/files', undefined, { limit: 50 });
+  return collectPages<CloudFile>(ctx, '/files', { limit: 50 });
 }
 
 export async function getCloudFile(ctx: ForwardContext, fileId: string) {
@@ -494,12 +526,8 @@ export async function uploadCloudFile(
   });
 
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
-  if (!res.ok) {
-    const message = data?.error?.message || `Upload failed: ${res.status}`;
-    throw new ForwardApiError(res.status, message);
-  }
-  return data as CloudFile;
+  if (!res.ok) throw parseForwardError(res.status, text, res.headers, 'Upload');
+  return (text ? JSON.parse(text) : null) as CloudFile;
 }
 
 // Signed download URL for an arbitrary file id.
@@ -522,7 +550,7 @@ export async function previewCloudFile(ctx: ForwardContext, fileId: string): Pro
     const response = await fetch(`${base}/api/${layer}/files/${encodeURIComponent(fileId)}/preview?${query}`, {
       headers: { Authorization: `Bearer ${ctx.pat}` },
     });
-    if (!response.ok) throw new ForwardApiError(response.status, `Preview failed: ${response.status}`, response.headers.get('x-request-id') || undefined);
+    if (!response.ok) throw parseForwardError(response.status, await response.text(), response.headers, 'Preview');
     return response.blob();
   };
   try { return await preview('forward'); }
@@ -567,7 +595,7 @@ export interface CloudVault {
 }
 
 export async function listCloudVaults(ctx: ForwardContext) {
-  return forwardRequest<{ data: CloudVault[] }>(ctx, 'GET', '/vaults', undefined, { limit: 50 });
+  return collectPages<CloudVault>(ctx, '/vaults', { limit: 50 });
 }
 
 export async function getCloudVault(ctx: ForwardContext, vaultId: string) {
@@ -697,7 +725,7 @@ export async function getTemplate(ctx: ForwardContext, templateId: string) {
 }
 
 export async function listTemplates(ctx: ForwardContext) {
-  return forwardRequest<Page<ForwardTemplate>>(ctx, 'GET', '/templates', undefined, {
+  return collectPages<ForwardTemplate>(ctx, '/templates', {
     status: 'active',
     limit: 50,
   });
@@ -720,7 +748,7 @@ export async function createTemplate(ctx: ForwardContext, input?: Partial<Create
     mcp_servers: input?.mcp_servers ?? [],
     skills: input?.skills ?? [],
     ...(input?.multiagent ? { multiagent: input.multiagent } : {}),
-    vault_ids: input?.vault_ids ?? {},
+    vaults: input?.vaults ?? {},
     files: input?.files ?? {},
     environment_variables: input?.environment_variables ?? {},
     metadata: { created_by: 'forward-quickstart' },
@@ -747,7 +775,7 @@ export async function updateTemplate(ctx: ForwardContext, templateId: string, in
   if (input.tools !== undefined) body.tools = input.tools;
   if (input.mcp_servers !== undefined) body.mcp_servers = input.mcp_servers;
   if (input.skills !== undefined) body.skills = input.skills;
-  if (input.vault_ids !== undefined) body.vault_ids = input.vault_ids;
+  if (input.vaults !== undefined) body.vaults = input.vaults;
   if (input.files !== undefined) body.files = input.files;
   if (input.environment_variables !== undefined) body.environment_variables = input.environment_variables;
   // multiagent uses replace semantics: send the field to replace it, or null to clear.
@@ -790,7 +818,7 @@ export async function deleteForwardResource(ctx: ForwardContext, resourceId: str
 }
 
 export async function listResources(ctx: ForwardContext, type: ForwardResourceType) {
-  return forwardRequest<Page<ForwardResource>>(ctx, 'GET', '/resources', undefined, {
+  return collectPages<ForwardResource>(ctx, '/resources', {
     type,
     limit: 50,
   });
@@ -858,17 +886,36 @@ export async function getEffectiveSpec(ctx: ForwardContext, identityId: string, 
   return forwardRequest<EffectiveSpecResp>(ctx, 'GET', `/identities/${encodeURIComponent(identityId)}/templates/${encodeURIComponent(templateId)}/effective`);
 }
 
-export async function listSessions(ctx: ForwardContext, identityId: string, templateId?: string) {
+export async function listSessions(
+  ctx: ForwardContext,
+  identityId: string,
+  templateId?: string,
+  options: { afterId?: string; page?: string; signal?: AbortSignal } = {},
+) {
+  if (options.page && options.afterId) {
+    throw new ForwardApiError(400, 'page 和 after_id 不能同时使用', undefined, undefined, { type: 'invalid_request_error' });
+  }
   const page = await forwardRequest<Page<ForwardSession>>(ctx, 'GET', '/sessions', undefined, {
     identity_id: identityId,
     template_id: templateId,
     include_archived: false,
     order: 'desc',
     limit: 50,
-  });
-  // Client-side filter: API may not strictly filter by identity_id in PAT mode
-  page.data = page.data.filter((s) => s.identity_id === identityId);
-  return page;
+    ...(options.page ? { page: options.page } : {}),
+    ...(options.afterId ? { after_id: options.afterId } : {}),
+  }, { signal: options.signal });
+  // Preserve the upstream cursor BEFORE identity filtering, even on an empty
+  // filtered page. This hot path intentionally fetches only one page per call.
+  const lastId = page.last_id ?? page.data.at(-1)?.id;
+  const result = { ...page, last_id: lastId, data: page.data.filter((s) => s.identity_id === identityId) };
+  if (result.has_more) {
+    const cursor = paginationCursor(result, '/sessions');
+    const value = Object.values(cursor)[0];
+    if (value === (options.page || options.afterId)) {
+      throw new ForwardApiError(502, '/sessions 分页游标没有推进', undefined, 'invalid_pagination_cursor');
+    }
+  }
+  return result;
 }
 
 // Paged/date-filtered session query, used by the usage panel's credit ledger.
@@ -1021,8 +1068,8 @@ export async function listSessionResources(ctx: ForwardContext, sessionId: strin
   );
 }
 
-export async function getSession(ctx: ForwardContext, sessionId: string) {
-  return forwardRequest<ForwardSession>(ctx, 'GET', `/sessions/${encodeURIComponent(sessionId)}`);
+export async function getSession(ctx: ForwardContext, sessionId: string, options: { signal?: AbortSignal } = {}) {
+  return forwardRequest<ForwardSession>(ctx, 'GET', `/sessions/${encodeURIComponent(sessionId)}`, undefined, undefined, options);
 }
 
 export async function archiveSession(ctx: ForwardContext, sessionId: string) {
@@ -1195,17 +1242,28 @@ export function startSessionPolling(
   return stop;
 }
 
+export interface StreamEventsOptions {
+  eventDeltas?: Array<'agent.message' | 'agent.thinking'>;
+  includeThinking?: boolean;
+  includeToolCalls?: boolean;
+  onCursor?: (id: string) => void;
+}
+
 export async function streamEvents(
   ctx: ForwardContext,
   sessionId: string,
   onEvent: (event: ForwardEvent) => void,
   signal?: AbortSignal,
   lastEventId?: string,
+  options: StreamEventsOptions = {},
 ) {
   const params = new URLSearchParams({
     authMode: ctx.authMode || 'pat',
     environment: ctx.environment,
   });
+  for (const type of options.eventDeltas ?? []) params.append('event_deltas[]', type);
+  if (options.includeThinking !== undefined) params.set('include_thinking', String(options.includeThinking));
+  if (options.includeToolCalls !== undefined) params.set('include_tool_calls', String(options.includeToolCalls));
   // Connect directly to Express server (port 3001) for SSE to bypass Vite proxy buffering
   const sseBase = window.location.port === '5173' ? 'http://localhost:3001' : '';
   const url = `${sseBase}/api/forward/sessions/${encodeURIComponent(sessionId)}/events/stream?${params.toString()}`;
@@ -1214,41 +1272,88 @@ export async function streamEvents(
     Authorization: `Bearer ${ctx.pat}`,
   };
   if (lastEventId) headers['Last-Event-ID'] = lastEventId;
-  const res = await fetch(url, { headers, signal });
-  if (!res.ok || !res.body) {
-    throw new ForwardApiError(res.status, await res.text());
+  if (options.eventDeltas?.includes('agent.thinking')) {
+    headers['X-Qoder-Beta'] = 'thinking-event-stream-delta-2026-07-20';
   }
+  const res = await fetch(url, { headers, signal });
+  if (!res.ok) throw parseForwardError(res.status, await res.text(), res.headers);
+  if (!res.body) throw parseForwardError(502, '', res.headers, 'Forward SSE');
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
+  let line = '';
+  let skipLF = false;
+  let dataLines: string[] = [];
+  let eventType = '';
+  let cursor = lastEventId;
+  let acknowledgedCursor = lastEventId;
+  let ended = false;
+  let cancellation: Promise<void> | undefined;
+  // Cleanup failures must not replace an upstream, read, or callback exception.
+  const cancelReader = () => cancellation ??= reader.cancel(signal?.reason).catch(() => {});
+  const onAbort = () => { void cancelReader(); };
 
-  function processLines(lines: string[]) {
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(':')) continue;
-      if (!trimmed.startsWith('data:')) continue;
-      const raw = trimmed.slice(5).trim();
-      if (!raw || raw === '[DONE]') continue;
-      try {
-        onEvent(JSON.parse(raw) as ForwardEvent);
-      } catch {
-        // skip malformed JSON
+  async function processLine(value: string) {
+    if (value === '') {
+      const raw = dataLines.join('\n');
+      dataLines = [];
+      const type = eventType;
+      eventType = '';
+      if (!raw) return;
+      if (raw.trim() === '[DONE]') { ended = true; return; }
+      const event = parseJson(raw);
+      if (type === 'error' || asRecord(event)?.type === 'error') {
+        // An error delivered over HTTP 200 is still a failed stream, not an Event.
+        throw parseForwardError(502, raw, res.headers, 'Forward SSE');
       }
+      if (!asRecord(event)) { cursor = acknowledgedCursor; return; }
+      signal?.throwIfAborted();
+      // Forward event_start/delta envelopes unchanged. Shared JSON/SSE IDs are
+      // not a dedup key: several distinct deltas can belong to the same Event.
+      await onEvent(event as ForwardEvent);
+      signal?.throwIfAborted();
+      if (cursor !== undefined) await options.onCursor?.(cursor);
+      acknowledgedCursor = cursor;
+      return;
+    }
+    if (value.startsWith(':')) return;
+    const colon = value.indexOf(':');
+    const field = colon < 0 ? value : value.slice(0, colon);
+    let content = colon < 0 ? '' : value.slice(colon + 1);
+    if (content.startsWith(' ')) content = content.slice(1);
+    if (field === 'data') dataLines.push(content);
+    else if (field === 'event') eventType = content;
+    else if (field === 'id' && !content.includes('\0')) cursor = content;
+  }
+
+  async function consume(text: string) {
+    for (const char of text) {
+      if (ended) break;
+      if (skipLF) {
+        skipLF = false;
+        if (char === '\n') continue;
+      }
+      if (char === '\r' || char === '\n') {
+        await processLine(line);
+        line = '';
+        skipLF = char === '\r';
+      } else line += char;
     }
   }
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-    processLines(lines);
-  }
-  // Process any remaining data in buffer after stream ends
-  if (buffer.trim()) {
-    processLines([buffer]);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    signal?.throwIfAborted();
+    while (!ended) {
+      const { done, value } = await reader.read();
+      signal?.throwIfAborted();
+      await consume(decoder.decode(value, { stream: !done }));
+      if (done) break;
+    }
+    // SSE dispatch requires a blank line. Discard incomplete frames at EOF.
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    try { await cancelReader(); } finally { reader.releaseLock(); }
   }
 }
 
@@ -1319,7 +1424,7 @@ export interface CreateScheduleInput {
 }
 
 export async function listSchedules(ctx: ForwardContext, identityId: string) {
-  return forwardRequest<Page<ForwardSchedule>>(ctx, 'GET', '/schedules', undefined, {
+  return collectPages<ForwardSchedule>(ctx, '/schedules', {
     identity_id: identityId,
     include_archived: false,
     limit: 50,
@@ -1448,7 +1553,7 @@ export interface ForwardQrSession {
 }
 
 export async function listChannels(ctx: ForwardContext, identityId?: string) {
-  return forwardRequest<Page<ForwardChannel>>(ctx, 'GET', '/channels', undefined, {
+  return collectPages<ForwardChannel>(ctx, '/channels', {
     ...(identityId ? { identity_id: identityId } : {}),
     limit: 50,
   });

@@ -5,6 +5,25 @@ import App from './App';
 import {
   buildChannelCredentials,
   channelTypesForEnvironment,
+  createTemplate,
+  updateTemplate,
+  forwardRequest,
+  getSession,
+  streamEvents,
+  listTemplates,
+  listResources,
+  listCloudEnvironments,
+  listCloudSkills,
+  listCloudVaults,
+  listCloudFiles,
+  listSchedules,
+  listChannels,
+  listSessions,
+  listSessionsPage,
+  listBatches,
+  listBatchTasks,
+  uploadCloudFile,
+  type ForwardEvent,
   deleteCloudEnvironment,
   deleteCloudSkill,
   deleteCloudVault,
@@ -157,7 +176,7 @@ describe('listEvents', () => {
       });
     }));
 
-    const ctx: ForwardContext = { pat: 'pat_test', environment: 'cn-pre' };
+    const ctx: ForwardContext = { pat: 'pat_test', environment: 'cn-prod' };
     await listEvents(ctx, 'sess_123');
 
     expect(requestBody.query).toEqual({
@@ -204,7 +223,7 @@ describe('listEvents', () => {
       });
     }));
 
-    const ctx: ForwardContext = { pat: 'pat_test', environment: 'cn-pre' };
+    const ctx: ForwardContext = { pat: 'pat_test', environment: 'cn-prod' };
     const page = await listEvents(ctx, 'sess_123', { afterId: 'evt_cursor' });
 
     expect(requestBody.query).toMatchObject({
@@ -571,6 +590,7 @@ describe('waitForChannelBinding', () => {
       identity_id: 'idn_1',
       template_id: 'tmpl_1',
       channel_type: 'wechat',
+      identity_resolution: { mode: 'fixed' },
       name: 'test',
       enabled: false,
       binding_status: bindingStatus,
@@ -642,5 +662,626 @@ describe('file previews', () => {
     const fetch = vi.fn(async () => new Response(null, { status })); vi.stubGlobal('fetch', fetch);
     await expect(previewCloudFile({ pat: 'token', environment: 'global-prod', authMode }, 'f1')).rejects.toMatchObject({ status });
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+const apiContext: ForwardContext = { pat: 'private_token', environment: 'global-prod', authMode: 'service-account' };
+
+function jsonResponse(value: unknown, status = 200, headers: HeadersInit = {}) {
+  return new Response(JSON.stringify(value), { status, headers });
+}
+
+describe('HTTP error contract and cancellation', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  test.each(['12', 'Wed, 25 Nov 2026 10:00:00 GMT'])('preserves raw Retry-After %s and structured error fields', async retryAfter => {
+    const payload = { type: 'error', request_id: 'body-id', error: {
+      type: 'invalid_request_error', code: 'invalid_event_cursor', param: 'Last-Event-ID', message: 'bad cursor',
+    } };
+    const raw = JSON.stringify(payload);
+    const fetch = vi.fn(async () => new Response(raw, {
+      status: 429, headers: { 'x-request-id': 'header-id', 'Retry-After': retryAfter },
+    }));
+    vi.stubGlobal('fetch', fetch);
+    await expect(forwardRequest(apiContext, 'POST', '/templates', {}, undefined, { idempotencyKey: 'fixed-key' }))
+      .rejects.toMatchObject({
+        name: 'ForwardApiError', status: 429, requestId: 'header-id', code: 'invalid_event_cursor',
+        type: 'invalid_request_error', param: 'Last-Event-ID', retryAfter, raw,
+        message: '[invalid_event_cursor] bad cursor (request id: header-id)',
+      });
+    expect(fetch).toHaveBeenCalledTimes(1); // Writes are never replayed.
+    const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('/api/forward/request');
+    expect(url).not.toContain(apiContext.pat);
+    expect(JSON.parse(String(init.body))).toMatchObject({ idempotencyKey: 'fixed-key' });
+  });
+
+  test.each([
+    { request_id: 'request-id' },
+    { requestId: 'request-id' },
+    { error: { request_id: 'request-id' } },
+    { error: { requestId: 'request-id' } },
+  ])('keeps request IDs from the JSON envelope: %j', async payload => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(payload, 400)));
+    await expect(forwardRequest(apiContext, 'GET', '/sessions')).rejects.toMatchObject({ requestId: 'request-id' });
+  });
+
+  test('keeps a flat error code/type/param and the legacy error constructor', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
+      type: 'conflict_error', code: 'conflict', param: null, message: 'already running',
+    }, 409)));
+    await expect(forwardRequest(apiContext, 'GET', '/sessions')).rejects.toMatchObject({
+      type: 'conflict_error', code: 'conflict', param: null, message: '[conflict] already running',
+    });
+    expect(new ForwardApiError(400, 'legacy', 'req', 'code')).toMatchObject({ status: 400, requestId: 'req', code: 'code' });
+  });
+
+  test('keeps non-JSON upstream responses without masking them with JSON parse errors', async () => {
+    const raw = '<html>upstream unavailable</html>';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(raw, { status: 503 })));
+    await expect(forwardRequest(apiContext, 'GET', '/templates')).rejects.toMatchObject({
+      status: 503, raw, message: `Forward API error 503\n[原始响应] ${raw}`,
+    });
+  });
+
+  test.each([
+    ['skill upload', () => uploadCloudSkill(apiContext, { file: new File(['x'], 'skill.zip') })],
+    ['file upload', () => uploadCloudFile(apiContext, { file: new File(['x'], 'file.txt') })],
+    ['file preview', () => previewCloudFile(apiContext, 'file_1')],
+  ] as const)('uses the same error envelope for %s', async (_name, request) => {
+    const payload = { request_id: 'req', error: { type: 'permission_error', code: 'denied', param: 'file', message: 'no access' } };
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(payload, 403, { 'Retry-After': '4' })));
+    await expect(request()).rejects.toMatchObject({
+      status: 403, type: 'permission_error', code: 'denied', param: 'file', requestId: 'req', retryAfter: '4', raw: JSON.stringify(payload),
+    });
+  });
+
+  test('also preserves the error contract from the existing Cloud file fallback', async () => {
+    const payload = { request_id: 'cloud-req', error: { type: 'api_error', code: 'unavailable', message: 'offline' } };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ error: { message: 'missing' } }, 404))
+      .mockResolvedValueOnce(jsonResponse(payload, 503, { 'Retry-After': '2' }));
+    vi.stubGlobal('fetch', fetch);
+    await expect(getCloudFile({ ...apiContext, authMode: 'pat' }, 'file')).rejects.toMatchObject({
+      status: 503, requestId: 'cloud-req', type: 'api_error', code: 'unavailable', retryAfter: '2', raw: JSON.stringify(payload),
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  test('passes signal to fetch, never to the wire body, for getSession and forwardRequest', async () => {
+    const controller = new AbortController();
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(init?.signal).toBe(controller.signal);
+      const body = JSON.parse(String(init?.body));
+      expect(body).not.toHaveProperty('signal');
+      expect(body).not.toHaveProperty('idempotencyKey');
+      return jsonResponse({ id: 'a b', status: 'running' });
+    });
+    vi.stubGlobal('fetch', fetch);
+    await getSession(apiContext, 'a b', { signal: controller.signal });
+    await forwardRequest(apiContext, 'GET', '/sessions', undefined, undefined, { signal: controller.signal });
+    expect(JSON.parse(String(fetch.mock.calls[0][1]?.body)).path).toBe('/sessions/a%20b');
+  });
+
+  test('cancels a pending getSession without misreporting success or retrying', async () => {
+    const controller = new AbortController();
+    const fetch = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    }));
+    vi.stubGlobal('fetch', fetch);
+    const request = getSession(apiContext, 'sess', { signal: controller.signal });
+    const failure = expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    controller.abort();
+    await failure;
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+function stubSse(chunks: Uint8Array[], close = true, headers: HeadersInit = {}) {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      if (close) controller.close();
+    },
+  });
+  const response = new Response(body, { headers });
+  const reader = body.getReader();
+  vi.spyOn(body, 'getReader').mockReturnValue(reader);
+  const cancel = vi.spyOn(reader, 'cancel');
+  const release = vi.spyOn(reader, 'releaseLock');
+  const fetch = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>().mockResolvedValue(response);
+  vi.stubGlobal('fetch', fetch);
+  return { body, fetch, cancel, release };
+}
+
+function sseBytes(text: string) { return new TextEncoder().encode(text); }
+
+describe('SSE frames and lifecycle', () => {
+  beforeEach(() => vi.stubGlobal('window', { location: { port: '5173' } }));
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  test('decodes multiline CRLF frames and UTF-8 split at every byte without deduplicating delta IDs', async () => {
+    const start = { id: 'json-id', type: 'event_start', session_id: 'sess', event: { id: 'json-id', type: 'agent.message' } };
+    const delta = { id: 'json-id', type: 'event_delta', session_id: 'sess', delta: { content: { text: '你好' } } };
+    const wire = `: heartbeat\r\nretry: 1000\r\nid: sse-id\r\nevent: event_start\r\ndata: ${JSON.stringify(start)}\r\n\r\n`
+      + `id: sse-id\r\nevent: event_delta\r\ndata: {"id":"json-id","type":"event_delta",\r\ndata: "session_id":"sess","delta":{"content":{"text":"你好"}}}\r\n\r\n`
+      + `id: sse-id\nevent: event_delta\ndata: ${JSON.stringify(delta)}\n\n`;
+    const stream = stubSse(Array.from(sseBytes(wire), byte => Uint8Array.of(byte)));
+    const events: ForwardEvent[] = [];
+    const order: string[] = [];
+    await streamEvents(apiContext, 'sess', event => { events.push(event); order.push(event.type); }, undefined, undefined, {
+      onCursor: id => { order.push(id); },
+    });
+    expect(events).toEqual([start, delta, delta]);
+    expect(order).toEqual(['event_start', 'sse-id', 'event_delta', 'sse-id', 'event_delta', 'sse-id']);
+    expect(stream.cancel).toHaveBeenCalledTimes(1);
+    expect(stream.release).toHaveBeenCalledTimes(1);
+    expect(stream.body.locked).toBe(false);
+  });
+
+  test('parses lone-CR frames correctly at every possible chunk boundary', async () => {
+    const wire = sseBytes('id: cursor\revent: agent.message\rdata: {"id":"json-id","content":"你好"}\r\r');
+    for (let boundary = 1; boundary < wire.length; boundary += 1) {
+      const stream = stubSse([wire.slice(0, boundary), wire.slice(boundary)]);
+      const onEvent = vi.fn();
+      const onCursor = vi.fn();
+      await streamEvents(apiContext, 'sess', onEvent, undefined, undefined, { onCursor });
+      expect(onEvent).toHaveBeenCalledExactlyOnceWith({ id: 'json-id', content: '你好' });
+      expect(onCursor).toHaveBeenCalledExactlyOnceWith('cursor');
+      expect(stream.body.locked).toBe(false);
+    }
+  });
+
+  test('waits for a blank line before dispatching a frame', async () => {
+    let source!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({ start(controller) { source = controller; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body)));
+    const onEvent = vi.fn();
+    const pending = streamEvents(apiContext, 'sess', onEvent);
+    source.enqueue(sseBytes('data: {"id":"evt","type":"agent.message"}\n'));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onEvent).not.toHaveBeenCalled();
+    source.enqueue(sseBytes('\n'));
+    source.close();
+    await pending;
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect(body.locked).toBe(false);
+  });
+
+  test('keeps SSE IDs independent of JSON IDs, inherits valid IDs, and honors empty ID resets', async () => {
+    const wire = 'id: cursor\ndata: {"id":"one","type":"agent.message"}\n\n'
+      + 'id: ignored\0id\ndata: {"id":"two","type":"agent.message"}\n\n'
+      + 'id:\ndata: {"id":"three","type":"agent.message"}\n\n';
+    stubSse([sseBytes(wire)]);
+    const onCursor = vi.fn();
+    const onEvent = vi.fn();
+    await streamEvents(apiContext, 'sess', onEvent, undefined, undefined, { onCursor });
+    expect(onEvent).toHaveBeenCalledTimes(3);
+    expect(onCursor.mock.calls.map(([id]) => id)).toEqual(['cursor', 'cursor', '']);
+  });
+
+  test('does not invent a cursor from JSON id or dispatch an incomplete EOF frame', async () => {
+    stubSse([sseBytes('data: {"id":"json","type":"agent.message"}\n\ndata: {"id":"partial"}\n')]);
+    const onEvent = vi.fn();
+    const onCursor = vi.fn();
+    await streamEvents(apiContext, 'sess', onEvent, undefined, undefined, { onCursor });
+    expect(onEvent).toHaveBeenCalledExactlyOnceWith({ id: 'json', type: 'agent.message' });
+    expect(onCursor).not.toHaveBeenCalled();
+  });
+
+  test('ignores comments and malformed JSON without acknowledging a failed frame', async () => {
+    stubSse([sseBytes(': heartbeat\n\nid: bad\ndata: {broken}\n\nid: good\ndata: {"id":"evt","type":"unknown.event"}\n\n')]);
+    const onCursor = vi.fn();
+    const onEvent = vi.fn();
+    await streamEvents(apiContext, 'sess', onEvent, undefined, undefined, { onCursor });
+    expect(onEvent).toHaveBeenCalledExactlyOnceWith({ id: 'evt', type: 'unknown.event' });
+    expect(onCursor).toHaveBeenCalledExactlyOnceWith('good');
+  });
+
+  test('a malformed frame cannot contaminate an id-less following frame cursor', async () => {
+    stubSse([sseBytes('id: good\ndata: {"id":"one"}\n\nid: bad\ndata: {broken}\n\ndata: {"id":"two"}\n\n')]);
+    const onCursor = vi.fn();
+    await streamEvents(apiContext, 'sess', vi.fn(), undefined, undefined, { onCursor });
+    expect(onCursor.mock.calls.map(([id]) => id)).toEqual(['good', 'good']);
+  });
+
+  test('only sends opt-in delta/filter parameters and the official thinking beta header', async () => {
+    const stream = stubSse([]);
+    await streamEvents(apiContext, 'sess /?', vi.fn(), undefined, 'resume-id', {
+      eventDeltas: ['agent.message', 'agent.thinking'], includeThinking: false, includeToolCalls: true,
+    });
+    const [url, init] = stream.fetch.mock.calls[0];
+    const parsed = new URL(url);
+    expect(parsed.pathname).toBe('/api/forward/sessions/sess%20%2F%3F/events/stream');
+    expect(parsed.searchParams.getAll('event_deltas[]')).toEqual(['agent.message', 'agent.thinking']);
+    expect(parsed.searchParams.get('include_thinking')).toBe('false');
+    expect(parsed.searchParams.get('include_tool_calls')).toBe('true');
+    expect(parsed.searchParams.get('authMode')).toBe('service-account');
+    expect(url).not.toContain(apiContext.pat);
+    expect(init?.headers).toMatchObject({
+      Authorization: `Bearer ${apiContext.pat}`, 'Last-Event-ID': 'resume-id',
+      'X-Qoder-Beta': 'thinking-event-stream-delta-2026-07-20',
+    });
+  });
+
+  test.each([undefined, {}, { eventDeltas: ['agent.message'] as Array<'agent.message'> }])('preserves default requests without a thinking opt-in: %j', async options => {
+    vi.stubGlobal('window', { location: { port: '443' } });
+    const stream = stubSse([]);
+    await streamEvents(apiContext, 'sess', vi.fn(), undefined, undefined, options);
+    const [url, init] = stream.fetch.mock.calls[0];
+    const params = new URL(url, 'https://example.test').searchParams;
+    expect(url.startsWith('/api/forward/')).toBe(true);
+    expect(params.has('include_thinking')).toBe(false);
+    expect(params.has('include_tool_calls')).toBe(false);
+    expect(params.getAll('event_deltas[]')).toEqual(options?.eventDeltas ?? []);
+    expect(init?.headers).not.toHaveProperty('X-Qoder-Beta');
+    expect(init?.headers).not.toHaveProperty('Last-Event-ID');
+  });
+
+  test('advances onCursor only after an asynchronous event callback succeeds', async () => {
+    stubSse([sseBytes('id: cursor\ndata: {"id":"evt","type":"event_delta"}\n\n')]);
+    let finish!: () => void;
+    const onEvent = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+    const onCursor = vi.fn();
+    const pending = streamEvents(apiContext, 'sess', onEvent, undefined, undefined, { onCursor });
+    await vi.waitFor(() => expect(onEvent).toHaveBeenCalledTimes(1));
+    expect(onCursor).not.toHaveBeenCalled();
+    finish();
+    await pending;
+    expect(onCursor).toHaveBeenCalledExactlyOnceWith('cursor');
+  });
+
+  test.each(['sync', 'async', 'cursor'] as const)('propagates %s callback failures and cancels/releases the reader', async mode => {
+    const stream = stubSse([sseBytes('id: cursor\ndata: {"id":"evt","type":"event_delta"}\n\n')], false);
+    const failure = new Error('callback failed');
+    const onCursor = vi.fn(() => { if (mode === 'cursor') throw failure; });
+    const onEvent = vi.fn(() => {
+      if (mode === 'sync') throw failure;
+      if (mode === 'async') return Promise.reject(failure);
+    });
+    await expect(streamEvents(apiContext, 'sess', onEvent, undefined, undefined, { onCursor })).rejects.toBe(failure);
+    expect(onCursor).toHaveBeenCalledTimes(mode === 'cursor' ? 1 : 0);
+    expect(stream.cancel).toHaveBeenCalledTimes(1);
+    expect(stream.release).toHaveBeenCalledTimes(1);
+    expect(stream.body.locked).toBe(false);
+  });
+
+  test.each(['event: error\n', ''])('rejects SSE error envelopes instead of forwarding or acknowledging them: %j', async prefix => {
+    const payload = { type: 'error', request_id: 'stream-req', error: {
+      type: 'api_error', code: 'stream_failed', param: 'events', message: 'stream failure',
+    } };
+    const raw = JSON.stringify(payload);
+    const stream = stubSse([sseBytes(`id: failed\n${prefix}data: ${raw}\n\n`)], false, { 'Retry-After': '5' });
+    const onEvent = vi.fn();
+    const onCursor = vi.fn();
+    await expect(streamEvents(apiContext, 'sess', onEvent, undefined, undefined, { onCursor })).rejects.toMatchObject({
+      status: 502, type: 'api_error', code: 'stream_failed', param: 'events', requestId: 'stream-req', retryAfter: '5', raw,
+    });
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(onCursor).not.toHaveBeenCalled();
+    expect(stream.cancel).toHaveBeenCalledTimes(1);
+    expect(stream.body.locked).toBe(false);
+  });
+
+  test('does not swallow a non-JSON error frame', async () => {
+    const stream = stubSse([sseBytes('event: error\ndata: upstream disconnected\n\n')], false);
+    const onEvent = vi.fn();
+    await expect(streamEvents(apiContext, 'sess', onEvent)).rejects.toMatchObject({ status: 502, raw: 'upstream disconnected' });
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(stream.body.locked).toBe(false);
+  });
+
+  test('retains HTTP handshake errors and does not reconnect automatically', async () => {
+    const payload = { request_id: 'req', error: { type: 'not_found_error', code: 'event_cursor_not_found', message: 'cursor missing', param: 'Last-Event-ID' } };
+    const fetch = vi.fn(async () => jsonResponse(payload, 404, { 'Retry-After': 'Wed, 25 Nov 2026 10:00:00 GMT' }));
+    vi.stubGlobal('fetch', fetch);
+    await expect(streamEvents(apiContext, 'sess', vi.fn())).rejects.toMatchObject({
+      status: 404, requestId: 'req', type: 'not_found_error', code: 'event_cursor_not_found', param: 'Last-Event-ID',
+      raw: JSON.stringify(payload), retryAfter: 'Wed, 25 Nov 2026 10:00:00 GMT',
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('reports a missing response body as failure rather than HTTP 200 success', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { headers: { 'x-request-id': 'req' } })));
+    await expect(streamEvents(apiContext, 'sess', vi.fn())).rejects.toMatchObject({ status: 502, requestId: 'req' });
+  });
+
+  test('cancels a blocked reader on abort and releases its lock', async () => {
+    const stream = stubSse([], false);
+    const controller = new AbortController();
+    const onEvent = vi.fn();
+    const onCursor = vi.fn();
+    const pending = streamEvents(apiContext, 'sess', onEvent, controller.signal, undefined, { onCursor });
+    const failure = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await Promise.resolve();
+    controller.abort();
+    await failure;
+    expect(stream.fetch.mock.calls[0][1]?.signal).toBe(controller.signal);
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(onCursor).not.toHaveBeenCalled();
+    expect(stream.cancel).toHaveBeenCalledTimes(1);
+    expect(stream.release).toHaveBeenCalledTimes(1);
+    expect(stream.body.locked).toBe(false);
+  });
+
+  test('rejects an already-aborted stream and still releases an acquired reader', async () => {
+    const stream = stubSse([], false);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(streamEvents(apiContext, 'sess', vi.fn(), controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(stream.cancel).toHaveBeenCalledTimes(1);
+    expect(stream.body.locked).toBe(false);
+  });
+
+  test('does not acknowledge an event if its callback aborts the stream', async () => {
+    const stream = stubSse([sseBytes('id: cursor\ndata: {"id":"evt"}\n\n')], false);
+    const controller = new AbortController();
+    const onCursor = vi.fn();
+    await expect(streamEvents(apiContext, 'sess', () => controller.abort(), controller.signal, undefined, { onCursor }))
+      .rejects.toMatchObject({ name: 'AbortError' });
+    expect(onCursor).not.toHaveBeenCalled();
+    expect(stream.cancel).toHaveBeenCalledTimes(1);
+    expect(stream.body.locked).toBe(false);
+  });
+
+  test('does not mask a callback exception with a cleanup failure', async () => {
+    const stream = stubSse([sseBytes('data: {"id":"evt"}\n\n')], false);
+    stream.cancel.mockRejectedValue(new Error('cleanup failed'));
+    const failure = new Error('callback failed');
+    await expect(streamEvents(apiContext, 'sess', () => { throw failure; })).rejects.toBe(failure);
+    expect(stream.release).toHaveBeenCalledTimes(1);
+    expect(stream.body.locked).toBe(false);
+  });
+
+  test('releases the reader even when its read rejects', async () => {
+    const stream = stubSse([], false);
+    const reader = stream.body.getReader();
+    const failure = new Error('connection lost');
+    vi.spyOn(reader, 'read').mockRejectedValue(failure);
+    await expect(streamEvents(apiContext, 'sess', vi.fn())).rejects.toBe(failure);
+    expect(stream.cancel).toHaveBeenCalledTimes(1);
+    expect(stream.release).toHaveBeenCalledTimes(1);
+  });
+
+  test('closes on DONE without processing later frames and removes abort listeners', async () => {
+    const stream = stubSse([sseBytes('data: [DONE]\n\nid: later\ndata: {"id":"evt"}\n\n')], false);
+    const controller = new AbortController();
+    const remove = vi.spyOn(controller.signal, 'removeEventListener');
+    const onEvent = vi.fn();
+    await streamEvents(apiContext, 'sess', onEvent, controller.signal);
+    controller.abort();
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(stream.cancel).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+    expect(stream.body.locked).toBe(false);
+  });
+});
+
+function stubPages(pages: unknown[]) {
+  const requests: Array<{ path: string; query: Record<string, unknown> }> = [];
+  const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)));
+    const page = pages[requests.length - 1];
+    if (page === undefined) throw new Error('Unexpected extra page request');
+    return page instanceof Response ? page : jsonResponse(page);
+  });
+  vi.stubGlobal('fetch', fetch);
+  return { fetch, requests };
+}
+
+describe('complete non-hot pagination', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const lists = [
+    ['templates', () => listTemplates(apiContext), '/templates', { status: 'active' }],
+    ['resources', () => listResources(apiContext, 'skill'), '/resources', { type: 'skill' }],
+    ['environments', () => listCloudEnvironments(apiContext), '/environments', {}],
+    ['skills', () => listCloudSkills(apiContext), '/skills', {}],
+    ['vaults', () => listCloudVaults(apiContext), '/vaults', {}],
+    ['files', () => listCloudFiles(apiContext), '/files', {}],
+    ['schedules', () => listSchedules(apiContext, 'identity'), '/schedules', { identity_id: 'identity', include_archived: false }],
+    ['channels', () => listChannels(apiContext, 'identity'), '/channels', { identity_id: 'identity' }],
+  ] as const;
+
+  test.each(lists)('collects all %s beyond 50, including an empty page, using next_page then last_id', async (_name, list, path, filters) => {
+    const first = Array.from({ length: 50 }, (_, index) => ({ id: `item_${index}` }));
+    const final = [{ id: 'item_50' }, { id: 'item_51' }];
+    const { requests, fetch } = stubPages([
+      { data: first, first_id: 'item_0', last_id: 'item_49', next_page: 'opaque +/page', has_more: true },
+      { data: [], last_id: 'empty-page-cursor', next_page: null, has_more: true },
+      { data: final, first_id: 'item_50', last_id: 'item_51', next_page: null, has_more: false },
+    ]);
+    const result = await list();
+    expect(result.data).toEqual([...first, ...final]);
+    expect(result).toMatchObject({ first_id: 'item_0', last_id: 'item_51', next_page: null, has_more: false });
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(requests).toEqual([
+      expect.objectContaining({ path, query: { ...filters, limit: 50 } }),
+      expect.objectContaining({ path, query: { ...filters, limit: 50, page: 'opaque +/page' } }),
+      expect.objectContaining({ path, query: { ...filters, limit: 50, after_id: 'empty-page-cursor' } }),
+    ]);
+  });
+
+  test.each(['skill', 'file', 'environment', 'vault'] as const)('fully traverses the %s catalog before filtering invalid resources', async type => {
+    const { fetch } = stubPages([
+      { data: [{ name: 'no id' }, null], last_id: 'raw-cursor', has_more: true },
+      { data: [{ id: 'valid', display_title: 'Resource', filename: 'file.txt' }], has_more: false },
+    ]);
+    const result = await listResourceCatalog(apiContext, type);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(result.has_more).toBe(false);
+    expect(result.data).toHaveLength(1);
+    expect(result.data[0]).toMatchObject({ id: 'valid', type });
+  });
+
+  test('fully traverses the memory-store catalog via registry resources', async () => {
+    const { requests } = stubPages([
+      { data: [{ id: 'one' }], next_page: 'next', has_more: true },
+      { data: [{ id: 'two' }], has_more: false },
+    ]);
+    expect((await listResourceCatalog(apiContext, 'memory_store')).data).toEqual([{ id: 'one' }, { id: 'two' }]);
+    expect(requests[1]).toMatchObject({ path: '/resources', query: { type: 'memory_store', page: 'next' } });
+  });
+
+  test('does not claim exhaustion when next_page still exists', async () => {
+    const { fetch } = stubPages([
+      { data: [{ id: 'one' }], next_page: 'next', has_more: false },
+      { data: [{ id: 'two' }], next_page: null, has_more: false },
+    ]);
+    expect((await listTemplates(apiContext)).data.map(item => item.id)).toEqual(['one', 'two']);
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  test.each([
+    [{ data: [], has_more: true }],
+    [{ data: [{ id: 'not-a-cursor' }], has_more: true }],
+    [{ data: [], next_page: '', last_id: '', has_more: true }],
+    [{ data: [], next_page: 'repeat', has_more: true }, { data: [], next_page: 'repeat', has_more: true }],
+    [{ data: [], last_id: 'repeat', has_more: true }, { data: [], last_id: 'repeat', has_more: true }],
+    [{ data: [], next_page: 'repeat', has_more: true }, { data: [], last_id: 'repeat', has_more: true }],
+    [{ data: [], next_page: 'a', has_more: true }, { data: [], next_page: 'b', has_more: true }, { data: [], next_page: 'a', has_more: true }],
+  ])('rejects missing/repeated/cyclic cursors rather than silently truncating: %j', async (...pages) => {
+    const { fetch } = stubPages(pages);
+    await expect(listTemplates(apiContext)).rejects.toMatchObject({ status: 502, code: 'invalid_pagination_cursor' });
+    expect(fetch).toHaveBeenCalledTimes(pages.length);
+  });
+
+  test.each([{ data: [] }, { has_more: false }, null])('does not invent exhaustion for an invalid page envelope: %j', async page => {
+    const { fetch } = stubPages([page]);
+    await expect(listCloudFiles(apiContext)).rejects.toMatchObject({ status: 502, code: 'invalid_pagination_response' });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('propagates a later-page HTTP error instead of returning a partial list or retrying', async () => {
+    const { fetch } = stubPages([
+      { data: [{ id: 'one' }], last_id: 'one', has_more: true },
+      jsonResponse({ error: { type: 'api_error', code: 'offline', message: 'offline' } }, 503),
+    ]);
+    await expect(listChannels(apiContext)).rejects.toMatchObject({ status: 503, code: 'offline' });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('session hot-path page contract', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  test('stays on one page and preserves the original cursor before identity filtering', async () => {
+    const { fetch, requests } = stubPages([
+      { data: [{ id: 'raw', identity_id: 'other' }], first_id: 'raw', last_id: 'raw', next_page: 'opaque', has_more: true },
+    ]);
+    const page = await listSessions(apiContext, 'identity', 'template');
+    expect(page).toEqual({ data: [], first_id: 'raw', last_id: 'raw', next_page: 'opaque', has_more: true });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(requests[0].query).toEqual({ identity_id: 'identity', template_id: 'template', order: 'desc', include_archived: false, limit: 50 });
+  });
+
+  test('captures raw last id even when the API omits last_id and filtering empties the page', async () => {
+    stubPages([{ data: [{ id: 'raw', identity_id: 'other' }], has_more: true }]);
+    expect(await listSessions(apiContext, 'identity')).toMatchObject({ data: [], last_id: 'raw', has_more: true });
+  });
+
+  test('lets the caller explicitly load more across empty filtered pages, without automatic traversal', async () => {
+    const { fetch, requests } = stubPages([
+      { data: [{ id: 'wrong', identity_id: 'other' }], next_page: 'page-2', has_more: true },
+      { data: [], last_id: 'after-empty', has_more: true },
+      { data: [{ id: 'mine', identity_id: 'identity' }], has_more: false },
+    ]);
+    const first = await listSessions(apiContext, 'identity');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const second = await listSessions(apiContext, 'identity', undefined, { page: first.next_page! });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const third = await listSessions(apiContext, 'identity', undefined, { afterId: second.last_id! });
+    expect(third.data).toEqual([{ id: 'mine', identity_id: 'identity' }]);
+    expect(requests[1].query).toMatchObject({ page: 'page-2' });
+    expect(requests[1].query).not.toHaveProperty('after_id');
+    expect(requests[2].query).toMatchObject({ after_id: 'after-empty' });
+    expect(requests[2].query).not.toHaveProperty('page');
+  });
+
+  test('rejects mutually exclusive cursors before issuing a request', async () => {
+    const { fetch } = stubPages([]);
+    await expect(listSessions(apiContext, 'identity', undefined, { page: 'page', afterId: 'id' })).rejects.toMatchObject({ status: 400 });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    [{ data: [], has_more: true }, {}],
+    [{ data: [], last_id: 'repeat', has_more: true }, { afterId: 'repeat' }],
+    [{ data: [], next_page: 'repeat', has_more: true }, { page: 'repeat' }],
+  ] as const)('rejects missing or non-advancing session cursors: %j', async (page, options) => {
+    const { fetch } = stubPages([page]);
+    await expect(listSessions(apiContext, 'identity', undefined, options)).rejects.toMatchObject({ status: 502, code: 'invalid_pagination_cursor' });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('supports aborting a session-list poll via its fourth options argument', async () => {
+    const controller = new AbortController();
+    const { fetch } = stubPages([{ data: [], has_more: false }]);
+    await listSessions(apiContext, 'identity', undefined, { signal: controller.signal });
+    expect(fetch.mock.calls[0][1]?.signal).toBe(controller.signal);
+    expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).not.toHaveProperty('signal');
+  });
+
+  test.each([
+    [() => listSessionsPage(apiContext, { afterId: 'cursor', limit: 12 }), '/sessions', { after_id: 'cursor', limit: 12 }],
+    [() => listBatches(apiContext, { afterId: 'cursor', limit: 12 }), '/batches', { after_id: 'cursor', limit: 12 }],
+    [() => listBatchTasks(apiContext, 'batch', { afterId: 'cursor', limit: 12 }), '/batches/batch/tasks', { after_id: 'cursor', limit: 12 }],
+  ] as const)('does not widen existing Usage/Batch caller-managed pagination: %s', async (list, path, query) => {
+    const { fetch, requests } = stubPages([{ data: [], last_id: 'next', has_more: true }]);
+    expect((await list()).has_more).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(requests[0]).toMatchObject({ path, query });
+  });
+});
+
+describe('canonical template vaults', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  test('creates with canonical vaults only', async () => {
+    const { requests } = stubPages([{ id: 'template' }]);
+    const vaults = { vault_one: { enabled: true }, vault_two: { enabled: false } };
+    await createTemplate(apiContext, { environment_id: ' env ', name: 'Agent', vaults });
+    const request = requests[0] as unknown as { path: string; body: Record<string, unknown> };
+    expect(request.path).toBe('/templates');
+    expect(request.body).toMatchObject({ vaults, environment_id: 'env' });
+    expect(request.body).not.toHaveProperty('vault_ids');
+  });
+
+  test('updates or clears vaults with merge-patch semantics and does not invent omitted fields', async () => {
+    const { requests } = stubPages([{ id: 'template' }, { id: 'template' }, { id: 'template' }]);
+    await updateTemplate(apiContext, 'a b', { vaults: { vault_one: { enabled: true } } });
+    await updateTemplate(apiContext, 'a b', { vaults: {} });
+    await updateTemplate(apiContext, 'a b', { name: 'Renamed' });
+    expect(requests).toMatchObject([
+      { path: '/templates/a%20b', body: { vaults: { vault_one: { enabled: true } } } },
+      { path: '/templates/a%20b', body: { vaults: {} } },
+      { path: '/templates/a%20b', body: { name: 'Renamed' } },
+    ]);
+    const bodies = requests.map(request => (request as unknown as { body: Record<string, unknown> }).body);
+    expect(bodies[2]).not.toHaveProperty('vaults');
+    for (const body of bodies) expect(body).not.toHaveProperty('vault_ids');
+  });
+
+  test('does not add an unverified fallback for legacy vault_ids inputs', async () => {
+    const { requests } = stubPages([{ id: 'template' }, { id: 'template' }]);
+    // Simulate a stale JavaScript caller; typed callers must migrate to vaults.
+    const legacyInput = { environment_id: 'env', vault_ids: { legacy: { enabled: true } } };
+    await createTemplate(apiContext, legacyInput);
+    await updateTemplate(apiContext, 'template', legacyInput);
+    const bodies = requests.map(request => (request as unknown as { body: Record<string, unknown> }).body);
+    expect(bodies[0].vaults).toEqual({});
+    expect(bodies[1]).not.toHaveProperty('vaults');
+    for (const body of bodies) expect(body).not.toHaveProperty('vault_ids');
   });
 });
