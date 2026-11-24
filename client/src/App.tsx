@@ -2309,6 +2309,7 @@ export default function App() {
   const [apiEnvironment, setApiEnvironment] = useState<ForwardApiEnvironment>(savedAuth.apiEnvironment);
   const [pat, setPat] = useState(savedAuth.pat);
   const [serviceAccountKey, setServiceAccountKey] = useState('');
+  const [showCredential, setShowCredential] = useState(false);
   const [serviceAccountToken, setServiceAccountToken] = useState<ForwardServiceAccountToken | null>(null);
   const [hasReusableServiceAccountToken, setHasReusableServiceAccountToken] = useState(
     savedAuth.authMode === 'service-account' && !!savedAuth.pat,
@@ -3437,6 +3438,7 @@ export default function App() {
       return;
     }
     setLoading(true);
+    setShowCredential(false);
     setError('');
     try {
       let authToken = savedToken;
@@ -4556,6 +4558,7 @@ export default function App() {
   const logout = useCallback(() => {
     streamAbort.current?.abort();
     localStorage.removeItem(AUTH_KEY);
+    setShowCredential(false);
     setPat('');
     setServiceAccountKey('');
     setServiceAccountToken(null);
@@ -4671,6 +4674,7 @@ export default function App() {
                     value={apiEnvironment}
                     onChange={(nextEnvironment) => {
                       setApiEnvironment(nextEnvironment);
+                      setShowCredential(false);
                       setError('');
                     }}
                   />
@@ -4680,6 +4684,7 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setAuthMode('pat');
+                      setShowCredential(false);
                       setPat('');
                       setServiceAccountKey('');
                       setServiceAccountToken(null);
@@ -4701,6 +4706,7 @@ export default function App() {
                         setHasReusableServiceAccountToken(false);
                       }
                       setAuthMode('service-account');
+                      setShowCredential(false);
                       setError('');
                     }}
                     className={`h-9 rounded-lg text-sm font-medium transition ${
@@ -4714,20 +4720,34 @@ export default function App() {
                   <span className="mb-1.5 block text-xs font-medium text-black/50">
                     {authMode === 'pat' ? '访问令牌 (PAT)' : 'SA Key'}
                   </span>
-                  <input
-                    value={authMode === 'pat' ? pat : serviceAccountKey}
-                    onChange={(event) => {
-                      if (authMode === 'pat') {
-                        setPat(event.target.value);
-                        setHasReusableServiceAccountToken(false);
-                      }
-                      else setServiceAccountKey(event.target.value);
-                      setError('');
-                    }}
-                    placeholder={authMode === 'pat' ? '粘贴你的 Personal Access Token' : '粘贴你的 Service Account Key'}
-                    className="h-11 w-full rounded-xl border border-[#E5E7EB] bg-white px-3.5 text-sm outline-none transition placeholder:text-black/25 focus:border-[#3550FF] focus:shadow-[0_0_0_3px_rgba(53,80,255,0.08)]"
-                    autoFocus
-                  />
+                  <div className="relative">
+                    <input
+                      type={showCredential ? 'text' : 'password'}
+                      value={authMode === 'pat' ? pat : serviceAccountKey}
+                      onChange={(event) => {
+                        if (authMode === 'pat') {
+                          setPat(event.target.value);
+                          setHasReusableServiceAccountToken(false);
+                        }
+                        else setServiceAccountKey(event.target.value);
+                        setError('');
+                      }}
+                      placeholder={authMode === 'pat' ? '粘贴你的 Personal Access Token' : '粘贴你的 Service Account Key'}
+                      className="h-11 w-full rounded-xl border border-[#E5E7EB] bg-white pl-3.5 pr-16 text-sm outline-none transition placeholder:text-black/25 focus:border-[#3550FF] focus:shadow-[0_0_0_3px_rgba(53,80,255,0.08)]"
+                      autoComplete="off"
+                      spellCheck={false}
+                      autoFocus
+                    />
+                    <button
+                      type="button"
+                      aria-label={`${showCredential ? '隐藏' : '显示'}${authMode === 'pat' ? '访问令牌' : 'SA Key'}`}
+                      aria-pressed={showCredential}
+                      onClick={() => setShowCredential((visible) => !visible)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md px-2 py-1 text-xs text-black/50 hover:text-[#3550FF]"
+                    >
+                      {showCredential ? '隐藏' : '显示'}
+                    </button>
+                  </div>
                   {authMode === 'service-account' && hasReusableServiceAccountToken && pat.trim() && !serviceAccountKey.trim() && (
                     <span className="mt-1.5 block text-[11px] text-black/35">
                       已保存上次签发的 Service Account Token；留空将直接复用，填写 SA Key 会重新签发。

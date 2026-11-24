@@ -1,4 +1,8 @@
 import { ForwardClient, ManagedClient, type ClientOptions } from 'qca-sdk';
+import { Agent } from 'undici';
+
+// Long-lived SSE must not occupy the HTTP/2 connection used for session writes.
+const streamDispatcher = new Agent({ allowH2: false, bodyTimeout: 0 });
 
 export type ApiLayer = 'forward' | 'cloud';
 export type ApiEnvironment = 'cn-prod' | 'global-prod';
@@ -17,6 +21,15 @@ export function clientOptions(baseURL: string, token: string, authMode: unknown)
     baseURL, maxRetries: 0, timeout: 30_000,
     ...(authMode === 'service-account' ? { authMode: 'sa', accessToken: token } : { authMode: 'pat', pat: token }),
   };
+}
+
+export function createStreamClient(baseURL: string, token: string, authMode: unknown) {
+  return new ForwardClient({
+    ...clientOptions(baseURL, token, authMode),
+    fetch: (input, init) => globalThis.fetch(input, {
+      ...init, dispatcher: streamDispatcher,
+    } as RequestInit & { dispatcher: Agent }),
+  });
 }
 
 export function createTokenIssuer(baseURL: string) {

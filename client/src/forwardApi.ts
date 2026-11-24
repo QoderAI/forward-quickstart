@@ -692,35 +692,6 @@ export async function deleteIdentity(ctx: ForwardContext, identityId: string) {
   return forwardRequest<{ id: string; type: string; deleted: boolean }>(ctx, 'DELETE', `/identities/${encodeURIComponent(identityId)}`);
 }
 
-export interface ForwardAccessToken {
-  id: string;
-  type: 'access_token';
-  identity_id: string;
-  token_type: string;
-  expires_at?: string;
-  metadata?: Record<string, unknown>;
-  created_at?: string;
-}
-
-export async function listAccessTokens(ctx: ForwardContext, identityId: string) {
-  return forwardRequest<Page<ForwardAccessToken>>(ctx, 'GET', `/identities/${encodeURIComponent(identityId)}/access_tokens`, undefined, { limit: 50 });
-}
-
-export async function createAccessToken(ctx: ForwardContext, identityId: string) {
-  return forwardRequest<{
-    access_token: string;
-    token_type: string;
-    expires_at: string;
-    identity_id: string;
-  }>(ctx, 'POST', `/identities/${encodeURIComponent(identityId)}/access_tokens`, {
-    metadata: { created_by: 'forward-quickstart' },
-  });
-}
-
-export async function deleteAccessToken(ctx: ForwardContext, identityId: string, tokenId: string) {
-  return forwardRequest<{ id: string; type: string; deleted: boolean }>(ctx, 'DELETE', `/identities/${encodeURIComponent(identityId)}/access_tokens/${encodeURIComponent(tokenId)}`);
-}
-
 export async function getTemplate(ctx: ForwardContext, templateId: string) {
   return forwardRequest<ForwardTemplate>(ctx, 'GET', `/templates/${encodeURIComponent(templateId)}`);
 }

@@ -116,6 +116,13 @@ test('resource catalog and signed URL extensions stay explicit; Managed fallback
     assert.equal(f.requests.at(-1)!.headers.get('Authorization'), 'Bearer pat_test');
   }
   const count = f.requests.length;
+  for (const [method, path] of [
+    ['GET', '/identities/i1/access_tokens'],
+    ['POST', '/identities/i1/access_tokens'],
+    ['DELETE', '/identities/i1/access_tokens/token1'],
+  ]) {
+    await assert.rejects(() => f.call(method, path, {}), /Unsupported/);
+  }
   await assert.rejects(() => f.call('POST', '/unmapped', {}), /Unsupported/);
   await assert.rejects(() => f.call('GET', '/%2e%2e/files'), /invalid API path/);
   assert.equal(f.requests.length, count);

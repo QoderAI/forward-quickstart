@@ -4,7 +4,7 @@ Forward Quickstart 是一个用于体验 Qoder Cloud Agents Forward API 的示�
 
 你可以先通过本项目理解 Forward API 的主流程，再将相关能力集成到自己的应用中。
 
-服务端通过固定版本的 [QCA TypeScript SDK](https://github.com/QoderAI/qoder-cloud-agents-sdk-ts)（`qca-sdk@0.5.0`）调用 QCA。浏览器继续访问同源 API/SSE 和语音中继；SDK 及凭据解析位于 Node 服务端。
+服务端通过固定版本的 [QCA TypeScript SDK](https://github.com/QoderAI/qoder-cloud-agents-sdk-ts)（`qca-sdk@0.5.0`）调用 QCA。浏览器继续访问同源 API/SSE 和语音中继；SDK 及凭据解析位于 Node 服务端。SSE 上游使用独立的 HTTP/1.1 连接池，与普通请求隔离，避免多标签页或多用户同时对话时长连接阻塞消息发送；本地和 Vercel 共用实现。
 
 ## Demo 体验地址
 
@@ -90,7 +90,7 @@ npm -v
 
 ## 配置
 
-登录页面支持 PAT 和 Service Account 两种方式。Service Account 模式使用 Key 换取 Token，后续请求携带该 Token；两种方式都需要选择 API 环境并填写应用侧用户标识。如果需要覆盖默认 API 地址，也可以复制 `.env.example` 为 `.env`：
+登录页面支持 PAT 和 Service Account 两种方式。PAT 和 SA Key 默认以密码形式隐藏，可点击「显示 / 隐藏」切换；切换登录方式或环境、提交登录及退出时恢复隐藏。Service Account 模式使用 Key 换取 Token，后续请求携带该 Token；两种方式都需要选择 API 环境并填写应用侧用户标识。如果需要覆盖默认 API 地址，也可以复制 `.env.example` 为 `.env`：
 
 ```bash
 cp .env.example .env
@@ -229,7 +229,7 @@ npm run build --workspace=client
 | --- | --- | --- |
 | POST | `/identities` | 创建 Identity |
 | GET | `/identities` | 查询或查找 Identity |
-| POST | `/identities/{id}/access_tokens` | 创建 Identity 访问令牌 |
+| POST | `/identities/{id}/service_account_tokens` | 使用 Service Account Key 签发 Identity Token |
 | POST | `/service_account_tokens` | 使用 Service Account Key 换取登录 Token |
 | GET | `/templates` | 查询 Template 列表 |
 | POST | `/templates` | 创建 Template |

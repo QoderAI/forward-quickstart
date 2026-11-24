@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import App from './App';
 import {
   buildChannelCredentials,
   channelTypesForEnvironment,
@@ -23,6 +26,27 @@ import {
   type ForwardChannel,
   type ForwardContext,
 } from './forwardApi';
+
+describe('login credential privacy', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  for (const authMode of ['pat', 'service-account']) {
+    test(`${authMode} credentials are hidden by default, including saved logins`, () => {
+      vi.stubGlobal('localStorage', {
+        getItem: (key: string) => key === 'forward_quickstart_auth'
+          ? JSON.stringify({ authMode, pat: 'test_token', externalId: 'test_user', apiEnvironment: 'global-prod' })
+          : null,
+      });
+      const html = renderToStaticMarkup(createElement(App));
+      const placeholder = authMode === 'pat' ? '粘贴你的 Personal Access Token' : '粘贴你的 Service Account Key';
+      const credentialInput = html.match(/<input[^>]+>/g)?.find(input => input.includes(placeholder));
+      expect(credentialInput).toContain('type="password"');
+      expect(credentialInput).toContain('autoComplete="off"');
+      expect(html).toContain(`aria-label="显示${authMode === 'pat' ? '访问令牌' : 'SA Key'}"`);
+      expect(html).toContain('aria-pressed="false"');
+    });
+  }
+});
 
 describe('listEvents', () => {
   afterEach(() => {

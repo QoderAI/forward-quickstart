@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { Agent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -77,7 +78,7 @@ test('HTTP proxy integrates the SDK across JSON, upload, preview and SSE routes'
     for (const [key, value] of previous) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
     await rm(temp, { recursive: true, force: true });
   });
-  const json = (layer: string, body: object) => fetch(`${base}/api/${layer}/request`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pat: 'forward_sat', authMode: 'service-account', environment: 'cn-prod', ...body }) });
+  const json = (layer: string, body: object, signal?: AbortSignal) => fetch(`${base}/api/${layer}/request`, { method: 'POST', signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pat: 'forward_sat', authMode: 'service-account', environment: 'cn-prod', ...body }) });
 
   await t.test('SA issuer, SAT writes, Global PAT and Managed fallback preserve contracts', async () => {
     const login = await json('forward', { path: '/service_account_tokens', method: 'POST', pat: 'login_key', body: { metadata: { source: 'test' } } });
@@ -113,11 +114,36 @@ test('HTTP proxy integrates the SDK across JSON, upload, preview and SSE routes'
       assert.equal(await response.text(), 'image bytes');
     }
   });
-  await t.test('disconnecting the browser cancels the active SDK SSE body', async () => {
+  await t.test('an active SSE stream does not block session writes and disconnect releases upstream', async () => {
+    const previousDispatcher = getGlobalDispatcher();
+    const ordinaryDispatcher = new Agent({ connections: 1 });
+    const browserDispatcher = new Agent();
+    setGlobalDispatcher(ordinaryDispatcher);
     const controller = new AbortController();
-    const response = await fetch(`${base}/api/forward/sessions/s1/events/stream?environment=cn-prod&authMode=service-account`, { headers: { Authorization: 'Bearer forward_sat', 'Last-Event-ID': 'resume_1' }, signal: controller.signal });
-    const reader = response.body!.getReader();
-    assert.match(new TextDecoder().decode((await reader.read()).value), /你好/);
-    controller.abort(); await reader.cancel().catch(() => undefined); await streamReleased;
+    try {
+      const response = await fetch(`${base}/api/forward/sessions/s1/events/stream?environment=cn-prod&authMode=service-account`, {
+        headers: { Authorization: 'Bearer forward_sat', 'Last-Event-ID': 'resume_1' },
+        signal: controller.signal, dispatcher: browserDispatcher,
+      } as RequestInit & { dispatcher: Agent });
+      const reader = response.body!.getReader();
+      try {
+        assert.match(new TextDecoder().decode((await reader.read()).value), /你好/);
+        for (const sessionId of ['s1', 's2']) {
+          const write = await json('forward', { path: `/sessions/${sessionId}/events`, method: 'POST', body: { type: 'user.message', content: 'hello' } }, AbortSignal.timeout(1500));
+          assert.equal(write.status, 201);
+          assert.deepEqual((await write.json()).body, { type: 'user.message', content: 'hello' });
+          assert.equal(requests.at(-1)!.auth, 'Bearer forward_sat');
+        }
+        const globalWrite = await json('forward', { path: '/sessions/s3/events', method: 'POST', environment: 'global-prod', pat: 'global_pat', authMode: 'pat', body: { type: 'user.message', content: 'global' } }, AbortSignal.timeout(1500));
+        assert.equal(globalWrite.status, 201); await globalWrite.json();
+        assert.deepEqual(requests.at(-1), { path: '/global/forward/sessions/s3/events', auth: 'Bearer global_pat', method: 'POST' });
+      } finally {
+        controller.abort(); await reader.cancel().catch(() => undefined); await streamReleased;
+      }
+    } finally {
+      controller.abort();
+      setGlobalDispatcher(previousDispatcher);
+      await Promise.all([ordinaryDispatcher.destroy(), browserDispatcher.destroy()]);
+    }
   });
 });

@@ -49,7 +49,7 @@ JSON、上传、预览、SSE 及 `proxy.auth` 都会传递 `authMode`；旧页�
 - `GET /resources`：保留注册资源列表语义。
 - Forward/Cloud `GET /files/{id}/content`：仅返回签名 URL；`files.download()` 用于需要文件字节的预览，SDK 不会向存储请求附带 API token。
 
-为保持旧导出函数可调用，显式保留 8 个兼容操作：Identity access_tokens 的查询/创建/删除，Resource 注册/删除，Vault 更新/归档，Schedule DELETE。页面没有使用这些功能；保留传输不表示目标服务已经实现它们。未知接口返回明确的 404，不做任意路径转发。
+显式保留 5 个兼容操作：Resource 注册/删除，Vault 更新/归档，Schedule DELETE。页面没有使用这些功能；保留传输不表示目标服务已经实现它们。Identity access_tokens 已移除；Identity SAT 签发仍使用 SDK 的 service_account_tokens 方法。未知接口返回明确的 404，不做任意路径转发。
 
 ## 语音、文件和用量
 
@@ -59,7 +59,7 @@ JSON、上传、预览、SSE 及 `proxy.auth` 都会传递 `authMode`；旧页�
 
 SDK 校验事件、序号和音频格式；旧的简化 mock 报文不可用。初始化有总计 30 秒期限，浏览器断开会取消上游，部署的 280 秒连接轮换保留。SDK 内部队列有界，下游也保留缓冲限制。SDK 不改变 Vercel 的部署条件，仍需按 README 配置并在目标环境验收。
 
-Skill 使用推荐的 `files` multipart 字段，名称和描述来自 ZIP 内的 SKILL.md。普通文件保留文件名、MIME、purpose 和对象 metadata。SSE 直接转发原始字节；子线程 idle 不关闭主会话流。
+Skill 使用推荐的 `files` multipart 字段，名称和描述来自 ZIP 内的 SKILL.md。普通文件保留文件名、MIME、purpose 和对象 metadata。SSE 使用独立的 Undici dispatcher，仅通过 HTTP/1.1 打开上游连接，不占用普通请求的连接池；SDK 仍通过原生 fetch 返回 Response。原始字节转发、子线程 idle 判断与断开取消保持不变；本地和 Vercel 共用此实现。
 
 部分 Agent 产物的 Forward 元数据返回 404，但其内容接口允许下载。产物卡片在此情形下继续尝试经过鉴权的内容预览；若存储只返回 `application/octet-stream`，通过 PNG/JPEG/GIF/WebP/BMP/AVIF 文件头识别图片。未知格式仍显示下载卡片，元数据 401/403 不触发此降级。
 

@@ -1,13 +1,10 @@
 import type { ForwardClient, ManagedClient, RequestOptions } from 'qca-sdk';
 
 // Explicit compatibility routes only. New SDK resources belong in dispatch.ts.
-// The eight unused legacy operations stay callable without adding any UI feature.
 const forwardExtensions = [
   /^GET \/resources$/,
   /^POST \/resources\/registry$/,
   /^DELETE \/resources\/[^/]+$/,
-  /^(GET|POST) \/identities\/[^/]+\/access_tokens$/,
-  /^DELETE \/identities\/[^/]+\/access_tokens\/[^/]+$/,
   /^POST \/vaults\/[^/]+(?:\/archive)?$/,
   /^DELETE \/schedules\/[^/]+$/,
 ];

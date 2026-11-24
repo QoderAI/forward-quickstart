@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import './utils/env.js';
 import { createVoiceProxy } from './voiceProxy.js';
 import { voiceConfig } from './voiceConfig.js';
-import { apiBaseUrls, createClient, createTokenIssuer, type ApiLayer, type ApiEnvironment } from './qca/clients.js';
+import { apiBaseUrls, createClient, createStreamClient, createTokenIssuer, type ApiLayer, type ApiEnvironment } from './qca/clients.js';
 import { dispatch, normalizeQuery } from './qca/dispatch.js';
 import { requestScope, sdkResponse, sendError, sendResponse } from './qca/http.js';
 import { previewFile, uploadFile } from './qca/transfers.js';
@@ -91,7 +91,7 @@ app.get('/api/forward/sessions/:sessionId/events/stream', async (req, res) => {
   // Streaming has no overall deadline; the SDK bounds opening the HTTP request.
   const scope = requestScope(req, res, 0);
   try {
-    const client = createClient('forward', API_BASE_URLS[environment], token, req.query.authMode);
+    const client = createStreamClient(API_BASE_URLS[environment], token, req.query.authMode);
     const upstream = await sdkResponse(client.sessions.events.streamEvents(sessionId,
       { last_event_id: req.header('Last-Event-ID') },
       { signal: scope.signal, query: normalizeQuery({ type: req.query.type, types: req.query.types }) },
